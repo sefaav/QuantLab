@@ -1,0 +1,1054 @@
+"""Streamlit dashboard.
+
+Run with:
+
+    streamlit run src/quantlab/dashboard/app.py
+
+Lets a user configure an experiment in the sidebar, run the look-ahead-safe
+backtest, inspect metrics/charts/trades, run robustness checks and download an
+HTML research report.
+"""
+
+from __future__ import annotations
+
+from datetime import date
+from typing import TYPE_CHECKING, cast
+
+import pandas as pd
+import streamlit as st
+
+from quantlab.dashboard.components import (
+    render_charts,
+    render_metric_cards,
+    render_trade_table,
+)
+from quantlab.dashboard.state import (
+    build_config_from_inputs,
+    default_end_date,
+    run_dashboard_backtest,
+    run_dashboard_stress_tests,
+)
+from quantlab.logging_config import get_logger
+from quantlab.strategies.base import available_strategies
+
+if TYPE_CHECKING:
+    from quantlab.backtesting.result import BacktestResult
+
+logger = get_logger(__name__)
+
+st.set_page_config(page_title="QuantLab", page_icon="📈", layout="wide")
+
+
+def _parse_symbols(raw: str) -> list[str]:
+    """Normalise symbols and remove duplicates while preserving their order."""
+    return list(dict.fromkeys(s.strip().upper() for s in raw.split(",") if s.strip()))
+
+
+def _strategy_param_inputs(strategy_name: str, symbols: list[str]) -> dict:
+    """Render strategy-specific parameter widgets and return their values.
+
+    Args:
+        strategy_name: The selected strategy's registered name.
+        symbols: The universe entered in the sidebar, used to default and
+            populate the pairs-trading symbol pickers.
+    """
+    params: dict[str, object] = {}
+    if strategy_name == "cross_sectional_momentum":
+        lookback_period = st.slider(
+            "Lookback (periods)",
+            20,
+            300,
+            189,
+            1,
+            help=(
+                "Trailing window used to rank assets by momentum, measured "
+                "after skipping the most recent 'Skip' periods below."
+            ),
+        )
+        params["lookback_period"] = lookback_period
+        max_skip = min(42, lookback_period - 1)
+        params["skip_period"] = st.slider(
+            "Skip (periods)",
+            0,
+            max_skip,
+            min(21, max_skip),
+            1,
+            help=(
+                "Most-recent periods excluded from the lookback window, to "
+                "avoid the well-documented short-term reversal effect right "
+                "before formation."
+            ),
+        )
+        params["long_short"] = st.checkbox(
+            "Long/short",
+            value=False,
+            help=(
+                "Off: hold only the top-fraction winners. On: also short the "
+                "bottom-fraction losers, sized by 'Bottom fraction' below — a "
+                "market-neutral-ish spread instead of a long-only tilt."
+            ),
+        )
+        max_top_fraction = 0.75 if params["long_short"] else 1.0
+        top_fraction = st.slider(
+            "Top fraction",
+            0.1,
+            max_top_fraction,
+            0.5,
+            0.05,
+            help=(
+                "Fraction of the ranked universe held long — the strongest "
+                "momentum names."
+            ),
+        )
+        params["top_fraction"] = top_fraction
+        if params["long_short"]:
+            # top_fraction + bottom_fraction must not exceed 1.0 (disjoint groups).
+            max_bottom_fraction = round(max(0.1, 1.0 - top_fraction), 2)
+            params["bottom_fraction"] = st.slider(
+                "Bottom fraction (shorted)",
+                0.1,
+                max_bottom_fraction,
+                min(0.25, max_bottom_fraction),
+                0.05,
+                help=(
+                    "Fraction of the ranked universe held short — the "
+                    "weakest momentum names. Capped so it never overlaps "
+                    "the top fraction above."
+                ),
+            )
+    elif strategy_name == "time_series_momentum":
+        lookback_period = st.slider(
+            "Lookback (periods)",
+            20,
+            300,
+            200,
+            1,
+            help=(
+                "Trailing window used to compute each asset's own momentum, "
+                "measured after skipping the most recent 'Skip' periods below."
+            ),
+        )
+        params["lookback_period"] = lookback_period
+        max_skip = min(42, lookback_period - 1)
+        params["skip_period"] = st.slider(
+            "Skip (periods)",
+            0,
+            max_skip,
+            min(21, max_skip),
+            1,
+            help=(
+                "Most-recent periods excluded from the lookback window, to "
+                "avoid the well-documented short-term reversal effect right "
+                "before formation."
+            ),
+        )
+        params["long_only"] = st.checkbox(
+            "Long only",
+            value=True,
+            help=(
+                "Clip the strategy's own signal to non-negative before "
+                "allocation — separate from, and applied before, the "
+                "portfolio-level 'Long only' constraint below."
+            ),
+        )
+        signal_scaling = st.selectbox(
+            "Signal scaling",
+            ["binary", "continuous", "volatility_adjusted"],
+            index=0,
+            help=(
+                "binary uses only direction; continuous standardises momentum "
+                "by its trailing dispersion; volatility_adjusted divides "
+                "momentum by trailing annualised volatility."
+            ),
+        )
+        params["signal_scaling"] = signal_scaling
+        if signal_scaling == "volatility_adjusted":
+            params["volatility_window"] = st.slider(
+                "Momentum volatility window (periods)",
+                10,
+                252,
+                63,
+                1,
+                help=(
+                    "Trailing window used to annualise each asset's own "
+                    "volatility for this signal scaling — separate from the "
+                    "portfolio-level volatility window in the Portfolio "
+                    "section below."
+                ),
+            )
+    elif strategy_name == "mean_reversion":
+        params["lookback_period"] = st.slider(
+            "Lookback (periods)",
+            5,
+            60,
+            20,
+            1,
+            help=(
+                "Trailing window used to compute the rolling mean and "
+                "standard deviation that the price z-score is measured "
+                "against."
+            ),
+        )
+        entry_zscore = st.slider(
+            "Entry z-score",
+            1.0,
+            3.0,
+            2.0,
+            0.1,
+            help=(
+                "Open a position once the price z-score moves beyond ± this "
+                "threshold, betting on reversion back toward the trailing mean."
+            ),
+        )
+        params["entry_zscore"] = entry_zscore
+        params["exit_zscore"] = st.slider(
+            "Exit z-score",
+            0.0,
+            min(1.5, round(entry_zscore - 0.1, 1)),
+            0.5,
+            0.1,
+            help=(
+                "Close the position once the z-score reverts back inside "
+                "± this threshold."
+            ),
+        )
+        params["long_only"] = st.checkbox(
+            "Long only",
+            value=True,
+            help=(
+                "Off: also open short positions when price rises above the "
+                "entry z-score, not only long positions on a drop below it — "
+                "separate from the portfolio-level 'Long only' below."
+            ),
+        )
+        if st.checkbox(
+            "Enable stop z-score",
+            value=True,
+            key="mr_enable_stop",
+            help=(
+                "Force the position flat when the z-score moves past this "
+                "threshold, e.g. because the trailing mean itself has shifted "
+                "and the entry z-score is no longer expected to revert."
+            ),
+        ):
+            params["stop_zscore"] = st.slider(
+                "Stop z-score",
+                entry_zscore + 0.1,
+                6.0,
+                max(4.0, entry_zscore + 0.5),
+                0.1,
+                help=(
+                    "|z-score| beyond which the position is forced flat "
+                    "instead of waiting for reversion — protects against a "
+                    "move that keeps extending instead of reverting."
+                ),
+            )
+        else:
+            params["stop_zscore"] = None
+    elif strategy_name == "trend_following":
+        fast_window = st.slider(
+            "Fast window",
+            5,
+            60,
+            20,
+            1,
+            help=(
+                "Short moving-average window; crossing above the slow "
+                "average signals an uptrend."
+            ),
+        )
+        params["fast_window"] = fast_window
+        minimum_slow = max(30, fast_window + 1)
+        params["slow_window"] = st.slider(
+            "Slow window",
+            minimum_slow,
+            250,
+            max(100, minimum_slow),
+            1,
+            help=(
+                "Long moving-average window that defines the trend "
+                "baseline; always kept larger than the fast window above."
+            ),
+        )
+        params["long_only"] = st.checkbox(
+            "Long only",
+            value=True,
+            help=(
+                "Off: also go short when the fast average crosses below the "
+                "slow average, not only long on an upward crossover — "
+                "separate from the portfolio-level 'Long only' below."
+            ),
+        )
+    elif strategy_name == "pairs_trading":
+        st.caption("Pairs trading needs exactly two symbols (symbol_a, symbol_b).")
+        if len(symbols) < 2:
+            st.error("Enter at least two symbols above to configure a pairs trade.")
+        else:
+            params["symbol_a"] = st.selectbox(
+                "Symbol A",
+                symbols,
+                index=0,
+                help=(
+                    "One leg of the pair. The strategy trades the price "
+                    "spread between Symbol A and Symbol B, long one and "
+                    "short the other in a hedge-ratio-weighted amount."
+                ),
+            )
+            remaining = [s for s in symbols if s != params["symbol_a"]] or symbols
+            params["symbol_b"] = st.selectbox(
+                "Symbol B", remaining, index=0, help="The other leg of the pair."
+            )
+            params["formation_window"] = st.slider(
+                "Formation window (periods)",
+                60,
+                500,
+                252,
+                10,
+                help=(
+                    "Trailing window used to estimate the hedge ratio (fixed "
+                    "once here unless Dynamic hedge ratio is on below) and "
+                    "to run the ADF cointegration test that gates entries."
+                ),
+            )
+            params["zscore_window"] = st.slider(
+                "Z-score window (periods)",
+                10,
+                150,
+                63,
+                1,
+                help=(
+                    "Trailing window used to compute the spread's rolling "
+                    "mean and standard deviation that the entry/exit/stop "
+                    "z-scores are measured against."
+                ),
+            )
+            entry_zscore = st.slider(
+                "Entry z-score",
+                1.0,
+                4.0,
+                2.0,
+                0.1,
+                help=(
+                    "Open the pair once the spread z-score moves beyond ± "
+                    "this threshold, betting the spread reverts toward its "
+                    "trailing mean."
+                ),
+            )
+            params["entry_zscore"] = entry_zscore
+            params["exit_zscore"] = st.slider(
+                "Exit z-score",
+                0.0,
+                round(entry_zscore - 0.1, 1),
+                0.5,
+                0.1,
+                help=(
+                    "Close the pair once the spread z-score reverts back "
+                    "inside ± this threshold."
+                ),
+            )
+            with st.expander("Advanced pairs parameters"):
+                if st.checkbox(
+                    "Enable stop z-score",
+                    value=True,
+                    key="pt_enable_stop",
+                    help=(
+                        "Force the pair flat when the spread z-score moves "
+                        "past this threshold, e.g. because the hedge "
+                        "relationship itself has broken down."
+                    ),
+                ):
+                    params["stop_zscore"] = st.slider(
+                        "Stop z-score",
+                        entry_zscore + 0.1,
+                        6.0,
+                        max(4.0, entry_zscore + 0.5),
+                        0.1,
+                        help=(
+                            "|z-score| beyond which the pair is forced flat "
+                            "instead of waiting for reversion."
+                        ),
+                    )
+                else:
+                    params["stop_zscore"] = None
+                params["dynamic_hedge_ratio"] = st.checkbox(
+                    "Dynamic hedge ratio",
+                    value=True,
+                    help=(
+                        "Re-estimate the hedge ratio on every trailing window "
+                        "instead of fixing it once at the formation window."
+                    ),
+                )
+                params["adf_pvalue_threshold"] = st.slider(
+                    "ADF p-value threshold (entry gate)",
+                    0.01,
+                    0.50,
+                    0.10,
+                    0.01,
+                    help=(
+                        "New entries require an Augmented Dickey-Fuller test "
+                        "on the trailing spread to reach this p-value or "
+                        "below — lower is a stricter mean-reversion filter "
+                        "and rejects more entries. Open positions are exempt: "
+                        "they still exit only on the z-score exit/stop rules."
+                    ),
+                )
+    return params
+
+
+# --------------------------------------------------------------------------- #
+# Home / header
+# --------------------------------------------------------------------------- #
+st.title("📈 QuantLab")
+st.caption("Reproducible quantitative research and backtesting")
+st.warning(
+    "Research and educational tool only — **not investment advice**. "
+    "Historical performance does not guarantee future results.",
+    icon="⚠️",
+)
+with st.expander("About this platform"):
+    st.markdown(
+        """
+        QuantLab turns a financial hypothesis into a reproducible, bias-aware
+        experiment: **data → cleaning & validation → feature functions → signals →
+        allocation → execution costs → look-ahead-safe accounting → risk metrics
+        → validation → reporting**. Signals are strictly shifted before returns
+        to prevent look-ahead bias.
+
+        Source: [github.com/sefaav/QuantLab](https://github.com/sefaav/QuantLab)
+        · [Report an issue](https://github.com/sefaav/QuantLab/issues)
+        · [Author portfolio](https://sefaav.github.io/website/index.html)
+        """
+    )
+
+# --------------------------------------------------------------------------- #
+# Sidebar configuration
+# --------------------------------------------------------------------------- #
+with st.sidebar:
+    st.header("Experiment configuration")
+    source = st.selectbox(
+        "Data source",
+        ["csv", "yahoo", "binance"],
+        index=0,
+        help=(
+            "csv reads local files from data/raw. A separate opt-in below "
+            "allows QuantLab's bundled synthetic demo files when every "
+            "requested local file is absent. yahoo and binance download and "
+            "locally cache real market data, and need network access."
+        ),
+    )
+    if source == "csv":
+        use_bundled_demo_data = st.toggle(
+            "Allow bundled synthetic demo data",
+            value=False,
+            help=(
+                "If every requested CSV is absent from data/raw, use the "
+                "bundled synthetic SPY/QQQ/TLT/GLD files instead. QuantLab "
+                "never mixes local and bundled files, and unsupported "
+                "symbols still fail explicitly."
+            ),
+        )
+    else:
+        use_bundled_demo_data = False
+    symbols_raw = st.text_input(
+        "Symbols (comma-separated)",
+        "SPY, QQQ, TLT, GLD",
+        help=(
+            "Tradable universe. pairs_trading needs at least two symbols "
+            "here; its two legs are then picked below. One market calendar "
+            "applies to the entire universe, so every symbol must follow the "
+            "same trading schedule."
+        ),
+    )
+    symbols = _parse_symbols(symbols_raw)
+
+    # Sidebar date fields need the full width to keep labels and values readable.
+    start_date = st.date_input(
+        "Start date",
+        value=date(2019, 1, 1),
+        help=(
+            "Requested start of the sample. The actually observed range "
+            "after data-quality filtering is reported once the backtest runs."
+        ),
+    )
+    end_date = st.date_input(
+        "End date",
+        value=default_end_date(),
+        help="Requested end of the sample, same caveat as Start date above.",
+    )
+
+    # Offer only frequencies supported by the selected backend.
+    frequency_options = (
+        ["1d", "1h", "1w"] if source == "binance" else ["1d", "1h", "1w", "1mo"]
+    )
+    frequency = st.selectbox(
+        "Frequency",
+        frequency_options,
+        index=0,
+        help=(
+            "Bar size requested from the data source; also sets the "
+            "annualisation factor used by every risk metric."
+        ),
+    )
+    if source == "csv":
+        st.caption(
+            "For CSV data, frequency controls annualisation and data-quality "
+            "checks but does not resample the file. A mismatch with the "
+            "observed timestamps is reported after the run."
+        )
+    # Yahoo and CSV experiments select a supported calendar explicitly.
+    market_calendar: str | None
+    if source in {"csv", "yahoo"}:
+        market_calendar = st.selectbox(
+            "Market calendar",
+            ["XNYS", "24/7"],
+            index=0,
+            help=(
+                "Use 'XNYS' for US equities and ETFs, or '24/7' for continuous "
+                "markets such as crypto. This controls annualisation, settlement "
+                "and gap checks."
+            ),
+        )
+    else:
+        market_calendar = None
+        st.caption("Market calendar: implied by Binance (24/7).")
+    if source in {"csv", "yahoo"}:
+        st.warning(
+            "One calendar applies to every symbol. Do not mix markets with "
+            "different trading schedules (for example AAPL and 1211.HK); "
+            "run them as separate experiments."
+        )
+    strategy_name = st.selectbox(
+        "Strategy",
+        available_strategies(),
+        index=0,
+        help=(
+            "Signal-generation method: buy_and_hold (no signal, baseline "
+            "exposure); time_series_momentum / cross_sectional_momentum "
+            "(trend continuation); trend_following (moving-average trend); "
+            "mean_reversion / pairs_trading (reversion to a trailing mean or "
+            "spread). Its own parameters appear below."
+        ),
+    )
+
+    if strategy_name != "buy_and_hold":
+        st.subheader("Strategy parameters")
+    strategy_parameters = _strategy_param_inputs(strategy_name, symbols)
+
+    st.subheader("Portfolio")
+    signal_scaling = strategy_parameters.get("signal_scaling")
+    # Mirror ExperimentConfig's validators so an invalid combination can never
+    # be selected in the first place, instead of failing only after "Run
+    # backtest": equal_weight discards signal magnitude (breaks non-binary
+    # time-series scaling), and volatility_adjusted already divides by
+    # volatility itself (an inverse-volatility allocator would apply that
+    # sizing a second time).
+    allocator_note: str | None
+    if strategy_name == "pairs_trading":
+        allocator_options = ["signal_proportional"]
+        allocator_note = (
+            "Only signal_proportional is offered: pairs trading needs its "
+            "signed hedge magnitude preserved exactly, not re-sized or "
+            "reduced to a sign, to keep the pair's two legs offsetting."
+        )
+    elif (
+        strategy_name == "time_series_momentum"
+        and signal_scaling == "volatility_adjusted"
+    ):
+        allocator_options = ["signal_proportional"]
+        allocator_note = (
+            "Only signal_proportional is offered: volatility_adjusted "
+            "scaling above already divides the signal by trailing "
+            "volatility, so inverse_volatility or volatility_targeting "
+            "would apply that sizing a second time."
+        )
+    elif strategy_name == "time_series_momentum" and signal_scaling == "continuous":
+        allocator_options = [
+            "signal_proportional",
+            "inverse_volatility",
+            "volatility_targeting",
+        ]
+        allocator_note = (
+            "equal_weight is not offered: it discards signal magnitude and "
+            "keeps only its sign, which would throw away the continuous "
+            "scaling selected above."
+        )
+    else:
+        allocator_options = [
+            "equal_weight",
+            "signal_proportional",
+            "inverse_volatility",
+            "volatility_targeting",
+        ]
+        allocator_note = None
+    preferred_default = (
+        "inverse_volatility"
+        if "inverse_volatility" in allocator_options
+        else allocator_options[0]
+    )
+    allocator = st.selectbox(
+        "Allocator",
+        allocator_options,
+        index=allocator_options.index(preferred_default),
+        help=(
+            "equal_weight: same absolute weight on every active signal. "
+            "signal_proportional: weight scales with signed signal magnitude. "
+            "inverse_volatility: weight scales inversely with each asset's "
+            "trailing volatility. volatility_targeting: inverse-volatility "
+            "weights further scaled so total exposure tracks the target "
+            "volatility below. Only allocators compatible with the selected "
+            "strategy (and its signal scaling, for time_series_momentum) are "
+            "listed."
+        ),
+    )
+    if allocator_note is not None:
+        st.caption(allocator_note)
+    if strategy_name == "pairs_trading":
+        maximum_weight = None
+        long_only = False
+        st.caption(
+            "Per-asset weight caps and long-only are disabled to preserve the "
+            "pair hedge (a pairs trade always holds one long and one short leg)."
+        )
+    else:
+        maximum_weight = st.slider(
+            "Max weight per asset",
+            0.05,
+            1.0,
+            0.30,
+            0.05,
+            help=(
+                "Hard cap on any single asset's absolute target weight, "
+                "enforced as a portfolio constraint regardless of the "
+                "allocator chosen above."
+            ),
+        )
+        long_only = st.checkbox(
+            "Long only (portfolio)",
+            value=False,
+            help=(
+                "Reject any negative target weight at the portfolio level, on "
+                "top of whatever the strategy's own signals already allow."
+            ),
+        )
+    rebalance_frequency = st.selectbox(
+        "Rebalance frequency",
+        ["daily", "weekly", "monthly", "quarterly"],
+        index=2,
+        help=(
+            "How often target weights are recomputed and traded toward. "
+            "Between rebalances, QuantLab carries the previous target weights "
+            "forward unchanged; it does not model price-driven weight drift."
+        ),
+    )
+    if allocator == "volatility_targeting":
+        enable_volatility_targeting = True
+        st.caption("Volatility targeting is inherent to this allocator.")
+    else:
+        enable_volatility_targeting = st.toggle(
+            "Enable volatility targeting",
+            value=True,
+            help=(
+                "Scale the portfolio's overall exposure toward the annual "
+                "volatility target. Disable this to keep the allocator's "
+                "unscaled weights."
+            ),
+        )
+    if allocator in {"inverse_volatility", "volatility_targeting"} or (
+        enable_volatility_targeting
+    ):
+        volatility_window = st.slider(
+            "Volatility window (periods)",
+            10,
+            252,
+            63,
+            1,
+            help=(
+                "Trailing window used to estimate realised volatility, for "
+                "both inverse-volatility sizing and volatility targeting."
+            ),
+        )
+    else:
+        volatility_window = 63
+    if enable_volatility_targeting:
+        target_volatility: float | None = st.slider(
+            "Target volatility (annual)",
+            0.05,
+            0.40,
+            0.12,
+            0.01,
+            help=(
+                "Desired annualised portfolio volatility. Exposure is "
+                "scaled, up to 'Max leverage' below, toward this target "
+                "using the volatility window above."
+            ),
+        )
+        maximum_leverage = st.slider(
+            "Max leverage",
+            1.0,
+            3.0,
+            1.5,
+            0.1,
+            help=(
+                "Ceiling on the volatility-targeting scale-up, e.g. 1.5 "
+                "allows up to 150% gross exposure even if hitting the "
+                "target volatility would ask for more."
+            ),
+        )
+    else:
+        target_volatility = None
+        maximum_leverage = 1.0
+
+    st.subheader("Validation")
+    enable_holdout = st.checkbox(
+        "Chronological holdout (train / validation / test)",
+        value=False,
+        help=(
+            "Split one continuous backtest chronologically and report each "
+            "block separately. No fitting or parameter tuning happens here. "
+            "Treat the trailing test block as out-of-sample only if you fixed "
+            "the strategy and parameters before inspecting it; the headline "
+            "metric cards still describe the full sample."
+        ),
+    )
+    validation_ratio: float | None = None
+    test_ratio: float | None = None
+    if enable_holdout:
+        validation_ratio = st.slider(
+            "Validation fraction",
+            0.05,
+            0.4,
+            0.2,
+            0.05,
+            help=(
+                "Middle chronological slice reported separately for manual "
+                "assessment. This dashboard backtest does not tune or select "
+                "parameters automatically."
+            ),
+        )
+        test_ratio = st.slider(
+            "Test fraction",
+            0.05,
+            0.4,
+            0.2,
+            0.05,
+            help=(
+                "Final chronological slice held out as the out-of-sample "
+                "test block — its metrics are what the report calls "
+                "out-of-sample evidence."
+            ),
+        )
+
+    st.subheader("Costs & capital")
+    initial_capital = st.number_input(
+        "Initial capital",
+        1_000.0,
+        value=100_000.0,
+        step=1_000.0,
+        help=(
+            "Starting portfolio value in currency units. Scales every "
+            "currency-denominated figure (costs, traded notional) but not "
+            "percentage returns."
+        ),
+    )
+    risk_free_rate_percent = float(
+        st.number_input(
+            "Risk-free rate (annual %)",
+            value=2.0,
+            step=0.1,
+            format="%.2f",
+            help=(
+                "Annual rate used for excess-return metrics and the cash "
+                "benchmark. Enter 2 for 2%."
+            ),
+        )
+    )
+    benchmark_kind = st.selectbox(
+        "Benchmark",
+        options=["symbol", "equal_weight", "first_asset", "cash"],
+        index=0,
+        format_func={
+            "symbol": "Symbol",
+            "equal_weight": "Equal weight",
+            "first_asset": "First asset",
+            "cash": "Cash",
+        }.__getitem__,
+        help=(
+            "Compare the strategy with an external symbol, an equal-weight "
+            "portfolio, the first universe asset, or cash earning the "
+            "configured risk-free rate."
+        ),
+    )
+    if benchmark_kind == "symbol":
+        benchmark_symbol = st.text_input(
+            "Benchmark symbol",
+            "SPY",
+            help="External symbol to download and compare against, e.g. SPY.",
+        )
+    else:
+        benchmark_symbol = ""
+        if benchmark_kind == "first_asset":
+            first_symbol = symbols[0] if symbols else "the first universe symbol"
+            st.caption(f"Benchmark asset: {first_symbol}")
+    commission_bps = st.slider(
+        "Commission (bps)",
+        0.0,
+        20.0,
+        2.0,
+        0.5,
+        help="Broker commission charged per unit of traded notional, in basis points.",
+    )
+    spread_bps = st.slider(
+        "Spread (bps)",
+        0.0,
+        20.0,
+        3.0,
+        0.5,
+        help=(
+            "Full quoted bid-ask spread in basis points; half is charged "
+            "whenever a trade crosses it."
+        ),
+    )
+    slippage_bps = st.slider(
+        "Slippage (bps)",
+        0.0,
+        20.0,
+        2.0,
+        0.5,
+        help=(
+            "Additional execution cost beyond commission and spread, "
+            "modelling market impact. Constant here; a volume-based model "
+            "scaling with trade size is available via the Python API."
+        ),
+    )
+
+    run = st.button("Run backtest", type="primary", width="stretch")
+
+
+def _render_robustness_tab(result: BacktestResult) -> None:
+    """Render chronological holdout evidence and on-demand stress tests."""
+    holdout_report = result.metadata.get("holdout_report")
+    st.markdown("#### Chronological holdout (train / validation / test)")
+    if holdout_report:
+        # Two-way train/test holdouts omit the validation row.
+        blocks = [("Train", "train"), ("Test (out-of-sample)", "test")]
+        if "validation_metrics" in holdout_report:
+            blocks.insert(1, ("Validation", "validation"))
+        rows = [
+            {
+                "Block": block,
+                "Period": f"{period[0][:10]} to {period[1][:10]}",
+                "Sharpe": metrics.get("sharpe_ratio", float("nan")),
+                "CAGR": metrics.get("cagr", float("nan")),
+                "Max Drawdown": metrics.get("max_drawdown", float("nan")),
+            }
+            for block, key in blocks
+            for metrics, period in [
+                (
+                    holdout_report[f"{key}_metrics"],
+                    holdout_report[f"{key}_period"],
+                )
+            ]
+        ]
+        st.dataframe(
+            pd.DataFrame(rows),
+            width="stretch",
+            hide_index=True,
+            column_config={
+                "Sharpe": st.column_config.NumberColumn(format="%.2f"),
+                "CAGR": st.column_config.NumberColumn(format="percent"),
+                "Max Drawdown": st.column_config.NumberColumn(format="percent"),
+            },
+        )
+    else:
+        st.info(
+            "No out-of-sample holdout is attached to this run — tick "
+            "**Chronological holdout** in the sidebar's Validation section "
+            "and re-run the backtest to see train/validation/test metrics "
+            "here instead of full-sample-only numbers."
+        )
+
+    st.markdown("#### Stress tests")
+    st.caption(
+        "Re-runs the backtest under several perturbations to check how "
+        "sensitive the result is to modelling assumptions: commission x2/x5, "
+        "slippage x2, one extra period of execution delay, the 10 best days "
+        "removed, and — only when the universe has more than 2 symbols — a "
+        "**reduced universe** that drops the last configured symbol and "
+        "re-runs on what remains, to see how much the result leans on that "
+        "one asset. Not run automatically since it re-executes the backtest "
+        "several times. Re-running **Run backtest** for any reason "
+        "(including just enabling holdout) invalidates these numbers — "
+        "rerun stress tests afterwards if you want them in the downloaded "
+        "report."
+    )
+    if st.button("Run stress tests"):
+        st.session_state.pop("stress_tests", None)
+        st.session_state.pop("report_html", None)
+        with st.spinner("Running stress-test scenarios…"):
+            try:
+                expected_data_hash = result.metadata.get("data_hash")
+                if not isinstance(expected_data_hash, str):
+                    raise RuntimeError(
+                        "The displayed result has no valid data hash. "
+                        "Run the backtest again before running stress tests."
+                    )
+                st.session_state["stress_tests"] = run_dashboard_stress_tests(
+                    result.config, expected_data_hash
+                )
+            except Exception as exc:
+                logger.exception("Dashboard stress tests failed")
+                st.error(f"Stress tests failed: {exc}")
+    stress = st.session_state.get("stress_tests")
+    if stress is not None:
+        st.dataframe(
+            stress,
+            width="stretch",
+            hide_index=True,
+            column_config={
+                "scenario": st.column_config.TextColumn("Scenario"),
+                "total_return": st.column_config.NumberColumn(
+                    "Total return", format="percent"
+                ),
+                "cagr": st.column_config.NumberColumn("CAGR", format="percent"),
+                "sharpe": st.column_config.NumberColumn("Sharpe", format="%.2f"),
+                "max_drawdown": st.column_config.NumberColumn(
+                    "Max drawdown", format="percent"
+                ),
+            },
+        )
+
+
+# --------------------------------------------------------------------------- #
+# Run and results
+# --------------------------------------------------------------------------- #
+def _collect_inputs() -> dict:
+    """Return the current sidebar values used to build the experiment config."""
+    return {
+        "experiment_name": f"dashboard_{strategy_name}",
+        "source": source,
+        "use_bundled_demo_data": use_bundled_demo_data,
+        "symbols": symbols,
+        "start_date": start_date,
+        "end_date": end_date or default_end_date(),
+        "frequency": frequency,
+        "market_calendar": market_calendar,
+        "strategy_name": strategy_name,
+        "strategy_parameters": strategy_parameters,
+        "allocator": allocator,
+        "maximum_weight": maximum_weight,
+        "long_only": long_only,
+        "target_volatility": target_volatility,
+        "volatility_window": volatility_window,
+        "maximum_leverage": maximum_leverage,
+        "rebalance_frequency": rebalance_frequency,
+        "validation_ratio": validation_ratio,
+        "test_ratio": test_ratio,
+        "initial_capital": initial_capital,
+        "benchmark_kind": benchmark_kind,
+        "benchmark_symbol": benchmark_symbol,
+        "risk_free_rate": risk_free_rate_percent / 100.0,
+        "commission_bps": commission_bps,
+        "spread_bps": spread_bps,
+        "slippage_bps": slippage_bps,
+    }
+
+
+def _clear_result_state() -> None:
+    """Remove artefacts that no longer describe a successful backtest."""
+    for key in ("result", "result_inputs", "warnings", "stress_tests", "report_html"):
+        st.session_state.pop(key, None)
+
+
+def _execute() -> None:
+    inputs = _collect_inputs()
+    _clear_result_state()
+    with st.spinner("Running look-ahead-safe backtest…"):
+        try:
+            config = build_config_from_inputs(inputs)
+            result, warnings = run_dashboard_backtest(config)
+        except Exception as exc:
+            logger.exception("Dashboard backtest failed")
+            st.error(f"Backtest failed: {exc}")
+            return
+
+    st.session_state["result"] = result
+    st.session_state["result_inputs"] = inputs
+    st.session_state["warnings"] = warnings
+
+
+if run:
+    _execute()
+
+result = st.session_state.get("result")
+if result is None:
+    st.info("Configure an experiment in the sidebar and click **Run backtest**.")
+else:
+    # Warn when the current controls no longer describe the saved result.
+    if _collect_inputs() != st.session_state.get("result_inputs"):
+        st.warning(
+            "Sidebar configuration has changed since this result was "
+            "computed — click **Run backtest** to refresh it.",
+            icon="⚠️",
+        )
+    data_warnings = st.session_state.get("warnings", [])
+    frequency_warnings = [
+        w for w in data_warnings if "does not match the declared frequency" in w
+    ]
+    other_warnings = [w for w in data_warnings if w not in frequency_warnings]
+    if frequency_warnings:
+        # Frequency mismatches invalidate all annualised metrics.
+        st.error(
+            "**Frequency mismatch detected** — the metrics below use the "
+            "wrong annualisation factor and should not be trusted:\n"
+            + "\n".join(f"- {w}" for w in frequency_warnings),
+            icon="🚫",
+        )
+    for warning in other_warnings:
+        st.caption(f"⚠️ {warning}")
+
+    # Dynamic tabs render only the selected tab; the stable key also supports tests.
+    tab_results, tab_trades, tab_robustness, tab_report = st.tabs(
+        ["Results", "Trades", "Robustness", "Report"],
+        on_change="rerun",
+        key="dashboard_active_tab",
+    )
+    if tab_results.open:
+        with tab_results:
+            render_metric_cards(st, result)
+            render_charts(st, result)
+    if tab_trades.open:
+        with tab_trades:
+            render_trade_table(st, result)
+    if tab_robustness.open:
+        with tab_robustness:
+            _render_robustness_tab(result)
+    if tab_report.open:
+        with tab_report:
+            st.markdown("### Research report")
+            # Include current stress evidence and avoid rebuilding unchanged HTML.
+            stress = st.session_state.get("stress_tests")
+            robustness = {"stress_tests": stress} if stress is not None else None
+            cache_key = (id(result), id(stress) if stress is not None else None)
+            cached_report = cast(
+                tuple[tuple[int, int | None], tuple[str, list[str]]] | None,
+                st.session_state.get("report_html"),
+            )
+            if cached_report is not None and cached_report[0] == cache_key:
+                html, chart_warnings = cached_report[1]
+            else:
+                chart_warnings = []
+                html = result.to_html(robustness=robustness, warnings=chart_warnings)
+                st.session_state["report_html"] = (cache_key, (html, chart_warnings))
+            if chart_warnings:
+                # Surface individual chart failures without discarding the report.
+                st.warning(
+                    "Some charts could not be rendered into this report:\n"
+                    + "\n".join(f"- {w}" for w in chart_warnings)
+                )
+            st.download_button(
+                "Download HTML report",
+                html.encode("utf-8"),
+                file_name=f"{result.config.experiment_name}_report.html",
+                mime="text/html",
+            )
+            st.iframe(html, height=800)

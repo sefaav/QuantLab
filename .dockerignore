@@ -1,0 +1,72 @@
+# Keep local environments, caches and generated artefacts out of the build context.
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Version control
+.git/
+.gitignore
+.gitattributes
+
+# Byte-compiled / caches
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+.pytest-*/
+.mypy_cache/
+.ruff_cache/
+.uv-*-cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+
+# Distribution / packaging (rebuilt inside the image, not needed from host)
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Keep only the synthetic CSVs required by the offline demonstration.
+data/*
+!data/raw/
+data/raw/*
+!data/raw/SPY.csv
+!data/raw/QQQ.csv
+!data/raw/TLT.csv
+!data/raw/GLD.csv
+reports/
+logs/
+
+# Documentation and research artefacts are not runtime inputs.
+notebooks/
+docs/
+*.md
+!README.md
+
+# Local diagnostic scratch files and directories
+.audit-*
+.audit_*
+.tmp-*
+.tmp_*
+
+# Tests aren't run inside the production image.
+tests/
+.coverage
+
+# IDE / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Docker's own files never need to be in their own build context.
+Dockerfile
+docker-compose.yml
+.dockerignore

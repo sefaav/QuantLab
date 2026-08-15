@@ -1,0 +1,47 @@
+# Example experiment: trend following on Bitcoin.
+# Crypto uses 365 periods/year and higher costs than ETFs.
+experiment_name: btc_trend_following
+
+data:
+  source: binance
+  symbols:
+    - BTCUSDT
+  start_date: "2018-01-01"
+  end_date: "2025-12-31"
+  frequency: "1d"
+  missing_value_policy: "drop"
+
+strategy:
+  name: trend_following
+  parameters:
+    fast_window: 20
+    slow_window: 100
+    long_only: true
+
+portfolio:
+  allocator: volatility_targeting
+  target_volatility: 0.40
+  volatility_window: 30
+  maximum_leverage: 2.0
+  rebalance_frequency: daily
+
+execution:
+  # Crypto: wider spreads and higher slippage than ETFs.
+  commission_bps: 10.0
+  spread_bps: 8.0
+  slippage_bps: 10.0
+  slippage_model: constant
+
+backtest:
+  initial_capital: 100000
+  benchmark_symbol: BTCUSDT
+  risk_free_rate: 0.0
+  periods_per_year: 365   # crypto trades every calendar day
+
+validation:
+  method: holdout
+  validation_ratio: 0.2
+  test_ratio: 0.2
+
+reproducibility:
+  random_seed: 42

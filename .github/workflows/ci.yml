@@ -1,0 +1,150 @@
+name: CI
+
+permissions:
+  contents: read
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    # Exercise both supported Python versions on Linux and Windows.
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python-version: ["3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v9.0.0
+        with:
+          version: "0.12.3"
+
+      - name: Set up Python ${{ matrix.python-version }}
+        run: uv python install ${{ matrix.python-version }}
+
+      - name: Install dependencies (locked)
+        run: >-
+          uv sync --locked --python ${{ matrix.python-version }}
+          --extra dev --extra dashboard --extra yahoo --extra docs
+          --extra notebooks
+
+      - name: Lint (ruff)
+        run: |
+          uv run ruff check src tests scripts
+          uv run ruff format --check src tests scripts
+
+      - name: Type-check (mypy)
+        run: uv run mypy src tests scripts
+
+      - name: Test (offline suite, with coverage)
+        run: >-
+          uv run pytest -m "not network" --cov=quantlab
+          --cov-report=term-missing --cov-report=xml --cov-fail-under=82
+
+      - name: Build documentation (strict)
+        run: uv run mkdocs build --strict
+
+  packaging:
+    # Verify distributions and bundled resources independently of the checkout.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v9.0.0
+        with:
+          version: "0.12.3"
+
+      - name: Set up Python
+        run: uv python install "3.12"
+
+      - name: Build sdist, then build the wheel *from that sdist*
+        # Building from the extracted sdist verifies both distribution manifests.
+        shell: bash
+        run: |
+          uv build --sdist --out-dir dist
+          mkdir sdist_extracted
+          tar -xzf dist/*.tar.gz -C sdist_extracted --strip-components=1
+          uv build --wheel --out-dir dist sdist_extracted
+
+      - name: Install the wheel and smoke-test the CLI from *outside* the checkout
+        # Running outside the checkout proves that bundled resources are installed.
+        shell: bash
+        working-directory: ${{ runner.temp }}
+        run: |
+          uv venv wheel_venv --python 3.12
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            PY="wheel_venv/Scripts/python.exe"
+            QUANTLAB="wheel_venv/Scripts/quantlab.exe"
+          else
+            PY="wheel_venv/bin/python"
+            QUANTLAB="wheel_venv/bin/quantlab"
+          fi
+          uv pip install --python "$PY" "$GITHUB_WORKSPACE"/dist/*.whl
+          "$QUANTLAB" --help
+          "$QUANTLAB" backtest --shipped-config demo_offline
+
+      - name: Verify py.typed ships with the installed (non-editable) wheel
+        # Verify the marker in the installed package, not the source tree.
+        shell: bash
+        working-directory: ${{ runner.temp }}
+        run: |
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            PY="wheel_venv/Scripts/python.exe"
+          else
+            PY="wheel_venv/bin/python"
+          fi
+          "$PY" -c "
+          import pathlib
+          import quantlab
+          marker = pathlib.Path(quantlab.__file__).parent / 'py.typed'
+          assert marker.is_file(), f'py.typed missing from installed package: {marker}'
+          print(f'py.typed present: {marker}')
+          "
+
+      - name: Build Docker image
+        if: matrix.os == 'ubuntu-latest'
+        run: docker build -t quantlab-ci-smoke-test .
+
+      - name: Smoke-test the Docker image with a real backtest
+        # Exercise the locked non-editable install and bundled offline data.
+        if: matrix.os == 'ubuntu-latest'
+        shell: bash
+        run: |
+          docker run --rm --entrypoint python quantlab-ci-smoke-test -c "
+          import os, pathlib, shutil
+          import quantlab
+          package = pathlib.Path(quantlab.__file__).resolve()
+          assert os.geteuid() != 0, 'runtime must not run as root'
+          assert shutil.which('gcc') is None, 'compiler leaked into runtime image'
+          assert 'site-packages' in package.parts, package
+          print(f'non-root wheel install: {package}')
+          "
+          docker run --rm quantlab-ci-smoke-test \
+            backtest --shipped-config demo_offline
+
+      - name: Smoke-test the Docker dashboard
+        if: matrix.os == 'ubuntu-latest'
+        shell: bash
+        run: |
+          container_id=$(docker run -d -p 8501:8501 quantlab-ci-smoke-test dashboard)
+          trap 'docker rm -f "$container_id" >/dev/null 2>&1 || true' EXIT
+          for attempt in {1..30}; do
+            if curl --fail --silent http://127.0.0.1:8501/_stcore/health; then
+              exit 0
+            fi
+            sleep 1
+          done
+          docker logs "$container_id"
+          exit 1

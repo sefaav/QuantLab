@@ -1,0 +1,199 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "quantlab"
+version = "0.1.0"
+description = "QuantLab — Reproducible quantitative research and backtesting platform"
+readme = "README.md"
+requires-python = ">=3.12,<3.14"
+license = { text = "MIT" }
+authors = [{ name = "sefaav" }]
+keywords = [
+    "quantitative-finance",
+    "backtesting",
+    "trading-strategies",
+    "walk-forward",
+    "research",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Financial and Insurance Industry",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Office/Business :: Financial :: Investment",
+]
+
+# Core dependencies are intentionally small. `pandas-market-calendars`
+# supplies maintained XNYS sessions and close times that QuantLab should not
+# duplicate with a local holiday list.
+dependencies = [
+    "numpy>=1.26",
+    "pandas>=2.1",
+    "pyarrow>=14.0",       # Parquet storage backend
+    "scipy>=1.11",
+    "statsmodels>=0.14",   # ADF test for pairs trading
+    "matplotlib>=3.8",
+    "plotly>=5.18",
+    "pydantic>=2.5",       # Config validation
+    "pyyaml>=6.0",         # YAML config loading
+    "typer>=0.12",         # CLI
+    "requests>=2.31",      # Binance REST client
+    "joblib>=1.3",         # Caching / parallelism helpers
+    "pandas-market-calendars>=5.4,<6",  # Maintained XNYS calendar
+    "filelock>=3.13",      # Cross-process cache-write coordination
+]
+
+[project.optional-dependencies]
+# Streamlit 1.60 provides the iframe and lazy-tab APIs used by the dashboard.
+dashboard = ["streamlit>=1.60"]
+# Data downloads. Isolated so tests can run fully offline.
+yahoo = ["yfinance>=0.2.40"]
+# Optional analytical accelerators for advanced parameter search/ML strategies.
+extra = ["scikit-learn>=1.4", "optuna>=3.5"]
+dev = [
+    "pytest>=8.0",
+    "pytest-cov>=4.1",
+    # UP047 requires Ruff 0.12 or newer.
+    "ruff>=0.12",
+    # Pre-commit runs mypy from the active project development environment
+    # instead of maintaining a second, incomplete dependency list.
+    "mypy>=2.3",
+    "pre-commit>=3.7",
+    "pandas-stubs",
+    "types-PyYAML",
+    "types-requests",
+    # Independent reference implementation of standard risk/return metrics,
+    # cross-checked against quantlab.risk in tests so a shared blind spot in
+    # our own formulas isn't also blind in the tests that check them.
+    "empyrical-reloaded>=0.5.12",
+]
+# Material for MkDocs 9.x targets MkDocs 1.x; avoid resolving an incompatible
+# future MkDocs 2 release in documentation and CI environments.
+docs = ["mkdocs>=1.5,<2", "mkdocs-material>=9.5"]
+notebooks = ["jupyter>=1.0", "nbformat>=5.10", "nbclient>=0.10", "ipykernel>=6.29"]
+
+[project.scripts]
+quantlab = "quantlab.cli:app"
+
+[project.urls]
+Homepage = "https://github.com/sefaav/QuantLab"
+Documentation = "https://github.com/sefaav/QuantLab"
+Repository = "https://github.com/sefaav/QuantLab.git"
+Issues = "https://github.com/sefaav/QuantLab/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/quantlab"]
+
+# Bundle shipped configs and only the four synthetic CSVs required by the
+# offline demonstration. User-downloaded data must never enter a wheel.
+[tool.hatch.build.targets.wheel.force-include]
+"configs" = "quantlab/configs"
+"data/raw/SPY.csv" = "quantlab/demo_data/SPY.csv"
+"data/raw/QQQ.csv" = "quantlab/demo_data/QQQ.csv"
+"data/raw/TLT.csv" = "quantlab/demo_data/TLT.csv"
+"data/raw/GLD.csv" = "quantlab/demo_data/GLD.csv"
+
+# --------------------------------------------------------------------------- #
+# Tooling configuration
+# --------------------------------------------------------------------------- #
+[tool.ruff]
+line-length = 88
+target-version = "py312"
+src = ["src", "tests"]
+# Notebook cells are generated research artefacts; lint their source templates.
+extend-exclude = ["notebooks"]
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "F",   # pyflakes
+    "I",   # isort
+    "N",   # pep8-naming
+    "UP",  # pyupgrade
+    "B",   # flake8-bugbear
+    "C4",  # flake8-comprehensions
+    "SIM", # flake8-simplify
+    "PT",  # flake8-pytest-style
+    "RUF", # ruff-specific
+    "D",   # pydocstyle (docstrings for public API)
+]
+ignore = [
+    "D100",   # missing docstring in public module (allowed)
+    "D104",   # missing docstring in public package
+    "D107",   # missing docstring in __init__
+    "D203",   # 1 blank line before class docstring (conflicts with D211)
+    "D213",   # multi-line summary second line (conflicts with D212)
+    "UP047",  # PEP 695 generics: TypeVar-based generics are still idiomatic pre-3.13
+    "RUF002", # ambiguous unicode in docstrings: em dashes/typographic quotes are this project's deliberate prose style
+    "RUF003", # ambiguous unicode in comments: same reason
+    "B008",   # typer.Option(...) as a default is the documented Typer pattern
+    "N812",   # single-letter module aliases (metrics as M, technical as T) are intentional
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["D"]        # tests do not require docstrings
+"scripts/*" = ["D"]
+"notebooks/*" = ["D"]
+# notebook_cells.py holds cell *source templates*; their line length mirrors
+# what a user would actually type in a notebook cell, not library code.
+"scripts/notebook_cells.py" = ["D", "E501"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.mypy]
+python_version = "3.12"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+check_untyped_defs = true
+no_implicit_optional = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+plugins = ["pydantic.mypy"]
+
+[[tool.mypy.overrides]]
+# Third-party libraries without complete type stubs.
+module = [
+    "yfinance.*",
+    "statsmodels.*",
+    "plotly.*",
+    "streamlit.*",
+    "scipy.*",
+    "empyrical.*",
+    # Notebook dependencies are optional in development and CI environments.
+    "nbformat.*",
+    "nbclient.*",
+    "pandas_market_calendars.*",
+]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+minversion = "8.0"
+testpaths = ["tests"]
+addopts = "-ra --strict-markers"
+markers = [
+    "network: tests that require internet access (deselect with '-m \"not network\"')",
+    "slow: slow tests",
+]
+
+[tool.coverage.run]
+branch = true
+source = ["quantlab"]
+# UI entry points are exercised by CLI integration tests and Streamlit AppTest;
+# the numerical/core-library coverage gate excludes their orchestration code.
+omit = ["*/dashboard/*", "*/cli.py"]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = false
+exclude_lines = [
+    "pragma: no cover",
+    "raise NotImplementedError",
+    "if TYPE_CHECKING:",
+    "if __name__ == .__main__.:",
+    "@abstractmethod",
+]

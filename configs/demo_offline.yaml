@@ -1,0 +1,62 @@
+# Offline demo experiment. Uses the `csv` data source reading synthetic files
+# from data/raw/, so `quantlab backtest`/`walk-forward` run with no network.
+# NOTE: the prices here are SYNTHETIC (generated), not real market data.
+experiment_name: demo_offline_momentum
+
+data:
+  source: csv
+  symbols:
+    - SPY
+    - QQQ
+    - TLT
+    - GLD
+  start_date: "2019-01-01"
+  end_date: "2023-10-30"
+  frequency: "1d"
+  missing_value_policy: "drop"
+  # The synthetic symbols model US equity ETFs.
+  market_calendar: XNYS
+  # Allow the installed package to use its bundled synthetic demo files.
+  use_bundled_demo_data: true
+
+strategy:
+  name: cross_sectional_momentum
+  parameters:
+    lookback_period: 189
+    skip_period: 21
+    top_fraction: 0.5
+    bottom_fraction: 0.5
+    long_short: false
+    signal_scaling: binary
+
+portfolio:
+  allocator: inverse_volatility
+  maximum_weight: 0.60
+  maximum_gross_exposure: 1.0
+  target_volatility: 0.12
+  volatility_window: 63
+  maximum_leverage: 1.5
+  rebalance_frequency: monthly
+
+execution:
+  commission_bps: 2.0
+  spread_bps: 3.0
+  slippage_bps: 2.0
+  slippage_model: constant
+
+backtest:
+  initial_capital: 100000
+  benchmark_symbol: SPY
+  risk_free_rate: 0.02
+  periods_per_year: 252
+
+validation:
+  method: walk_forward
+  train_window: 500
+  validation_window: 126
+  test_window: 126
+  expanding: true
+  optimization_metric: sharpe
+
+reproducibility:
+  random_seed: 42

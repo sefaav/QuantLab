@@ -1,0 +1,26 @@
+# QuantLab services. Usage:
+#   docker compose run --rm quantlab backtest --shipped-config momentum_sp500
+#   docker compose up dashboard          # http://localhost:8501
+
+services:
+  quantlab:
+    build: .
+    image: quantlab:latest
+    volumes:
+      - ./data:/home/quantlab/.quantlab/data
+      - ./reports:/home/quantlab/.quantlab/reports
+      - ./logs:/home/quantlab/.quantlab/logs
+    entrypoint: ["quantlab"]
+    command: ["--help"]
+
+  dashboard:
+    build: .
+    image: quantlab:latest
+    volumes:
+      - ./data:/home/quantlab/.quantlab/data
+      - ./reports:/home/quantlab/.quantlab/reports
+      - ./logs:/home/quantlab/.quantlab/logs
+    ports:
+      - "8501:8501"
+    entrypoint: ["quantlab"]
+    command: ["dashboard"]

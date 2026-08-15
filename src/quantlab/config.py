@@ -1,0 +1,1007 @@
+"""Experiment configuration models.
+
+Configs are the single reproducible description of an experiment. They are
+Pydantic models so that loading is validated and mistakes fail loudly and
+early.
+
+We model configs in their natural nested form (it maps cleanly to the
+domain) and expose flat, read-only convenience accessors on
+:class:`ExperimentConfig` so both nested and flat access work.
+"""
+
+from __future__ import annotations
+
+import itertools
+import math
+import re
+import types
+from collections.abc import Mapping
+from datetime import date
+from enum import StrEnum
+from pathlib import Path
+from typing import Any, Self, Union, get_args, get_origin
+
+import numpy as np
+import pandas as pd
+import yaml
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from yaml.constructor import ConstructorError
+from yaml.nodes import MappingNode
+
+from quantlab.constants import (
+    CRYPTO_FREQUENCY_TO_PERIODS_PER_YEAR,
+    DEFAULT_RISK_FREE_RATE,
+    FREQUENCY_TO_PERIODS_PER_YEAR,
+    TRADING_DAYS_PER_YEAR,
+)
+from quantlab.exceptions import InvalidConfigurationError
+from quantlab.logging_config import get_logger
+
+logger = get_logger(__name__)
+
+#: Safe filename characters for symbols and experiment names. ``^`` and ``=``
+#: are included because Yahoo identifiers commonly use them; path separators
+#: and other unsafe characters remain forbidden.
+_SAFE_PATH_COMPONENT = re.compile(r"^[A-Za-z0-9^][A-Za-z0-9._=^-]*$")
+
+#: Windows device names remain reserved even when followed by an extension.
+_WINDOWS_RESERVED_NAMES = frozenset(
+    {"CON", "PRN", "AUX", "NUL"}
+    | {f"COM{i}" for i in range(1, 10)}
+    | {f"LPT{i}" for i in range(1, 10)}
+)
+
+
+def _validate_path_component(value: str, *, field_name: str) -> None:
+    """Raise ``ValueError`` if ``value`` isn't safe to use as a path segment."""
+    if not _SAFE_PATH_COMPONENT.match(value):
+        raise ValueError(
+            f"Invalid {field_name} {value!r}: only letters, digits, '.', "
+            "'-', '_', '^' and '=' are allowed (must also start with a "
+            "letter, digit or '^') — anything else, e.g. a path separator, "
+            "could escape the intended directory when used to build a "
+            "file path."
+        )
+    stem = value.split(".", 1)[0].upper()
+    if stem in _WINDOWS_RESERVED_NAMES:
+        raise ValueError(
+            f"Invalid {field_name} {value!r}: {stem!r} is a Windows reserved "
+            "device name (CON/PRN/AUX/NUL/COM1-9/LPT1-9) — using it as a "
+            "file or directory name addresses the actual OS device instead "
+            "of a normal file, silently discarding anything written to it."
+        )
+    if value.endswith((".", " ")):
+        # Windows strips trailing dots and spaces, which would make distinct
+        # configured names resolve to the same filesystem entry.
+        raise ValueError(
+            f"Invalid {field_name} {value!r}: must not end with '.' or a "
+            "space — Windows silently strips a trailing dot/space from a "
+            "path component, so this would collide with the same name "
+            "minus that trailing character on that platform."
+        )
+
+
+#: Scalar configuration values with an unambiguous JSON representation.
+#: Dates are accepted because ``model_dump(mode="json")`` serialises them to ISO.
+_JSON_SAFE_SCALARS = (bool, int, str, date, type(None))
+
+
+def _is_numeric_annotation(annotation: Any) -> bool:
+    """Return whether a model-field annotation represents an int or float."""
+    if annotation in (int, float):
+        return True
+    origin = get_origin(annotation)
+    if origin in (types.UnionType, Union):
+        return any(member in (int, float) for member in get_args(annotation))
+    return False
+
+
+class _UniqueKeySafeLoader(yaml.SafeLoader):
+    """Safe YAML loader that rejects duplicate mapping keys."""
+
+
+def _construct_unique_mapping(
+    loader: yaml.SafeLoader, node: MappingNode, deep: bool = False
+) -> dict[Any, Any]:
+    """Construct a YAML mapping and fail on a repeated key."""
+    mapping: dict[Any, Any] = {}
+    for key_node, value_node in node.value:
+        key = loader.construct_object(key_node, deep=deep)
+        try:
+            duplicate = key in mapping
+        except TypeError as exc:
+            raise ConstructorError(
+                "while constructing a mapping",
+                node.start_mark,
+                f"found unhashable key {key!r}",
+                key_node.start_mark,
+            ) from exc
+        if duplicate:
+            raise ConstructorError(
+                "while constructing a mapping",
+                node.start_mark,
+                f"found duplicate key {key!r}",
+                key_node.start_mark,
+            )
+        mapping[key] = loader.construct_object(value_node, deep=deep)
+    return mapping
+
+
+_UniqueKeySafeLoader.add_constructor(
+    yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG,
+    _construct_unique_mapping,
+)
+
+
+def _reject_non_json_safe(value: Any, *, path: str) -> None:
+    """Reject values that cannot be represented safely in saved metadata.
+
+    Accepted values are ``None``, booleans, integers, finite floats, strings,
+    dates, lists, and dictionaries with string keys. Array-like objects and
+    unordered containers must be converted explicitly by the caller.
+    """
+    if isinstance(value, _JSON_SAFE_SCALARS):
+        return
+    if isinstance(value, float):
+        if math.isnan(value) or math.isinf(value):
+            raise ValueError(f"{path}: NaN/Infinity are not permitted (got {value!r})")
+        return
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise ValueError(
+                    f"{path}: dict keys must be strings for a JSON-safe "
+                    f"config value, got {key!r} ({type(key).__name__})."
+                )
+            _reject_non_json_safe(item, path=f"{path}[{key!r}]")
+        return
+    if isinstance(value, list):
+        for i, item in enumerate(value):
+            _reject_non_json_safe(item, path=f"{path}[{i}]")
+        return
+    if isinstance(value, np.generic):
+        raise ValueError(
+            f"{path}: a numpy scalar ({type(value).__name__}, value "
+            f"{value!r}) is not a JSON-safe config value — convert "
+            f"explicitly with e.g. `.item()` before assigning it here."
+        )
+    if isinstance(value, np.ndarray):
+        raise ValueError(
+            f"{path}: a numpy array is not a JSON-safe config value — "
+            "convert explicitly with `.tolist()` before assigning it here."
+        )
+    if isinstance(value, (pd.Series, pd.DataFrame)):
+        raise ValueError(
+            f"{path}: a {type(value).__name__} is not a JSON-safe config "
+            "value — convert explicitly (e.g. `.tolist()`/`.to_dict()`) "
+            "before assigning it here."
+        )
+    if isinstance(value, (tuple, set, frozenset)):
+        raise ValueError(
+            f"{path}: a {type(value).__name__} is not a JSON-safe config "
+            "value — convert explicitly to a `list` before assigning it "
+            "here."
+        )
+    raise ValueError(
+        f"{path}: {type(value).__name__} is not a JSON-safe config value "
+        f"(got {value!r}) — config values must be one of None/bool/int/"
+        "finite-float/str/list/dict-with-string-keys. Convert explicitly to "
+        "one of those before assigning it here."
+    )
+
+
+class MissingValuePolicy(StrEnum):
+    """How the cleaner treats missing canonical market data."""
+
+    DROP = "drop"
+    FORWARD_FILL = "forward_fill"
+    RAISE = "raise"
+    NONE = "none"
+
+
+class RebalanceFrequency(StrEnum):
+    """Recognised rebalancing cadences.
+
+    ``custom`` is reserved for a future user-defined schedule and is rejected
+    by :class:`PortfolioConfig` until that schedule can be configured.
+    """
+
+    DAILY = "daily"
+    WEEKLY = "weekly"
+    MONTHLY = "monthly"
+    QUARTERLY = "quarterly"
+    CUSTOM = "custom"
+
+
+class ValidationMethod(StrEnum):
+    """Supported out-of-sample validation schemes."""
+
+    HOLDOUT = "holdout"
+    WALK_FORWARD = "walk_forward"
+
+
+class DataFrequency(StrEnum):
+    """Bar frequencies understood by QuantLab."""
+
+    D1 = "1d"
+    H1 = "1h"
+    W1 = "1w"
+    MO1 = "1mo"
+
+
+class DataSourceName(StrEnum):
+    """Market-data sources supported by the loader."""
+
+    YAHOO = "yahoo"
+    BINANCE = "binance"
+    CSV = "csv"
+
+
+class MarketCalendar(StrEnum):
+    """Market-hours model used for settlement, gaps, and annualisation.
+
+    QuantLab applies one calendar to the entire experiment. Yahoo defaults to
+    XNYS but may be configured as 24/7, Binance is always 24/7, and CSV
+    experiments must choose explicitly. Other calendars are not supported.
+    """
+
+    XNYS = "XNYS"
+    TWENTY_FOUR_SEVEN = "24/7"
+
+
+class OptimizationMetric(StrEnum):
+    """Metrics available for walk-forward parameter selection."""
+
+    SHARPE = "sharpe"
+    SORTINO = "sortino"
+    CALMAR = "calmar"
+    TOTAL_RETURN = "total_return"
+
+
+class SlippageModelName(StrEnum):
+    """Supported slippage models."""
+
+    CONSTANT = "constant"
+    VOLUME = "volume"
+
+
+class BenchmarkKind(StrEnum):
+    """Supported benchmark constructions."""
+
+    SYMBOL = "symbol"
+    EQUAL_WEIGHT = "equal_weight"
+    FIRST_ASSET = "first_asset"
+    CASH = "cash"
+
+
+class _StrictModel(BaseModel):
+    """Validated config model with forbidden extra keys and frozen attributes.
+
+    ``frozen=True`` prevents field reassignment, but Python lists and
+    dictionaries stored inside a field remain mutable. Callers must treat the
+    complete config tree as immutable and create changes with
+    :meth:`revalidated_copy` rather than mutating nested containers in place.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    def revalidated_copy(self, *, update: Mapping[str, Any] | None = None) -> Self:
+        """Copy with ``update`` applied, re-running every validator.
+
+        Pydantic's regular ``model_copy(update=...)`` does not validate the
+        updated values. This helper rebuilds the model from a fresh dump so
+        field bounds, relationship checks, and JSON-safety checks all run.
+
+        The returned model does not preserve ``model_fields_set`` because the
+        full dump makes defaults indistinguishable from explicitly supplied
+        fields. QuantLab does not rely on that Pydantic bookkeeping value.
+        """
+        data = self.model_dump(mode="python")
+        if update:
+            data.update(update)
+        return type(self).model_validate(data)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _reject_bool_for_numeric_fields(cls, data: Any) -> Any:
+        """Reject booleans before Pydantic coerces them to 0/1 numbers."""
+        if not isinstance(data, Mapping):
+            return data
+        for name, field in cls.model_fields.items():
+            if (
+                name in data
+                and isinstance(data[name], (bool, np.bool_))
+                and _is_numeric_annotation(field.annotation)
+            ):
+                raise ValueError(
+                    f"{name} must be numeric, not a boolean (got {data[name]!r})."
+                )
+        return data
+
+    @model_validator(mode="after")
+    def _reject_non_json_safe_fields(self) -> _StrictModel:
+        """Globally forbid NaN, Infinity, and non-JSON-safe values."""
+        for name, value in self.__dict__.items():
+            if isinstance(value, BaseModel):
+                continue
+            _reject_non_json_safe(value, path=f"{type(self).__name__}.{name}")
+        return self
+
+
+#: Frequencies supported by each remote backend. CSV frequency is checked
+#: against observed timestamps after the file is loaded.
+_SOURCE_SUPPORTED_FREQUENCIES: dict[DataSourceName, frozenset[DataFrequency]] = {
+    DataSourceName.YAHOO: frozenset(
+        {DataFrequency.D1, DataFrequency.H1, DataFrequency.W1, DataFrequency.MO1}
+    ),
+    DataSourceName.BINANCE: frozenset(
+        {DataFrequency.D1, DataFrequency.H1, DataFrequency.W1}
+    ),
+}
+
+
+class DataConfig(_StrictModel):
+    """Data-acquisition settings (the ``data:`` block)."""
+
+    source: DataSourceName = Field(
+        default=DataSourceName.YAHOO, description="Data source identifier."
+    )
+    symbols: list[str] = Field(min_length=1, description="Tickers to load.")
+    start_date: date
+    end_date: date
+    frequency: DataFrequency = Field(
+        default=DataFrequency.D1, description="Bar frequency."
+    )
+    missing_value_policy: MissingValuePolicy = MissingValuePolicy.DROP
+    forward_fill_limit: int = Field(
+        default=1,
+        ge=1,
+        description=(
+            "Maximum consecutive price bars filled per symbol when "
+            "missing_value_policy is 'forward_fill'."
+        ),
+    )
+    market_calendar: MarketCalendar | None = Field(
+        default=None,
+        description=(
+            "Market-hours model: 'XNYS' or '24/7'. Yahoo defaults to XNYS but "
+            "may select 24/7; Binance is always 24/7; CSV must set it explicitly."
+        ),
+    )
+    use_bundled_demo_data: bool = Field(
+        default=False,
+        description=(
+            "For source 'csv' only, use QuantLab's bundled synthetic demo "
+            "files when every requested symbol is absent from the local "
+            "raw-data directory (a partial match is always a hard error, "
+            "never a mix of local and bundled data). Must be enabled "
+            "explicitly."
+        ),
+    )
+
+    @property
+    def effective_market_calendar(self) -> MarketCalendar:
+        """Return the selected or source-implied market calendar."""
+        if self.source is DataSourceName.YAHOO:
+            return self.market_calendar or MarketCalendar.XNYS
+        if self.source is DataSourceName.BINANCE:
+            return MarketCalendar.TWENTY_FOUR_SEVEN
+        assert self.market_calendar is not None  # enforced by validator below
+        return self.market_calendar
+
+    @property
+    def is_247_market(self) -> bool:
+        """Resolve the effective 24/7-market flag."""
+        return self.effective_market_calendar is MarketCalendar.TWENTY_FOUR_SEVEN
+
+    @field_validator("symbols")
+    @classmethod
+    def _dedupe_and_upper(cls, value: list[str]) -> list[str]:
+        """Normalise tickers: strip, uppercase, drop duplicates (keep order).
+
+        Raises:
+            ValueError: If a symbol contains anything outside
+                `_SAFE_PATH_COMPONENT` — the ``csv`` source builds
+                ``raw_dir / f"{symbol}.csv"`` directly from this value with
+                no further sanitisation.
+        """
+        seen: set[str] = set()
+        out: list[str] = []
+        for raw in value:
+            sym = raw.strip().upper()
+            if not sym:
+                continue
+            _validate_path_component(sym, field_name="symbol")
+            if sym not in seen:
+                seen.add(sym)
+                out.append(sym)
+        if not out:
+            raise ValueError("`symbols` must contain at least one ticker.")
+        return out
+
+    @model_validator(mode="after")
+    def _check_dates(self) -> DataConfig:
+        if self.end_date < self.start_date:
+            raise ValueError(
+                f"end_date ({self.end_date}) must be on or after "
+                f"start_date ({self.start_date})."
+            )
+        if self.end_date == self.start_date and self.frequency is not DataFrequency.H1:
+            raise ValueError(
+                "start_date and end_date may be equal only for intraday "
+                "frequency '1h'; longer bar frequencies need a wider date range."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _check_frequency_supported(self) -> DataConfig:
+        allowed = _SOURCE_SUPPORTED_FREQUENCIES.get(self.source)
+        if allowed is not None and self.frequency not in allowed:
+            raise ValueError(
+                f"frequency '{self.frequency}' is not supported by source "
+                f"'{self.source}'. Supported: {sorted(allowed)}."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _check_forward_fill_limit_is_relevant(self) -> DataConfig:
+        if (
+            self.missing_value_policy is not MissingValuePolicy.FORWARD_FILL
+            and self.forward_fill_limit != 1
+        ):
+            raise ValueError(
+                "forward_fill_limit can differ from its default only when "
+                "missing_value_policy is 'forward_fill'."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _check_market_calendar_matches_source(self) -> DataConfig:
+        """Apply QuantLab's current one-calendar-per-experiment policy.
+
+        Yahoo supports XNYS or 24/7, Binance is always 24/7, and CSV has no
+        implied calendar. Other exchange calendars remain unsupported.
+        """
+        if self.source is DataSourceName.BINANCE:
+            if self.market_calendar not in (None, MarketCalendar.TWENTY_FOUR_SEVEN):
+                raise ValueError(
+                    f"market_calendar: {self.market_calendar!r} is not "
+                    "permitted with source: 'binance' — every Binance "
+                    "symbol genuinely trades 24/7, so there is no real "
+                    "instrument this combination could correctly describe. "
+                    "Leave market_calendar unset (implied '24/7')."
+                )
+        elif self.source is DataSourceName.CSV and self.market_calendar is None:
+            raise ValueError(
+                "market_calendar must be set explicitly ('XNYS' or '24/7') "
+                "for source: 'csv' — a CSV feed could contain either kind "
+                "of data, and nothing else here can tell which."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _check_bundled_demo_data_scoped_to_csv(self) -> DataConfig:
+        """Restrict the bundled synthetic-data fallback to CSV configs."""
+        if self.use_bundled_demo_data and self.source is not DataSourceName.CSV:
+            raise ValueError(
+                f"use_bundled_demo_data: true is not permitted with source: "
+                f"{self.source!r} — the bundled-demo-CSV fallback is only "
+                "ever consulted by the csv loader, so setting this alongside "
+                "any other source has no effect and only misleadingly "
+                "suggests an offline fallback is configured."
+            )
+        return self
+
+
+class StrategyConfig(_StrictModel):
+    """Strategy selection and its free-form parameter dictionary."""
+
+    name: str
+    parameters: dict[str, Any] = Field(default_factory=dict)
+
+
+class PortfolioConfig(_StrictModel):
+    """Portfolio construction and constraint settings."""
+
+    allocator: str = Field(default="equal_weight")
+    maximum_weight: float | None = Field(default=None, gt=0.0, le=1.0)
+    # Non-convex minimum-size and position-count limits apply to target
+    # portfolios. Turnover-limited transitional weights may temporarily differ.
+    target_minimum_weight: float | None = Field(default=None, ge=0.0)
+    maximum_gross_exposure: float | None = Field(default=None, gt=0.0)
+    maximum_net_exposure: float | None = Field(default=None, ge=0.0)
+    target_maximum_positions: int | None = Field(default=None, gt=0)
+    long_only: bool = False
+    # Volatility targeting
+    target_volatility: float | None = Field(default=None, gt=0.0)
+    volatility_window: int = Field(default=63, gt=1)
+    maximum_leverage: float = Field(default=1.0, gt=0.0)
+    rebalance_frequency: RebalanceFrequency = RebalanceFrequency.MONTHLY
+    # Maximum L1 weight change allowed at each rebalance.
+    maximum_turnover: float | None = Field(default=None, gt=0.0)
+
+    @model_validator(mode="after")
+    def _reject_unimplemented_custom_rebalancing(self) -> PortfolioConfig:
+        """Reject the reserved custom cadence before backtest execution."""
+        if self.rebalance_frequency is RebalanceFrequency.CUSTOM:
+            raise ValueError(
+                "rebalance_frequency 'custom' is not implemented. Choose "
+                "daily, weekly, monthly, or quarterly."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _check_weight_bounds(self) -> PortfolioConfig:
+        if (
+            self.target_minimum_weight is not None
+            and self.maximum_weight is not None
+            and self.target_minimum_weight > self.maximum_weight
+        ):
+            raise ValueError(
+                f"target_minimum_weight ({self.target_minimum_weight}) must "
+                f"not exceed maximum_weight ({self.maximum_weight})."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _warn_if_positions_and_weight_cap_infeasible(self) -> PortfolioConfig:
+        """Warn when the position/weight caps can't reach the gross ceiling.
+
+        E.g. ``target_maximum_positions=2`` with ``maximum_weight=0.30`` can
+        never exceed 60% gross. This warns rather than rejects because the
+        resulting under-investment may be intentional.
+        """
+        if (
+            self.target_maximum_positions is not None
+            and self.maximum_weight is not None
+        ):
+            achievable = self.target_maximum_positions * self.maximum_weight
+            ceiling = min(self.maximum_gross_exposure or 1.0, self.maximum_leverage)
+            if achievable < ceiling - 1e-9:
+                logger.warning(
+                    "target_maximum_positions (%d) x maximum_weight (%.4f) = "
+                    "%.4f can never reach the gross-exposure ceiling (%.4f) "
+                    "— this portfolio will structurally under-invest "
+                    "regardless of the signal, unless that is intentional.",
+                    self.target_maximum_positions,
+                    self.maximum_weight,
+                    achievable,
+                    ceiling,
+                )
+        return self
+
+
+class ExecutionConfig(_StrictModel):
+    """Transaction-cost parameters in basis points."""
+
+    commission_bps: float = Field(default=0.0, ge=0.0)
+    spread_bps: float = Field(default=0.0, ge=0.0)
+    slippage_bps: float = Field(default=0.0, ge=0.0)
+    slippage_model: SlippageModelName = SlippageModelName.CONSTANT
+    # Optional volume-based slippage coefficient.
+    impact_coefficient: float = Field(default=0.1, ge=0.0)
+
+
+class BacktestConfig(_StrictModel):
+    """Accounting and benchmark settings (the ``backtest:`` block)."""
+
+    initial_capital: float = Field(default=100_000.0, gt=0.0)
+    benchmark_kind: BenchmarkKind = BenchmarkKind.SYMBOL
+    benchmark_symbol: str | None = None
+    risk_free_rate: float = DEFAULT_RISK_FREE_RATE
+    periods_per_year: int | None = Field(default=None, gt=0)
+
+    @field_validator("benchmark_symbol")
+    @classmethod
+    def _normalize_and_validate_benchmark_symbol(cls, value: str | None) -> str | None:
+        """Normalise the benchmark and make it safe as a CSV/cache filename."""
+        if value is None:
+            return None
+        sym = value.strip().upper()
+        if not sym:
+            return None
+        _validate_path_component(sym, field_name="benchmark_symbol")
+        return sym
+
+    @model_validator(mode="after")
+    def _check_benchmark_configuration(self) -> BacktestConfig:
+        if (
+            self.benchmark_kind is not BenchmarkKind.SYMBOL
+            and self.benchmark_symbol is not None
+        ):
+            raise ValueError(
+                "benchmark_symbol is only valid when benchmark_kind='symbol'."
+            )
+        return self
+
+
+class ValidationConfig(_StrictModel):
+    """Out-of-sample validation settings."""
+
+    method: ValidationMethod = ValidationMethod.HOLDOUT
+    # Chronological holdout ratios. Train ratio inferred as remainder.
+    validation_ratio: float | None = Field(default=None, ge=0.0, lt=1.0)
+    test_ratio: float | None = Field(default=None, ge=0.0, lt=1.0)
+    # Walk-forward windows in number of periods.
+    train_window: int | None = Field(default=None, gt=0)
+    validation_window: int | None = Field(default=None, gt=0)
+    test_window: int | None = Field(default=None, gt=0)
+    expanding: bool = True
+    optimization_metric: OptimizationMetric = OptimizationMetric.SHARPE
+    # Optional strategy-parameter candidates for walk-forward selection. When
+    # omitted, QuantLab supplies a compact strategy-specific default grid.
+    parameter_grid: dict[str, list[Any]] | None = None
+
+    @model_validator(mode="after")
+    def _check_ratios(self) -> ValidationConfig:
+        val = self.validation_ratio or 0.0
+        test = self.test_ratio or 0.0
+        if val + test >= 1.0:
+            raise ValueError(
+                "validation_ratio + test_ratio must leave room for training "
+                f"(got {val} + {test} >= 1.0)."
+            )
+        if self.method is ValidationMethod.HOLDOUT and val > 0.0 and test <= 0.0:
+            raise ValueError(
+                "validation_ratio has no effect without a positive test_ratio "
+                "when validation.method is 'holdout'."
+            )
+        if self.method is ValidationMethod.WALK_FORWARD and (
+            self.validation_ratio is not None or self.test_ratio is not None
+        ):
+            raise ValueError(
+                "validation_ratio and test_ratio apply only to method 'holdout'; "
+                "remove them when validation.method is 'walk_forward'."
+            )
+        if self.parameter_grid is not None:
+            if self.method is not ValidationMethod.WALK_FORWARD:
+                raise ValueError(
+                    "parameter_grid applies only to validation.method 'walk_forward'."
+                )
+            for name, candidates in self.parameter_grid.items():
+                if not name.strip():
+                    raise ValueError("parameter_grid names must be non-empty strings.")
+                if not candidates:
+                    raise ValueError(
+                        f"parameter_grid.{name} must contain at least one candidate."
+                    )
+        return self
+
+
+class ReproducibilityConfig(_StrictModel):
+    """Determinism controls. One seed drives every stochastic step."""
+
+    random_seed: int = Field(default=42, ge=0)
+
+
+class ExperimentConfig(_StrictModel):
+    """Top-level, reproducible description of a single experiment.
+
+    Composes the sub-configs mirroring the YAML layout. Flat, read-only
+    accessor properties are also provided for convenience.
+    """
+
+    experiment_name: str
+    data: DataConfig
+    strategy: StrategyConfig
+    portfolio: PortfolioConfig = Field(default_factory=PortfolioConfig)
+    execution: ExecutionConfig = Field(default_factory=ExecutionConfig)
+    backtest: BacktestConfig = Field(default_factory=BacktestConfig)
+    validation: ValidationConfig = Field(default_factory=ValidationConfig)
+    reproducibility: ReproducibilityConfig = Field(
+        default_factory=ReproducibilityConfig
+    )
+
+    @field_validator("experiment_name")
+    @classmethod
+    def _validate_experiment_name(cls, value: str) -> str:
+        """Reject names that are unsafe as report-directory components."""
+        _validate_path_component(value, field_name="experiment_name")
+        return value
+
+    @model_validator(mode="after")
+    def _check_component_names(self) -> ExperimentConfig:
+        """Validate registered components and strategy-specific parameters.
+
+        Imports stay local because the portfolio and strategy registries import
+        this module while they are initialised.
+        """
+        from quantlab.portfolio.allocator import available_allocators
+        from quantlab.strategies import (
+            available_strategies,
+            strategy_parameter_names,
+            validate_strategy_parameters,
+        )
+
+        allocators = available_allocators()
+        if self.portfolio.allocator not in allocators:
+            raise ValueError(
+                f"Unknown portfolio.allocator '{self.portfolio.allocator}'. "
+                f"Registered allocators: {allocators}."
+            )
+        strategies = available_strategies()
+        if self.strategy.name not in strategies:
+            raise ValueError(
+                f"Unknown strategy.name '{self.strategy.name}'. "
+                f"Registered strategies: {strategies}."
+            )
+        # Validate parameters without constructing the strategy.
+        validate_strategy_parameters(self.strategy.name, self.strategy.parameters)
+        parameter_grid = self.validation.parameter_grid
+        if parameter_grid is not None:
+            accepted = strategy_parameter_names(self.strategy.name)
+            unknown = sorted(set(parameter_grid) - accepted)
+            if unknown:
+                raise ValueError(
+                    f"Unknown validation.parameter_grid key(s) {unknown} for "
+                    f"strategy '{self.strategy.name}'. Accepted parameters: "
+                    f"{sorted(accepted)}."
+                )
+            names = list(parameter_grid)
+            for values in itertools.product(*(parameter_grid[name] for name in names)):
+                validate_strategy_parameters(
+                    self.strategy.name,
+                    {
+                        **self.strategy.parameters,
+                        **dict(zip(names, values, strict=True)),
+                    },
+                )
+        # A pairs strategy can trade only symbols present in the loaded universe.
+        if self.strategy.name == "pairs_trading":
+            symbol_a = str(self.strategy.parameters["symbol_a"]).strip().upper()
+            symbol_b = str(self.strategy.parameters["symbol_b"]).strip().upper()
+            missing = [s for s in (symbol_a, symbol_b) if s not in self.data.symbols]
+            if missing:
+                raise ValueError(
+                    f"pairs_trading symbol(s) {missing} not in data.symbols "
+                    f"{self.data.symbols}. Add them to data.symbols so they "
+                    "are actually downloaded/loaded."
+                )
+            if self.portfolio.allocator != "signal_proportional":
+                raise ValueError(
+                    "pairs_trading requires portfolio.allocator "
+                    "'signal_proportional' so its dollar hedge ratio is preserved."
+                )
+            if (
+                self.portfolio.maximum_weight is not None
+                and self.portfolio.maximum_weight < 1.0
+            ):
+                raise ValueError(
+                    "pairs_trading does not support portfolio.maximum_weight "
+                    "because independently capping its legs changes the hedge ratio."
+                )
+            if (
+                self.portfolio.target_minimum_weight is not None
+                and self.portfolio.target_minimum_weight > 0.0
+            ):
+                raise ValueError(
+                    "pairs_trading does not support target_minimum_weight because "
+                    "dropping one small leg breaks the pair hedge."
+                )
+            if (
+                self.portfolio.target_maximum_positions is not None
+                and self.portfolio.target_maximum_positions < 2
+            ):
+                raise ValueError(
+                    "pairs_trading requires target_maximum_positions >= 2."
+                )
+            if self.portfolio.long_only:
+                raise ValueError("pairs_trading requires portfolio.long_only=false.")
+        if self.strategy.name == "cross_sectional_momentum":
+            parameters = self.strategy.parameters
+            top_fraction = float(parameters.get("top_fraction", 0.25))
+            long_short = bool(parameters.get("long_short", False))
+            bottom_fraction = (
+                float(parameters.get("bottom_fraction", 0.25)) if long_short else 0.0
+            )
+            available = len(self.data.symbols)
+            top_count = max(1, int(available * top_fraction)) if top_fraction else 0
+            bottom_count = (
+                max(1, int(available * bottom_fraction)) if bottom_fraction else 0
+            )
+            if top_count + bottom_count > available:
+                raise ValueError(
+                    "cross_sectional_momentum needs enough distinct symbols for "
+                    f"its top/bottom selections ({top_count} + {bottom_count} "
+                    f"requested, {available} configured)."
+                )
+        if self.strategy.name == "time_series_momentum":
+            scaling = self.strategy.parameters.get("signal_scaling", "binary")
+            if scaling != "binary" and self.portfolio.allocator == "equal_weight":
+                raise ValueError(
+                    "Non-binary time_series_momentum signals require an allocator "
+                    "that preserves signal magnitude; equal_weight keeps only signs."
+                )
+            if scaling == "volatility_adjusted" and self.portfolio.allocator in {
+                "inverse_volatility",
+                "volatility_targeting",
+            }:
+                raise ValueError(
+                    "volatility_adjusted time_series_momentum must not be combined "
+                    "with an allocator that applies inverse-volatility sizing again."
+                )
+        return self
+
+    # ----------------------------------------------------------------- #
+    # Construction helpers
+    # ----------------------------------------------------------------- #
+    @classmethod
+    def from_yaml(cls, path: str | Path) -> ExperimentConfig:
+        """Load and validate an experiment config from a YAML file.
+
+        Args:
+            path: Path to a YAML config file.
+
+        Returns:
+            A validated :class:`ExperimentConfig`.
+
+        Raises:
+            InvalidConfigurationError: If the file is missing, unreadable, or
+                fails validation.
+        """
+        path = Path(path)
+        if not path.is_file():
+            raise InvalidConfigurationError(
+                f"Config file not found: {path}. "
+                f"Check the path or create it under configs/."
+            )
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeError) as exc:
+            raise InvalidConfigurationError(
+                f"Could not read YAML config {path}: {exc}"
+            ) from exc
+        try:
+            raw = yaml.load(text, Loader=_UniqueKeySafeLoader)
+        except yaml.YAMLError as exc:
+            raise InvalidConfigurationError(
+                f"Could not parse YAML config {path}: {exc}"
+            ) from exc
+        if not isinstance(raw, dict):
+            raise InvalidConfigurationError(
+                f"Config {path} must be a YAML mapping, got {type(raw).__name__}."
+            )
+        return cls.from_dict(raw)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> ExperimentConfig:
+        """Validate a plain dict into an :class:`ExperimentConfig`."""
+        try:
+            return cls.model_validate(data)
+        except Exception as exc:  # pydantic.ValidationError and friends
+            raise InvalidConfigurationError(
+                f"Invalid experiment configuration: {exc}"
+            ) from exc
+
+    def to_yaml(self, path: str | Path) -> Path:
+        """Serialise this config to YAML (used to snapshot each run).
+
+        Args:
+            path: Destination file.
+
+        Returns:
+            The path written to.
+        """
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = self.model_dump(mode="json")
+        path.write_text(
+            yaml.safe_dump(payload, sort_keys=False, allow_unicode=True),
+            encoding="utf-8",
+        )
+        return path
+
+    # ----------------------------------------------------------------- #
+    # Derived values
+    # ----------------------------------------------------------------- #
+    @property
+    def periods_per_year(self) -> int:
+        """Resolve annualisation factor.
+
+        Priority: explicit ``backtest.periods_per_year`` > frequency lookup >
+        daily default. The frequency lookup distinguishes XNYS sessions from
+        24/7 markets.
+        """
+        if self.backtest.periods_per_year is not None:
+            return self.backtest.periods_per_year
+        table = (
+            CRYPTO_FREQUENCY_TO_PERIODS_PER_YEAR
+            if self.data.is_247_market
+            else FREQUENCY_TO_PERIODS_PER_YEAR
+        )
+        return table.get(self.data.frequency, TRADING_DAYS_PER_YEAR)
+
+    # ----------------------------------------------------------------- #
+    # Flat convenience accessors
+    # ----------------------------------------------------------------- #
+    @property
+    def data_source(self) -> str:
+        """Data source identifier (e.g. ``"yahoo"``, ``"binance"``, ``"csv"``)."""
+        return self.data.source
+
+    @property
+    def symbols(self) -> list[str]:
+        """Normalised list of tickers to load."""
+        return list(self.data.symbols)
+
+    @property
+    def start_date(self) -> date:
+        """Inclusive start date of the experiment."""
+        return self.data.start_date
+
+    @property
+    def end_date(self) -> date:
+        """Inclusive end date of the experiment."""
+        return self.data.end_date
+
+    @property
+    def frequency(self) -> str:
+        """Bar frequency (e.g. ``"1d"``)."""
+        return self.data.frequency
+
+    @property
+    def strategy_name(self) -> str:
+        """Registered strategy name to instantiate."""
+        return self.strategy.name
+
+    @property
+    def strategy_parameters(self) -> dict[str, Any]:
+        """Free-form parameter dict passed to the strategy constructor."""
+        return dict(self.strategy.parameters)
+
+    @property
+    def initial_capital(self) -> float:
+        """Starting equity for the backtest."""
+        return self.backtest.initial_capital
+
+    @property
+    def risk_free_rate(self) -> float:
+        """Annual risk-free rate used by excess-return metrics."""
+        return self.backtest.risk_free_rate
+
+    @property
+    def benchmark_symbol(self) -> str | None:
+        """Symbol to compare performance against, if any."""
+        return self.backtest.benchmark_symbol
+
+    @property
+    def benchmark_kind(self) -> BenchmarkKind:
+        """Benchmark construction used for relative metrics."""
+        return self.backtest.benchmark_kind
+
+    @property
+    def benchmark_label(self) -> str | None:
+        """Human-readable benchmark name, or ``None`` when disabled."""
+        kind = self.backtest.benchmark_kind
+        if kind is BenchmarkKind.SYMBOL:
+            return self.backtest.benchmark_symbol
+        if kind is BenchmarkKind.EQUAL_WEIGHT:
+            return "Equal weight"
+        if kind is BenchmarkKind.FIRST_ASSET:
+            return self.symbols[0]
+        return "Cash"
+
+    @property
+    def commission_bps(self) -> float:
+        """Commission in basis points of traded notional."""
+        return self.execution.commission_bps
+
+    @property
+    def slippage_bps(self) -> float:
+        """Slippage in basis points of traded notional."""
+        return self.execution.slippage_bps
+
+    @property
+    def spread_bps(self) -> float:
+        """Full quoted spread in basis points."""
+        return self.execution.spread_bps
+
+    @property
+    def rebalance_frequency(self) -> str:
+        """Configured rebalancing cadence as a string."""
+        return str(self.portfolio.rebalance_frequency)
+
+    @property
+    def random_seed(self) -> int:
+        """Seed applied to every stochastic step for reproducibility."""
+        return self.reproducibility.random_seed

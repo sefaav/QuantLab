@@ -1,0 +1,94 @@
+# Byte-compiled / optimized
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Distribution / packaging
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+# Temporary sdist extraction used by the packaging smoke test.
+sdist_extracted/
+
+# Generated documentation site (mkdocs build output)
+site/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Testing / coverage
+.pytest_cache/
+.pytest-local/
+.pytest-*/
+.mypy_cache/
+.ruff_cache/
+.uv-*-cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+
+# Data — keep the folder structure but never commit downloaded market data.
+# Exception: the small SYNTHETIC demo CSVs used by configs/demo_offline.yaml
+# so the offline demo works from a fresh clone with no network access.
+data/raw/*
+data/processed/*
+data/metadata/*
+data/cache/*
+!data/**/.gitkeep
+!data/raw/SPY.csv
+!data/raw/QQQ.csv
+!data/raw/TLT.csv
+!data/raw/GLD.csv
+
+# Generated reports (kept out of VCS; regenerate with the CLI)
+reports/generated/*
+!reports/generated/.gitkeep
+reports/figures/*
+!reports/figures/.gitkeep
+!reports/figures/dashboard_home.png
+!reports/figures/dashboard_results.png
+reports/tables/*
+!reports/tables/.gitkeep
+
+# Logs — never commit; may contain run details (never API keys)
+logs/
+*.log
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Local diagnostic scratch files and directories.
+.audit-*
+.audit_*
+.tmp-*
+.tmp_*
+
+# IDE / OS
+.vscode/
+.idea/
+.claude/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Local secrets and private keys.
+.env
+.env.*
+!.env.example
+.streamlit/secrets.toml
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+secrets.yaml
+secrets.yml
+secrets.json

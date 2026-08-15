@@ -1,0 +1,528 @@
+"""Command-line interface for QuantLab.
+
+Commands:
+
+    quantlab download      --config configs/momentum_sp500.yaml
+    quantlab backtest      --config configs/momentum_sp500.yaml
+    quantlab walk-forward  --config configs/momentum_sp500.yaml
+    quantlab report        --experiment cross_sectional_momentum_etfs
+    quantlab dashboard
+
+Commands display their main pipeline steps and convert expected QuantLab
+errors into non-zero process exit codes. Package logs are written to the
+configured QuantLab log directory.
+"""
+
+from __future__ import annotations
+
+import sys
+from pathlib import Path, PurePosixPath, PureWindowsPath
+from typing import TYPE_CHECKING, Any
+
+import typer
+
+from quantlab.constants import GENERATED_REPORTS_DIR
+from quantlab.exceptions import InsufficientDataError, QuantLabError
+from quantlab.logging_config import configure_logging, get_logger
+
+if TYPE_CHECKING:
+    # Only for type checking: the CLI otherwise lazy-imports heavy modules
+    # inside each command so `quantlab --help` stays fast.
+    from quantlab.backtesting.result import BacktestResult
+    from quantlab.config import ExperimentConfig
+    from quantlab.data.validator import DataQualityReport
+
+app = typer.Typer(
+    add_completion=False,
+    help="QuantLab — reproducible quantitative research and backtesting.",
+    no_args_is_help=True,
+)
+logger = get_logger(__name__)
+
+_CONFIG_OPTION = typer.Option(
+    None, "--config", "-c", help="Path to the experiment YAML config."
+)
+_SHIPPED_CONFIG_OPTION = typer.Option(
+    None,
+    "--shipped-config",
+    help=(
+        "Name of a config bundled with the installed package (e.g. "
+        "'demo_offline' or 'demo_offline.yaml') — works even without a full "
+        "repo checkout (no local configs/ directory). Mutually exclusive "
+        "with --config."
+    ),
+)
+
+
+def _echo_step(message: str) -> None:
+    """Print a pipeline step to the console and package log.
+
+    The ASCII marker remains compatible with legacy Windows console encodings.
+    """
+    typer.secho(f"-> {message}", fg=typer.colors.CYAN)
+    logger.info(message)
+
+
+def _resolve_config_path(config: Path | None, shipped_config: str | None) -> Path:
+    """Resolve exactly one explicit or package-bundled configuration.
+
+    ``--config`` is never silently redirected to a same-named bundled file;
+    package configurations require the explicit ``--shipped-config`` option.
+
+    Raises:
+        QuantLabError: If neither or both options are provided, or if the
+            requested bundled configuration does not exist.
+    """
+    from quantlab.constants import CONFIGS_DIR
+
+    if (config is None) == (shipped_config is None):
+        raise QuantLabError(
+            "Exactly one of --config PATH or --shipped-config NAME is required."
+        )
+    if shipped_config is not None:
+        raw_name = shipped_config.strip()
+        windows_path = PureWindowsPath(raw_name)
+        posix_path = PurePosixPath(raw_name)
+        invalid_name = (
+            not raw_name
+            or raw_name != shipped_config
+            or "/" in raw_name
+            or "\\" in raw_name
+            or windows_path.is_absolute()
+            or bool(windows_path.drive)
+            or posix_path.is_absolute()
+            or raw_name in {".", ".."}
+        )
+        suffix = Path(raw_name).suffix.lower()
+        if invalid_name or (suffix and suffix not in {".yaml", ".yml"}):
+            raise QuantLabError(
+                f"Invalid shipped config name {shipped_config!r}: use a simple "
+                "YAML filename such as 'demo_offline' or 'demo_offline.yaml'."
+            )
+        name = raw_name if suffix else f"{raw_name}.yaml"
+        configs_root = CONFIGS_DIR.resolve()
+        bundled = (configs_root / name).resolve()
+        if bundled.parent != configs_root or not bundled.is_relative_to(configs_root):
+            raise QuantLabError(
+                f"Invalid shipped config name {shipped_config!r}: the resolved "
+                "path must remain directly inside the bundled-config directory."
+            )
+        if not bundled.is_file():
+            available = sorted(
+                {
+                    path.stem
+                    for pattern in ("*.yaml", "*.yml")
+                    for path in CONFIGS_DIR.glob(pattern)
+                }
+            )
+            raise QuantLabError(
+                f"No shipped config named {shipped_config!r} (looked for "
+                f"{bundled}). Available: {available}."
+            )
+        return bundled
+    assert config is not None  # guaranteed by the exactly-one check above
+    return config
+
+
+def _load_config(config_path: Path) -> ExperimentConfig:
+    from quantlab.config import ExperimentConfig
+
+    _echo_step(f"Loading config {config_path}")
+    return ExperimentConfig.from_yaml(config_path)
+
+
+def _echo_data_warnings(report: DataQualityReport, *, limit: int = 10) -> None:
+    """Print a limited number of data-quality warnings.
+
+    The complete warning list is persisted in the saved report and metadata.
+    """
+    if not report.warnings:
+        return
+    limit = max(0, limit)
+    typer.secho(f"  data warnings: {len(report.warnings)}", fg=typer.colors.YELLOW)
+    for message in report.warnings[:limit]:
+        typer.secho(f"    - {message}", fg=typer.colors.YELLOW)
+    if len(report.warnings) > limit:
+        typer.secho(
+            f"    ... and {len(report.warnings) - limit} more "
+            "(included in the saved report and metadata).",
+            fg=typer.colors.YELLOW,
+        )
+
+
+def _echo_save_outcome(result: BacktestResult, success_message: str) -> None:
+    """Print a success message or a partial-rendering warning."""
+    if result.save_warnings:
+        typer.secho(
+            f"[WARN] {success_message} — but with {len(result.save_warnings)} "
+            "warning(s) (report/figures may be incomplete or missing; see log):",
+            fg=typer.colors.YELLOW,
+        )
+        for warning in result.save_warnings:
+            typer.secho(f"  - {warning}", fg=typer.colors.YELLOW)
+    else:
+        typer.secho(f"[OK] {success_message}", fg=typer.colors.GREEN)
+
+
+def _echo_parameter_grid(strategy_name: str, grid: dict[str, list[Any]]) -> None:
+    """Describe the effective walk-forward search without overstating it."""
+    if grid:
+        combinations = 1
+        for values in grid.values():
+            combinations *= len(values)
+        typer.echo(
+            f"  parameter grid: {combinations} combination(s) across "
+            f"{len(grid)} parameter(s)"
+        )
+        return
+    if strategy_name == "buy_and_hold":
+        typer.echo(
+            "  parameter grid: 1 combination (buy_and_hold has no "
+            "parameters to optimize; using the configured strategy as-is)"
+        )
+        return
+    typer.echo(
+        "  parameter grid: 1 combination (no optimization dimensions; "
+        "using the configured strategy parameters as-is)"
+    )
+
+
+@app.command()
+def download(
+    config: Path | None = _CONFIG_OPTION,
+    shipped_config: str | None = _SHIPPED_CONFIG_OPTION,
+    force: bool = typer.Option(
+        False,
+        "--force",
+        help="Ignore the existing cache and download remote data again.",
+    ),
+) -> None:
+    """Acquire the market data required by an experiment.
+
+    Yahoo and Binance data are downloaded when necessary and stored in the
+    local Parquet cache. CSV data are loaded from local files and are not
+    written to that cache.
+
+    A separately configured symbol benchmark is acquired as well when it is
+    not already part of the tradable universe. Use ``--force`` to refresh
+    remote data even when the existing cache already covers the requested
+    period.
+    """
+    configure_logging()
+    try:
+        cfg = _load_config(_resolve_config_path(config, shipped_config))
+
+        from quantlab.data.loader import DataLoader
+
+        symbols = list(cfg.symbols)
+        if (
+            str(cfg.benchmark_kind) == "symbol"
+            and cfg.benchmark_symbol
+            and cfg.benchmark_symbol not in symbols
+        ):
+            symbols.append(cfg.benchmark_symbol)
+
+        source = str(cfg.data_source)
+
+        if source == "csv":
+            _echo_step(f"Loading {len(symbols)} symbol(s) from local CSV files")
+        elif force:
+            _echo_step(
+                f"Refreshing {len(symbols)} symbol(s) from {source} "
+                "(ignoring the existing cache)"
+            )
+        else:
+            _echo_step(
+                f"Acquiring {len(symbols)} symbol(s) from {source} "
+                "(using the cache when available)"
+            )
+
+        data = DataLoader().download(cfg, force=force)
+        symbol_count = int(data["symbol"].nunique())
+
+        if source == "csv":
+            typer.secho(
+                f"[OK] Loaded {len(data)} rows for "
+                f"{symbol_count} symbol(s) from CSV files.",
+                fg=typer.colors.GREEN,
+            )
+        else:
+            typer.secho(
+                f"[OK] Data available for {symbol_count} symbol(s) "
+                f"({len(data)} rows returned).",
+                fg=typer.colors.GREEN,
+            )
+
+    except QuantLabError as exc:
+        typer.secho(f"[ERROR] {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1) from exc
+
+
+@app.command()
+def backtest(
+    config: Path | None = _CONFIG_OPTION,
+    shipped_config: str | None = _SHIPPED_CONFIG_OPTION,
+    output: Path | None = typer.Option(
+        None,
+        "--output",
+        "-o",
+        help=(
+            "Output directory. By default, uses QuantLab's generated-reports "
+            "directory (reports/generated/ in a checkout; ~/.quantlab after a "
+            "regular installation)."
+        ),
+    ),
+) -> None:
+    """Run a backtest and save its artefact bundle.
+
+    This command does not compute walk-forward or stress-test artefacts. Saving
+    over an existing experiment directory removes those earlier optional files.
+    """
+    configure_logging()
+    try:
+        cfg = _load_config(_resolve_config_path(config, shipped_config))
+        from quantlab.backtesting.runner import run_backtest_from_config
+        from quantlab.data.loader import DataLoader
+
+        _echo_step("Loading and validating data")
+        data, report = DataLoader().load(cfg)
+        _echo_data_warnings(report)
+
+        _echo_step(f"Running backtest '{cfg.experiment_name}'")
+        result = run_backtest_from_config(data, cfg, data_quality_report=report)
+
+        _echo_step("Saving results")
+        out_dir = result.save(output)
+
+        typer.echo("")
+        typer.echo(result.summary())
+        typer.echo("")
+        _echo_save_outcome(result, f"Saved to {out_dir}")
+    except QuantLabError as exc:
+        typer.secho(f"[ERROR] {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1) from exc
+
+
+@app.command(name="walk-forward")
+def walk_forward(
+    config: Path | None = _CONFIG_OPTION,
+    shipped_config: str | None = _SHIPPED_CONFIG_OPTION,
+) -> None:
+    """Run walk-forward validation and robustness tests."""
+    configure_logging()
+    try:
+        cfg = _load_config(_resolve_config_path(config, shipped_config))
+        from quantlab.backtesting.runner import run_backtest_from_config
+        from quantlab.data.loader import DataLoader
+        from quantlab.validation.robustness import run_stress_tests
+        from quantlab.validation.walk_forward import WalkForwardValidator
+
+        _echo_step("Loading and validating data")
+        data, report = DataLoader().load(cfg)
+        _echo_data_warnings(report)
+
+        _echo_step("Running walk-forward validation")
+        grid = _default_grid(cfg)
+        _echo_parameter_grid(cfg.strategy_name, grid)
+        validator = WalkForwardValidator(cfg)
+        train_window = cfg.validation.train_window or 500
+        validation_window = cfg.validation.validation_window or 126
+        test_window = cfg.validation.test_window or 126
+        if not (
+            cfg.validation.train_window
+            and cfg.validation.validation_window
+            and cfg.validation.test_window
+        ):
+            # Apply the documented CLI defaults and make every fallback visible.
+            typer.secho(
+                "  using default window(s) "
+                f"(train={train_window}, validation={validation_window}, "
+                f"test={test_window}) — set validation.train_window / "
+                "validation_window / test_window explicitly to override.",
+                fg=typer.colors.YELLOW,
+            )
+        wf = validator.run(
+            data,
+            parameter_grid=grid,
+            train_window=train_window,
+            validation_window=validation_window,
+            test_window=test_window,
+            expanding=cfg.validation.expanding,
+        )
+
+        if not wf.folds:
+            raise InsufficientDataError(
+                "No walk-forward folds fit the available history and configured "
+                f"windows (train={train_window}, validation={validation_window}, "
+                f"test={test_window})."
+            )
+
+        _echo_step("Running stress tests")
+        stress = run_stress_tests(data, cfg)
+
+        out = GENERATED_REPORTS_DIR / cfg.experiment_name
+
+        # Attach OOS metrics to a fresh full-sample result before saving one bundle.
+        result = run_backtest_from_config(data, cfg, data_quality_report=report)
+        oos = wf.oos_metrics(cfg.periods_per_year, cfg.risk_free_rate)
+        result.metadata["walk_forward_oos_metrics"] = oos
+        result.metadata["walk_forward_parameter_grid"] = grid
+        result.metadata["walk_forward_windows"] = {
+            "train_window": train_window,
+            "validation_window": validation_window,
+            "test_window": test_window,
+            "expanding": cfg.validation.expanding,
+        }
+        # Capture the walk-forward configuration so later report regeneration can
+        # reject OOS artefacts produced by a different configuration.
+        result.metadata["walk_forward_config_snapshot"] = cfg.model_dump(mode="json")
+        # Preserve the original walk-forward timestamp separately from timestamps
+        # created by later report-only regenerations.
+        result.metadata["walk_forward_run_timestamp"] = result.metadata["run_timestamp"]
+        # Save the numerical bundle and its validation artefacts under one marker
+        # and cross-process lock. BacktestResult computes checksums only after each
+        # CSV has been atomically replaced.
+        result.save(
+            out,
+            robustness={
+                "walk_forward": wf.summary_table(),
+                "stress_tests": stress,
+            },
+            validation_artifacts={
+                "walk_forward_results.csv": wf.summary_table(),
+                "walk_forward_oos_returns.csv": wf.oos_returns.rename("return"),
+                "walk_forward_oos_equity.csv": wf.oos_equity.rename("equity"),
+                "stress_tests.csv": stress,
+            },
+        )
+
+        _echo_save_outcome(
+            result, f"Walk-forward done ({len(wf.folds)} folds). Saved to {out}"
+        )
+        typer.echo(
+            f"  OOS Sharpe: {oos.get('sharpe_ratio', 0):.2f} | "
+            f"OOS CAGR: {oos.get('cagr', 0):.2%}"
+        )
+    except QuantLabError as exc:
+        typer.secho(f"[ERROR] {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1) from exc
+
+
+@app.command()
+def report(
+    experiment: str = typer.Option(
+        ...,
+        "--experiment",
+        "-e",
+        help=(
+            "Regenerate a report from a previously saved experiment. If none exists, "
+            "run a bundled QuantLab config with the same experiment name."
+        ),
+    ),
+) -> None:
+    """Regenerate a report from a saved experiment or matching bundled config."""
+    configure_logging()
+    try:
+        reports_root = GENERATED_REPORTS_DIR.resolve()
+        exp_dir = (GENERATED_REPORTS_DIR / experiment).resolve()
+        if not exp_dir.is_relative_to(reports_root):
+            raise QuantLabError(
+                f"Invalid --experiment {experiment!r}: must not escape the "
+                f"generated-reports directory ({GENERATED_REPORTS_DIR})."
+            )
+        config_path = exp_dir / "config.yaml"
+        if not config_path.is_file():
+            # Fall back to a shipped config of the same name.
+            from quantlab.constants import CONFIGS_DIR
+
+            candidates = sorted(
+                path
+                for pattern in ("*.yaml", "*.yml")
+                for path in CONFIGS_DIR.glob(pattern)
+            )
+            for candidate in candidates:
+                from quantlab.config import ExperimentConfig
+
+                if ExperimentConfig.from_yaml(candidate).experiment_name == experiment:
+                    config_path = candidate
+                    break
+        if not config_path.is_file():
+            raise QuantLabError(
+                f"No saved or bundled config found for experiment {experiment!r}. "
+                "Run `quantlab backtest` first or check the experiment name."
+            )
+        cfg = _load_config(config_path)
+        if cfg.experiment_name != experiment:
+            raise QuantLabError(
+                f"Config {config_path} declares experiment_name="
+                f"{cfg.experiment_name!r}, but --experiment was {experiment!r}."
+            )
+        from quantlab.backtesting.result import save_with_walk_forward_reuse
+        from quantlab.backtesting.runner import run_backtest_from_config
+        from quantlab.data.loader import DataLoader
+
+        _echo_step("Reloading data and re-running for the report")
+        data, report = DataLoader().load(cfg)
+        _echo_data_warnings(report)
+        result = run_backtest_from_config(data, cfg, data_quality_report=report)
+
+        # A report-only run does not recompute walk-forward validation.
+        # Reuse earlier OOS artefacts only when their provenance checks pass.
+        out = save_with_walk_forward_reuse(result, exp_dir)
+        _echo_save_outcome(result, f"Report at {out / 'report.html'}")
+    except QuantLabError as exc:
+        typer.secho(f"[ERROR] {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1) from exc
+
+
+@app.command()
+def dashboard() -> None:
+    """Launch the Streamlit dashboard."""
+    import subprocess
+    from importlib.util import find_spec
+
+    configure_logging()
+
+    if find_spec("streamlit") is None:
+        typer.secho(
+            "[ERROR] Streamlit is not installed. Install it with: "
+            'python -m pip install -e ".[dashboard]"',
+            fg=typer.colors.RED,
+            err=True,
+        )
+        raise typer.Exit(code=1)
+
+    app_path = Path(__file__).parent / "dashboard" / "app.py"
+    if not app_path.is_file():
+        typer.secho(
+            f"[ERROR] Dashboard entry point not found: {app_path}",
+            fg=typer.colors.RED,
+            err=True,
+        )
+        raise typer.Exit(code=1)
+
+    _echo_step(f"Launching Streamlit dashboard: {app_path}")
+
+    try:
+        subprocess.run(
+            [sys.executable, "-m", "streamlit", "run", str(app_path)],
+            check=True,
+        )
+    except subprocess.CalledProcessError as exc:
+        typer.secho(
+            f"[ERROR] Streamlit exited with status {exc.returncode}.",
+            fg=typer.colors.RED,
+            err=True,
+        )
+        raise typer.Exit(code=exc.returncode) from exc
+
+
+def _default_grid(cfg: ExperimentConfig) -> dict[str, list[Any]]:
+    """Return the configured or default grid shared by research interfaces."""
+    from quantlab.validation.parameter_grid import parameter_grid_for_config
+
+    return parameter_grid_for_config(cfg)
+
+
+if __name__ == "__main__":  # pragma: no cover
+    app()

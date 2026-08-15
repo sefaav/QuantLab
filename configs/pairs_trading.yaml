@@ -1,0 +1,52 @@
+# Example experiment: pairs trading on two economically-related ETFs.
+# EWA (Australia) / EWC (Canada) are two commodity-linked developed markets — a
+# classic, economically-motivated pair (not chosen for historical performance).
+experiment_name: pairs_trading_ewa_ewc
+
+data:
+  source: yahoo
+  symbols:
+    - EWA
+    - EWC
+  start_date: "2010-01-01"
+  end_date: "2025-12-31"
+  frequency: "1d"
+  missing_value_policy: "drop"
+
+strategy:
+  name: pairs_trading
+  parameters:
+    symbol_a: EWA
+    symbol_b: EWC
+    formation_window: 252
+    zscore_window: 63
+    entry_zscore: 2.0
+    exit_zscore: 0.5
+    stop_zscore: 4.0
+    dynamic_hedge_ratio: true
+
+portfolio:
+  allocator: signal_proportional
+  maximum_gross_exposure: 2.0
+  maximum_net_exposure: 1.0
+  rebalance_frequency: daily
+
+execution:
+  commission_bps: 2.0
+  spread_bps: 3.0
+  slippage_bps: 2.0
+  slippage_model: constant
+
+backtest:
+  initial_capital: 100000
+  benchmark_symbol: SPY
+  risk_free_rate: 0.02
+  periods_per_year: 252
+
+validation:
+  method: holdout
+  validation_ratio: 0.2
+  test_ratio: 0.2
+
+reproducibility:
+  random_seed: 42

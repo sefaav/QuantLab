@@ -1,0 +1,71 @@
+# Example experiment:
+# Robust Cross-Sectional Momentum Across Liquid Multi-Asset ETFs.
+#
+# Research question: Can cross-sectional momentum generate stable out-of-sample
+# risk-adjusted returns across liquid ETFs after transaction costs and
+# volatility targeting?
+experiment_name: cross_sectional_momentum_etfs
+
+data:
+  source: yahoo
+  symbols:
+    - SPY   # US large cap
+    - QQQ   # US tech / Nasdaq 100
+    - IWM   # US small cap
+    - EFA   # Developed ex-US
+    - EEM   # Emerging markets
+    - TLT   # Long US treasuries
+    - GLD   # Gold
+    - VNQ   # US real estate
+  start_date: "2008-01-01"
+  end_date: "2025-12-31"
+  frequency: "1d"
+  missing_value_policy: "drop"
+
+strategy:
+  name: cross_sectional_momentum
+  parameters:
+    lookback_period: 252     # ~12 months
+    skip_period: 21          # exclude the most recent month
+    top_fraction: 0.25
+    bottom_fraction: 0.25
+    long_short: false        # long-only for the main version
+    signal_scaling: binary
+
+portfolio:
+  allocator: inverse_volatility
+  maximum_weight: 0.30
+  maximum_gross_exposure: 1.0
+  maximum_net_exposure: 1.0
+  target_volatility: 0.12
+  volatility_window: 63
+  maximum_leverage: 1.5
+  rebalance_frequency: monthly
+
+execution:
+  commission_bps: 2.0
+  spread_bps: 3.0
+  slippage_bps: 2.0
+  slippage_model: constant
+
+backtest:
+  initial_capital: 100000
+  benchmark_symbol: SPY
+  risk_free_rate: 0.02
+  periods_per_year: 252
+
+validation:
+  method: walk_forward
+  train_window: 1000
+  validation_window: 252
+  test_window: 126
+  expanding: true
+  optimization_metric: sharpe
+  # Freeze the published search space: tune timing while keeping the 25%
+  # selection breadth fixed as part of this experiment's hypothesis.
+  parameter_grid:
+    lookback_period: [126, 189, 252]
+    skip_period: [0, 21]
+
+reproducibility:
+  random_seed: 42

@@ -1,0 +1,44 @@
+site_name: QuantLab
+site_description: Reproducible quantitative research and backtesting platform
+repo_url: https://github.com/sefaav/QuantLab
+docs_dir: docs
+
+theme:
+  name: material
+  palette:
+    - scheme: default
+      primary: indigo
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - scheme: slate
+      primary: indigo
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+  features:
+    - navigation.sections
+    - navigation.top
+    - content.code.copy
+
+nav:
+  - Home: index.md
+  - Architecture: architecture.md
+  - Data pipeline: data_pipeline.md
+  - Strategies: strategies.md
+  - Python API: api.md
+  - Backtesting: backtesting.md
+  - Validation: validation.md
+  - Limitations: limitations.md
+
+markdown_extensions:
+  - admonition
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
+  - pymdownx.highlight
+  - tables
+  - toc:
+      permalink: true

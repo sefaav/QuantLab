@@ -1,0 +1,42 @@
+# Source and data hashes use file bytes. Normalising text to LF keeps those
+# hashes stable across operating systems and local Git configurations.
+
+# Default: auto-detect text files, normalise to LF.
+* text=auto eol=lf
+
+# Source and config — always text, always LF.
+*.py text eol=lf
+*.pyi text eol=lf
+*.md text eol=lf
+*.yaml text eol=lf
+*.yml text eol=lf
+*.toml text eol=lf
+*.cfg text eol=lf
+*.ini text eol=lf
+*.txt text eol=lf
+*.sh text eol=lf
+*.json text eol=lf
+*.csv text eol=lf
+Makefile text eol=lf
+Dockerfile text eol=lf
+.gitignore text eol=lf
+.gitattributes text eol=lf
+.dockerignore text eol=lf
+
+# Notebooks are JSON, but hashed/diffed as a whole document (cell outputs
+# embed base64 image data) — treat as text for LF normalisation, but Git's
+# line-based diff is of limited use on them regardless.
+*.ipynb text eol=lf
+
+# Windows launcher scripts genuinely need CRLF.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# Binary — never touch, never diff as text.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.parquet binary
+*.pdf binary
