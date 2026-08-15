@@ -3,7 +3,7 @@
 # Run the offline demo:
 #   docker run --rm quantlab backtest --shipped-config demo_offline
 
-FROM python:3.12-slim@sha256:229a2c5bfa27522db7815ea81f9bed70af17ccb9de9fc7ad142b1877b5830d36 AS builder
+FROM python:3.14-slim@sha256:ce40764625a4ff50df3548277632e7f96c4e77fe75fa848aae9885476e7df5a4 AS builder
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1 \
@@ -26,7 +26,7 @@ COPY data/raw/SPY.csv data/raw/QQQ.csv data/raw/TLT.csv data/raw/GLD.csv ./data/
 RUN uv sync --locked --no-dev --extra dashboard --extra yahoo --no-editable
 
 
-FROM python:3.12-slim@sha256:229a2c5bfa27522db7815ea81f9bed70af17ccb9de9fc7ad142b1877b5830d36 AS runtime
+FROM python:3.14-slim@sha256:ce40764625a4ff50df3548277632e7f96c4e77fe75fa848aae9885476e7df5a4 AS runtime
 
 ARG QUANTLAB_UID=1000
 ARG QUANTLAB_GID=1000
