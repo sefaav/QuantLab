@@ -29,7 +29,7 @@ classifiers = [
 # supplies maintained XNYS sessions and close times that QuantLab should not
 # duplicate with a local holiday list.
 dependencies = [
-    "numpy>=1.26",
+    "numpy>=2.5.2",
     "pandas>=2.1",
     "pyarrow>=14.0",       # Parquet storage backend
     "scipy>=1.11",
@@ -38,7 +38,7 @@ dependencies = [
     "plotly>=5.18",
     "pydantic>=2.5",       # Config validation
     "pyyaml>=6.0",         # YAML config loading
-    "typer>=0.12",         # CLI
+    "typer>=0.27.1",         # CLI
     "requests>=2.31",      # Binance REST client
     "joblib>=1.3",         # Caching / parallelism helpers
     "pandas-market-calendars>=5.4,<6",  # Maintained XNYS calendar
@@ -56,7 +56,7 @@ dev = [
     "pytest>=8.0",
     "pytest-cov>=4.1",
     # UP047 requires Ruff 0.12 or newer.
-    "ruff>=0.12",
+    "ruff>=0.16.2",
     # Pre-commit runs mypy from the active project development environment
     # instead of maintaining a second, incomplete dependency list.
     "mypy>=2.3",
@@ -72,7 +72,7 @@ dev = [
 # Material for MkDocs 9.x targets MkDocs 1.x; avoid resolving an incompatible
 # future MkDocs 2 release in documentation and CI environments.
 docs = ["mkdocs>=1.5,<2", "mkdocs-material>=9.5"]
-notebooks = ["jupyter>=1.0", "nbformat>=5.10", "nbclient>=0.10", "ipykernel>=6.29"]
+notebooks = ["jupyter>=1.0", "nbformat>=5.11.0", "nbclient>=0.10", "ipykernel>=6.29"]
 
 [project.scripts]
 quantlab = "quantlab.cli:app"
