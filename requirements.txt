@@ -2,7 +2,7 @@
 # For full development, prefer: pip install -e ".[dev,dashboard,yahoo,extra,docs,notebooks]"
 # This file includes the core dependencies plus the Yahoo and dashboard extras.
 
-numpy>=1.26
+numpy>=2.5.2
 pandas>=2.1
 pyarrow>=14.0
 scipy>=1.11
