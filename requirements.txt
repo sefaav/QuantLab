@@ -22,4 +22,4 @@ yfinance>=0.2.40
 
 # Dashboard (optional)
 # The dashboard uses Streamlit 1.60's lazy-tab API.
-streamlit>=1.60
+streamlit>=1.61.1
