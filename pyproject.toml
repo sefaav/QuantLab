@@ -56,7 +56,7 @@ dev = [
     "pytest>=8.0",
     "pytest-cov>=4.1",
     # UP047 requires Ruff 0.12 or newer.
-    "ruff>=0.12",
+    "ruff>=0.16.2",
     # Pre-commit runs mypy from the active project development environment
     # instead of maintaining a second, incomplete dependency list.
     "mypy>=2.3",
