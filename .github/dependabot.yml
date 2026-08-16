@@ -1,6 +1,9 @@
 version: 2
 updates:
-  - package-ecosystem: pip
+  # "uv", not "pip": this project is locked with uv.lock. The "pip" ecosystem
+  # only bumps the pyproject.toml version string and leaves uv.lock stale,
+  # which makes every CI job fail immediately on `uv sync --locked`.
+  - package-ecosystem: uv
     directory: "/"
     schedule:
       interval: monthly
