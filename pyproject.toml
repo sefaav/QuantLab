@@ -60,7 +60,7 @@ dev = [
     # Pre-commit runs mypy from the active project development environment
     # instead of maintaining a second, incomplete dependency list.
     "mypy>=2.3",
-    "pre-commit>=3.7",
+    "pre-commit>=4.6.2",
     "pandas-stubs",
     "types-PyYAML",
     "types-requests",
