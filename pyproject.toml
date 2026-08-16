@@ -29,7 +29,7 @@ classifiers = [
 # supplies maintained XNYS sessions and close times that QuantLab should not
 # duplicate with a local holiday list.
 dependencies = [
-    "numpy>=1.26",
+    "numpy>=2.5.2",
     "pandas>=2.1",
     "pyarrow>=14.0",       # Parquet storage backend
     "scipy>=1.11",
