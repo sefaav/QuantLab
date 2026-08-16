@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import datetime
 import json
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
 
@@ -23,7 +24,11 @@ pytest.importorskip("streamlit")
 
 from streamlit.testing.v1 import AppTest
 
-APP_PATH = "src/quantlab/dashboard/app.py"
+# Absolute, since AppTest.from_file() resolves a relative path against the
+# *calling test file's* directory rather than the working directory.
+APP_PATH = str(
+    Path(__file__).resolve().parents[2] / "src" / "quantlab" / "dashboard" / "app.py"
+)
 
 
 def _sidebar_selectbox(at: AppTest, label: str) -> Any:
