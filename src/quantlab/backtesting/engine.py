@@ -118,16 +118,32 @@ _source_hash_computed_at: float | None = None
 _SOURCE_HASH_TTL_SECONDS = 60.0
 
 
+#: Excluded from `_source_hash()`: neither the dashboard UI nor the CLI
+#: entry point is imported by any notebook cell or by the computational
+#: backtest path, so editing them would otherwise force spurious notebook
+#: rebuilds and spuriously invalidate walk-forward artifact reuse.
+_SOURCE_HASH_EXCLUDED_TOP_LEVEL_PARTS = frozenset({"dashboard"})
+_SOURCE_HASH_EXCLUDED_FILES = frozenset({"cli.py"})
+
+
 def _source_hash() -> str:
     r"""Return a SHA-256 hash of QuantLab's installed Python sources.
 
-    POSIX relative paths keep the hash platform-independent. A path/mtime
-    fingerprint avoids rereading unchanged files, while a short TTL bounds
-    staleness when a synchronisation tool preserves mtimes.
+    Scoped to the modules that actually affect computed results (excludes
+    `dashboard/` and `cli.py`; see `_SOURCE_HASH_EXCLUDED_TOP_LEVEL_PARTS`
+    and `_SOURCE_HASH_EXCLUDED_FILES`). POSIX relative paths keep the hash
+    platform-independent. A path/mtime fingerprint avoids rereading
+    unchanged files, while a short TTL bounds staleness when a
+    synchronisation tool preserves mtimes.
     """
     global _source_hash_fingerprint, _source_hash_value, _source_hash_computed_at
     root = Path(__file__).resolve().parents[1]
-    paths = sorted(root.rglob("*.py"))
+    paths = sorted(
+        path
+        for path in root.rglob("*.py")
+        if path.relative_to(root).parts[0] not in _SOURCE_HASH_EXCLUDED_TOP_LEVEL_PARTS
+        and path.relative_to(root).name not in _SOURCE_HASH_EXCLUDED_FILES
+    )
     fingerprint = tuple(
         (path.relative_to(root).as_posix(), path.stat().st_mtime_ns) for path in paths
     )

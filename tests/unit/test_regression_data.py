@@ -1178,6 +1178,47 @@ def test_source_hash_is_platform_independent_and_reuses_cache(
     assert engine._source_hash_fingerprint == fingerprint_after_first_call
 
 
+def test_source_hash_ignores_dashboard_and_cli_edits(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No notebook cell and no computational backtest path imports the
+    dashboard or the CLI entry point, so editing either must not change the
+    hash -- otherwise unrelated dashboard/CLI edits force spurious notebook
+    rebuilds and spuriously invalidate walk-forward artifact reuse."""
+    import shutil
+
+    from quantlab.backtesting import engine
+
+    real_root = Path(engine.__file__).resolve().parents[1]
+    fake_root = tmp_path / "quantlab"
+    shutil.copytree(real_root, fake_root)
+    monkeypatch.setattr(
+        engine, "__file__", str(fake_root / "backtesting" / "engine.py")
+    )
+
+    original = engine._source_hash()
+
+    (fake_root / "dashboard" / "app.py").write_text(
+        (fake_root / "dashboard" / "app.py").read_text(encoding="utf-8")
+        + "\n# edited\n",
+        encoding="utf-8",
+    )
+    (fake_root / "cli.py").write_text(
+        (fake_root / "cli.py").read_text(encoding="utf-8") + "\n# edited\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(engine, "_source_hash_computed_at", None)
+    assert engine._source_hash() == original
+
+    # A module actually on the computational path must still be caught.
+    (fake_root / "constants.py").write_text(
+        (fake_root / "constants.py").read_text(encoding="utf-8") + "\n# edited\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(engine, "_source_hash_computed_at", None)
+    assert engine._source_hash() != original
+
+
 def test_robustness_placeholder_does_not_overclaim_cli_coverage() -> None:
     from quantlab.reporting.html_report import _render_robustness
 
