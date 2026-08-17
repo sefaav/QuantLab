@@ -26,13 +26,18 @@ from quantlab.constants import (
     TIMESTAMP,
     VOLUME,
 )
-from quantlab.data.base import MarketDataSource, ensure_canonical_schema
+from quantlab.data.base import (
+    MarketDataSource,
+    SymbolSuggestion,
+    ensure_canonical_schema,
+)
 from quantlab.exceptions import DataDownloadError
 from quantlab.logging_config import get_logger
 
 logger = get_logger(__name__)
 
 _BASE_URL = "https://api.binance.com/api/v3/klines"
+_EXCHANGE_INFO_URL = "https://api.binance.com/api/v3/exchangeInfo"
 _INTERVAL = {"1d": "1d", "1h": "1h", "1w": "1w"}
 _MAX_LIMIT = 1000  # Binance hard limit per request
 _MAX_RETRY_DELAY_SECONDS = 60.0
@@ -91,6 +96,41 @@ class BinanceDataSource(MarketDataSource):
                 f"Binance returned no data for {symbols} in [{start}, {end}]."
             )
         return ensure_canonical_schema(pd.concat(frames, ignore_index=True))
+
+    def list_trading_symbols(self) -> list[SymbolSuggestion]:
+        """Fetch every currently active Binance spot trading pair.
+
+        For dashboard autocomplete only: returns an empty list (rather than
+        raising) on any network or parsing failure. The full list is meant to
+        be fetched once and filtered locally per keystroke, not re-fetched on
+        every query.
+        """
+        try:
+            response = self.session.get(_EXCHANGE_INFO_URL, timeout=10)
+            response.raise_for_status()
+            payload = response.json()
+        except (requests.RequestException, ValueError) as exc:
+            logger.warning("Binance symbol list fetch failed: %s", exc)
+            return []
+        entries = payload.get("symbols") if isinstance(payload, dict) else None
+        if not isinstance(entries, list):
+            return []
+        suggestions: list[SymbolSuggestion] = []
+        for entry in entries:
+            if not isinstance(entry, dict) or entry.get("status") != "TRADING":
+                continue
+            symbol = entry.get("symbol")
+            if not isinstance(symbol, str) or not symbol.strip():
+                continue
+            base_asset = entry.get("baseAsset") or ""
+            quote_asset = entry.get("quoteAsset") or ""
+            description = (
+                f"{base_asset}/{quote_asset}" if base_asset and quote_asset else ""
+            )
+            suggestions.append(
+                SymbolSuggestion(symbol=symbol.strip().upper(), description=description)
+            )
+        return suggestions
 
     # ------------------------------------------------------------------ #
     def _download_one(

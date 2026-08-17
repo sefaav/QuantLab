@@ -13,6 +13,7 @@ from math import isfinite
 from numbers import Real
 
 import pandas as pd
+import requests
 
 from quantlab.constants import (
     ADJUSTED_CLOSE,
@@ -24,7 +25,11 @@ from quantlab.constants import (
     TIMESTAMP,
     VOLUME,
 )
-from quantlab.data.base import MarketDataSource, ensure_canonical_schema
+from quantlab.data.base import (
+    MarketDataSource,
+    SymbolSuggestion,
+    ensure_canonical_schema,
+)
 from quantlab.data.calendar import (
     daily_equity_bucket_settlement,
     monthly_bucket_settlement,
@@ -45,6 +50,11 @@ _INTERVAL_TIMEDELTA: dict[str, pd.Timedelta] = {
     "1wk": pd.Timedelta(weeks=1),
 }
 
+#: Yahoo's unofficial, public, unauthenticated symbol-search endpoint. Used
+#: only for dashboard autocomplete, not for downloading price data.
+_SEARCH_URL = "https://query1.finance.yahoo.com/v1/finance/search"
+_SEARCH_HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; QuantLab/1.0)"}
+
 
 class YahooFinanceDataSource(MarketDataSource):
     """Download market data from Yahoo Finance.
@@ -52,12 +62,18 @@ class YahooFinanceDataSource(MarketDataSource):
     Args:
         max_retries: Number of attempts per symbol before giving up.
         retry_backoff_seconds: Base sleep between retries (linear backoff).
+        session: Optional pre-built ``requests.Session``, used only by
+            :meth:`search_symbols` (injected in tests). Downloading price data
+            goes through ``yfinance`` instead.
     """
 
     name = "yahoo"
 
     def __init__(
-        self, max_retries: int = 3, retry_backoff_seconds: float = 1.0
+        self,
+        max_retries: int = 3,
+        retry_backoff_seconds: float = 1.0,
+        session: requests.Session | None = None,
     ) -> None:
         if (
             isinstance(max_retries, bool)
@@ -76,6 +92,66 @@ class YahooFinanceDataSource(MarketDataSource):
             )
         self.max_retries: int = max_retries
         self.retry_backoff_seconds: float = float(retry_backoff_seconds)
+        self.session: requests.Session = (
+            session if session is not None else requests.Session()
+        )
+
+    def search_symbols(
+        self, query: str, max_results: int = 8
+    ) -> list[SymbolSuggestion]:
+        """Search Yahoo Finance's symbol directory for ``query``.
+
+        For dashboard autocomplete only: returns an empty list (rather than
+        raising) on any network or parsing failure.
+
+        Args:
+            query: Free-text ticker or company-name fragment.
+            max_results: Maximum number of matches to return.
+
+        Returns:
+            Matching symbols, most relevant first per Yahoo's own ranking.
+        """
+        query = query.strip()
+        if not query:
+            return []
+        params: dict[str, str | int] = {
+            "q": query,
+            "quotesCount": max_results,
+            "newsCount": 0,
+            "listsCount": 0,
+        }
+        try:
+            response = self.session.get(
+                _SEARCH_URL,
+                params=params,
+                headers=_SEARCH_HEADERS,
+                # (connect, read): a single float applies to *each* phase, so
+                # a plain `timeout=10` can take ~20s worst case before giving
+                # up — too long for an interactive dashboard search box.
+                timeout=(3, 5),
+            )
+            response.raise_for_status()
+            payload = response.json()
+        except (requests.RequestException, ValueError) as exc:
+            logger.warning("Yahoo symbol search failed for %r: %s", query, exc)
+            return []
+        quotes = payload.get("quotes") if isinstance(payload, dict) else None
+        if not isinstance(quotes, list):
+            return []
+        suggestions: list[SymbolSuggestion] = []
+        for quote in quotes:
+            if not isinstance(quote, dict):
+                continue
+            symbol = quote.get("symbol")
+            if not isinstance(symbol, str) or not symbol.strip():
+                continue
+            name = quote.get("shortname") or quote.get("longname") or ""
+            exchange = quote.get("exchDisp") or quote.get("exchange") or ""
+            description = " · ".join(part for part in (name, exchange) if part)
+            suggestions.append(
+                SymbolSuggestion(symbol=symbol.strip().upper(), description=description)
+            )
+        return suggestions[:max_results]
 
     def download(
         self,

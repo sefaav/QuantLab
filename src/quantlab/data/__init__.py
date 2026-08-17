@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from quantlab.data.base import (
     MarketDataSource,
+    SymbolSuggestion,
     ensure_canonical_schema,
     pivot_field,
     price_matrix,
@@ -24,6 +25,7 @@ __all__ = [
     "MarketDataSource",
     "MissingPeriod",
     "ParquetStorage",
+    "SymbolSuggestion",
     "Universe",
     "build_source",
     "ensure_canonical_schema",

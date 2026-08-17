@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from datetime import date
+from typing import NamedTuple
 
 import pandas as pd
 
@@ -26,6 +27,18 @@ from quantlab.exceptions import DataValidationError
 from quantlab.logging_config import get_logger
 
 logger = get_logger(__name__)
+
+
+class SymbolSuggestion(NamedTuple):
+    """A single symbol-search match, for dashboard autocomplete display.
+
+    ``description`` is a short human-readable label (e.g. a company name and
+    exchange, or a base/quote asset pair) and may be empty when the source
+    provides none.
+    """
+
+    symbol: str
+    description: str
 
 
 class MarketDataSource(ABC):

@@ -22,6 +22,7 @@ from quantlab.dashboard.components import _monthly_return_pivot, render_metric_c
 
 pytest.importorskip("streamlit")
 
+import streamlit as st
 from streamlit.testing.v1 import AppTest
 
 # Absolute, since AppTest.from_file() resolves a relative path against the
@@ -51,10 +52,14 @@ def _sidebar_checkbox(at: AppTest, label: str) -> Any:
     return next(box for box in at.sidebar.checkbox if box.label == label)
 
 
+def _sidebar_text_input(at: AppTest, label: str) -> Any:
+    return next(field for field in at.sidebar.text_input if field.label == label)
+
+
 def _configure_offline_pairs_trade(at: AppTest) -> AppTest:
     """Point the dashboard at locally cached CSV data for SPY/QQQ."""
     _sidebar_selectbox(at, "Data source").set_value("csv").run()
-    at.sidebar.text_input[0].set_value("SPY, QQQ").run()
+    _sidebar_text_input(at, "Symbols (comma-separated)").set_value("SPY, QQQ").run()
     _sidebar_date_input(at, "End date").set_value(datetime.date(2019, 6, 1)).run()
     _sidebar_selectbox(at, "Strategy").set_value("pairs_trading").run()
     return at
@@ -79,6 +84,293 @@ def test_sidebar_warns_that_one_calendar_applies_to_the_entire_universe() -> Non
         and "AAPL and 1211.HK" in warning.value
         for warning in at.sidebar.warning
     )
+
+
+def _sidebar_multiselect(at: AppTest, label: str) -> Any:
+    return next(ms for ms in at.sidebar.multiselect if ms.label == label)
+
+
+_MARKET_CALENDAR_NOTE = (
+    "One market calendar applies to the entire universe, so every symbol "
+    "must follow the same trading schedule."
+)
+
+
+def test_csv_symbols_and_benchmark_help_mention_market_calendar() -> None:
+    at = AppTest.from_file(APP_PATH, default_timeout=60)
+    at.run()
+
+    symbols_field = _sidebar_text_input(at, "Symbols (comma-separated)")
+    assert _MARKET_CALENDAR_NOTE in symbols_field.proto.help
+
+    _sidebar_selectbox(at, "Benchmark").set_value("symbol").run()
+    benchmark_field = _sidebar_text_input(at, "Benchmark symbol")
+    assert _MARKET_CALENDAR_NOTE in benchmark_field.proto.help
+
+
+def test_yahoo_symbols_and_benchmark_help_mention_market_calendar() -> None:
+    at = AppTest.from_file(APP_PATH, default_timeout=60)
+    at.run()
+    _sidebar_selectbox(at, "Data source").set_value("yahoo").run()
+
+    picker = _sidebar_multiselect(at, "Symbols")
+    assert _MARKET_CALENDAR_NOTE in picker.proto.help
+
+    benchmark = _sidebar_selectbox(at, "Benchmark symbol")
+    assert _MARKET_CALENDAR_NOTE in benchmark.proto.help
+
+
+def test_symbols_picker_help_icon_is_not_hidden_by_a_collapsed_label() -> None:
+    """Regression test: Streamlit hides a widget's help tooltip icon along
+    with a `label_visibility="collapsed"` label, which silently swallowed
+    the market-calendar/incomplete-list notes above. The label must stay
+    visible so the help icon (and thus those notes) stays reachable."""
+    at = AppTest.from_file(APP_PATH, default_timeout=60)
+    at.run()
+    _sidebar_selectbox(at, "Data source").set_value("yahoo").run()
+
+    picker = _sidebar_multiselect(at, "Symbols")
+    assert picker.proto.label_visibility.value == 0  # VISIBLE
+
+
+def test_binance_symbols_and_benchmark_help_omit_market_calendar_note() -> None:
+    """Every Binance pair already shares the same 24/7 calendar, so the
+    cross-market mixing warning (relevant for csv/yahoo) doesn't apply."""
+    at = AppTest.from_file(APP_PATH, default_timeout=60)
+    at.run()
+    _sidebar_selectbox(at, "Data source").set_value("binance").run()
+
+    picker = _sidebar_multiselect(at, "Symbols")
+    assert _MARKET_CALENDAR_NOTE not in picker.proto.help
+
+    benchmark = _sidebar_selectbox(at, "Benchmark symbol")
+    assert _MARKET_CALENDAR_NOTE not in benchmark.proto.help
+
+
+def test_csv_source_keeps_the_free_text_symbols_field() -> None:
+    at = AppTest.from_file(APP_PATH, default_timeout=60)
+    at.run()
+
+    assert any(
+        field.label == "Symbols (comma-separated)" for field in at.sidebar.text_input
+    )
+    assert not any(ms.label == "Symbols" for ms in at.sidebar.multiselect)
+
+
+def test_binance_symbols_picker_is_an_instant_dropdown_over_the_full_universe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Binance's whole universe is loaded once; picking needs no search box."""
+    from quantlab.data.base import SymbolSuggestion
+    from quantlab.data.binance import BinanceDataSource
+
+    fetches: list[None] = []
+
+    def fake_universe(self: BinanceDataSource) -> list[SymbolSuggestion]:
+        fetches.append(None)
+        return [
+            SymbolSuggestion(symbol="BTCUSDT", description="BTC/USDT"),
+            SymbolSuggestion(symbol="ETHUSDT", description="ETH/USDT"),
+        ]
+
+    monkeypatch.setattr(BinanceDataSource, "list_trading_symbols", fake_universe)
+    st.cache_data.clear()  # avoid a real universe cached by an earlier test/run
+
+    at = AppTest.from_file(APP_PATH, default_timeout=60)
+    at.run()
+    _sidebar_selectbox(at, "Data source").set_value("binance").run()
+
+    assert not at.exception
+    assert not any(field.label == "Search" for field in at.sidebar.text_input)
+    picker = _sidebar_multiselect(at, "Symbols")
+    assert picker.options == ["BTCUSDT — BTC/USDT", "ETHUSDT — ETH/USDT"]
+    assert picker.value == ["BTCUSDT — BTC/USDT", "ETHUSDT — ETH/USDT"]
+
+    # Selecting from the already-loaded list makes no further fetch.
+    picker.set_value(["ETHUSDT — ETH/USDT"]).run()
+    assert not at.exception
+    assert fetches == [None]
+
+
+def test_yahoo_symbols_picker_is_an_instant_dropdown_over_the_bundled_universe() -> (
+    None
+):
+    """Yahoo has no downloadable "every symbol" endpoint like Binance, so it
+    uses a bundled S&P 500 + ETF + major-global-company list instead — same
+    one-widget, no-search-box shape as Binance, just backed by a static file
+    instead of a live call."""
+    at = AppTest.from_file(APP_PATH, default_timeout=60)
+    at.run()
+    _sidebar_selectbox(at, "Data source").set_value("yahoo").run()
+
+    assert not at.exception
+    assert not any(field.label == "Search" for field in at.sidebar.text_input)
+    picker = _sidebar_multiselect(at, "Symbols")
+    # The bundled S&P 500 + ETF + global-company list, not just a handful.
+    assert len(picker.options) > 650
+    assert "AAPL — Apple Inc." in picker.options
+    assert "MSFT — Microsoft" in picker.options
+    assert set(picker.value) == {
+        "SPY — SPDR S&P 500 ETF Trust",
+        "QQQ — Invesco QQQ Trust (Nasdaq-100)",
+        "TLT — iShares 20+ Year Treasury Bond ETF",
+        "GLD — SPDR Gold Shares",
+    }
+
+    # Picking from the already-loaded list is a plain client-side selection.
+    picker.set_value([*picker.value, "AAPL — Apple Inc."]).run()
+    assert not at.exception
+    assert "AAPL — Apple Inc." in picker.value
+
+
+def test_yahoo_symbols_picker_includes_major_non_us_companies() -> None:
+    """Regression test: BMW (a DAX constituent, not S&P 500) must be
+    findable — the bundled list isn't limited to US large caps."""
+    at = AppTest.from_file(APP_PATH, default_timeout=60)
+    at.run()
+    _sidebar_selectbox(at, "Data source").set_value("yahoo").run()
+
+    picker = _sidebar_multiselect(at, "Symbols")
+    assert any(option.startswith("BMW.DE") for option in picker.options)
+
+
+def test_yahoo_symbols_picker_accepts_a_symbol_outside_the_bundled_list() -> None:
+    """Yahoo's bundled list is large but not exhaustive (no such thing
+    exists for Yahoo, unlike Binance's complete pair list), so an exact
+    symbol not in it can still be typed and added directly."""
+    at = AppTest.from_file(APP_PATH, default_timeout=60)
+    at.run()
+    _sidebar_selectbox(at, "Data source").set_value("yahoo").run()
+
+    picker = _sidebar_multiselect(at, "Symbols")
+    assert picker.proto.accept_new_options is True
+    assert not any(o.startswith("NOVN.SW") for o in picker.options)
+
+    picker.set_value([*picker.value, "novn.sw"]).run()
+
+    # The chip shows exactly what was typed; _symbols_picker() normalises
+    # (uppercases) it only in the returned list used to build the backtest
+    # config, not in the widget's own displayed value.
+    assert not at.exception
+    assert "novn.sw" in picker.value
+
+
+def test_yahoo_shows_a_note_that_suggestions_are_not_exhaustive() -> None:
+    """The caveat lives only in the help tooltip, not as a permanent
+    on-screen caption — it's a corner case, not something worth
+    dedicating always-visible space to."""
+    at = AppTest.from_file(APP_PATH, default_timeout=60)
+    at.run()
+    _sidebar_selectbox(at, "Data source").set_value("yahoo").run()
+
+    assert not any(
+        "Not every symbol is suggested" in c.value for c in at.sidebar.caption
+    )
+    picker = _sidebar_multiselect(at, "Symbols")
+    assert "Not every symbol is suggested" in picker.proto.help
+    benchmark = _sidebar_selectbox(at, "Benchmark symbol")
+    assert "Not every symbol is suggested" in benchmark.proto.help
+
+
+def test_binance_shows_no_incomplete_suggestions_note(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Binance's preloaded list is genuinely complete, so the "not every
+    symbol is suggested" caveat (which only applies to Yahoo) must not
+    appear for it, in the help text or otherwise."""
+    from quantlab.data.base import SymbolSuggestion
+    from quantlab.data.binance import BinanceDataSource
+
+    monkeypatch.setattr(
+        BinanceDataSource,
+        "list_trading_symbols",
+        lambda self: [SymbolSuggestion(symbol="BTCUSDT", description="BTC/USDT")],
+    )
+    st.cache_data.clear()  # avoid a real universe cached by an earlier test/run
+
+    at = AppTest.from_file(APP_PATH, default_timeout=60)
+    at.run()
+    _sidebar_selectbox(at, "Data source").set_value("binance").run()
+
+    assert not any(
+        "Not every symbol is suggested" in c.value for c in at.sidebar.caption
+    )
+    picker = _sidebar_multiselect(at, "Symbols")
+    assert "Not every symbol is suggested" not in picker.proto.help
+    benchmark = _sidebar_selectbox(at, "Benchmark symbol")
+    assert "Not every symbol is suggested" not in benchmark.proto.help
+
+
+def test_yahoo_benchmark_symbol_accepts_new_options() -> None:
+    """AppTest can't simulate typing a brand-new selectbox value (it looks
+    the value up by index into the fixed options list, which a freshly
+    typed value isn't part of), so this only checks the widget is
+    configured to accept one — verified end-to-end manually instead."""
+    at = AppTest.from_file(APP_PATH, default_timeout=60)
+    at.run()
+    _sidebar_selectbox(at, "Data source").set_value("yahoo").run()
+
+    benchmark = _sidebar_selectbox(at, "Benchmark symbol")
+    assert benchmark.proto.accept_new_options is True
+
+
+def test_binance_symbols_picker_rejects_symbols_outside_the_universe() -> None:
+    """Unlike Yahoo, Binance's preloaded list is genuinely complete, so
+    there is no free-typing escape hatch for it."""
+    at = AppTest.from_file(APP_PATH, default_timeout=60)
+    at.run()
+    _sidebar_selectbox(at, "Data source").set_value("binance").run()
+
+    picker = _sidebar_multiselect(at, "Symbols")
+    assert picker.proto.accept_new_options is False
+
+
+def test_csv_benchmark_symbol_stays_free_text() -> None:
+    at = AppTest.from_file(APP_PATH, default_timeout=60)
+    at.run()
+
+    assert any(field.label == "Benchmark symbol" for field in at.sidebar.text_input)
+    assert not any(sb.label == "Benchmark symbol" for sb in at.sidebar.selectbox)
+
+
+def test_binance_benchmark_symbol_is_a_dropdown_over_the_same_universe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from quantlab.data.base import SymbolSuggestion
+    from quantlab.data.binance import BinanceDataSource
+
+    monkeypatch.setattr(
+        BinanceDataSource,
+        "list_trading_symbols",
+        lambda self: [
+            SymbolSuggestion(symbol="BTCUSDT", description="BTC/USDT"),
+            SymbolSuggestion(symbol="ETHUSDT", description="ETH/USDT"),
+        ],
+    )
+    st.cache_data.clear()  # avoid a real universe cached by an earlier test/run
+
+    at = AppTest.from_file(APP_PATH, default_timeout=60)
+    at.run()
+    _sidebar_selectbox(at, "Data source").set_value("binance").run()
+
+    assert not at.exception
+    benchmark = _sidebar_selectbox(at, "Benchmark symbol")
+    assert benchmark.options == ["BTCUSDT — BTC/USDT", "ETHUSDT — ETH/USDT"]
+    assert benchmark.value == "BTCUSDT — BTC/USDT"
+
+
+def test_yahoo_benchmark_symbol_offers_the_full_bundled_universe() -> None:
+    """The benchmark dropdown isn't limited to the 4 starter symbols — it
+    shares the same bundled S&P 500 + ETF list as the Symbols picker."""
+    at = AppTest.from_file(APP_PATH, default_timeout=60)
+    at.run()
+    _sidebar_selectbox(at, "Data source").set_value("yahoo").run()
+
+    assert not at.exception
+    benchmark = _sidebar_selectbox(at, "Benchmark symbol")
+    assert len(benchmark.options) > 500
+    assert "AAPL — Apple Inc." in benchmark.options
+    assert benchmark.value == "SPY — SPDR S&P 500 ETF Trust"
 
 
 def test_monthly_return_pivot_preserves_a_month_without_observations() -> None:
@@ -175,7 +467,7 @@ def test_pairs_trading_symbol_inputs_render_without_crash() -> None:
     at.run()
     assert not at.exception
 
-    at.sidebar.text_input[0].set_value("AAA, BBB").run()
+    _sidebar_text_input(at, "Symbols (comma-separated)").set_value("AAA, BBB").run()
     _sidebar_selectbox(at, "Strategy").set_value("pairs_trading").run()
     assert not at.exception
 
@@ -253,7 +545,7 @@ def test_reversion_exit_slider_stays_strictly_below_entry(
     at = AppTest.from_file(APP_PATH, default_timeout=60)
     at.run()
     if strategy_name == "pairs_trading":
-        at.sidebar.text_input[0].set_value("AAA, BBB").run()
+        _sidebar_text_input(at, "Symbols (comma-separated)").set_value("AAA, BBB").run()
     _sidebar_selectbox(at, "Strategy").set_value(strategy_name).run()
 
     entry = next(
@@ -286,7 +578,7 @@ def test_holdout_controls_do_not_claim_automatic_tuning() -> None:
 def test_pairs_trading_with_fewer_than_two_symbols_shows_error_not_crash() -> None:
     at = AppTest.from_file(APP_PATH, default_timeout=60)
     at.run()
-    at.sidebar.text_input[0].set_value("AAA").run()
+    _sidebar_text_input(at, "Symbols (comma-separated)").set_value("AAA").run()
     _sidebar_selectbox(at, "Strategy").set_value("pairs_trading").run()
     assert not at.exception
     assert any("at least two symbols" in e.value for e in at.sidebar.error)
@@ -295,7 +587,7 @@ def test_pairs_trading_with_fewer_than_two_symbols_shows_error_not_crash() -> No
 def test_pairs_trading_requires_two_distinct_symbols() -> None:
     at = AppTest.from_file(APP_PATH, default_timeout=60)
     at.run()
-    at.sidebar.text_input[0].set_value("AAA, AAA").run()
+    _sidebar_text_input(at, "Symbols (comma-separated)").set_value("AAA, AAA").run()
     _sidebar_selectbox(at, "Strategy").set_value("pairs_trading").run()
 
     assert not at.exception
@@ -324,7 +616,7 @@ def test_failed_backtest_invalidates_previous_result() -> None:
     at.sidebar.button[0].click().run()
     assert "result" in at.session_state
 
-    at.sidebar.text_input[0].set_value("").run()
+    _sidebar_text_input(at, "Symbols (comma-separated)").set_value("").run()
     at.sidebar.button[0].click().run()
 
     assert not at.exception
@@ -439,7 +731,7 @@ def test_frequency_mismatch_shown_as_prominent_error_not_small_caption() -> None
     at = AppTest.from_file(APP_PATH, default_timeout=60)
     at.run()
     _sidebar_selectbox(at, "Data source").set_value("csv").run()
-    at.sidebar.text_input[0].set_value("SPY, QQQ").run()
+    _sidebar_text_input(at, "Symbols (comma-separated)").set_value("SPY, QQQ").run()
     _sidebar_date_input(at, "End date").set_value(datetime.date(2019, 6, 1)).run()
     _sidebar_selectbox(at, "Frequency").set_value("1h").run()
     at.sidebar.button[0].click().run()

@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import csv
 from datetime import date
+from functools import lru_cache
+from pathlib import Path
 from typing import Any
 
 import pandas as pd
@@ -10,9 +13,18 @@ import pandas as pd
 from quantlab.backtesting.result import BacktestResult
 from quantlab.backtesting.runner import run_backtest_from_config
 from quantlab.config import ExperimentConfig
+from quantlab.data.base import SymbolSuggestion
+from quantlab.data.binance import BinanceDataSource
 from quantlab.data.loader import DataLoader
 from quantlab.data.storage import ParquetStorage
 from quantlab.exceptions import BacktestError
+
+#: A curated, bundled reference list (S&P 500 constituents plus major ETFs)
+#: shipped with the package. Yahoo has no downloadable "every symbol"
+#: endpoint the way Binance does, so this stands in as an offline, instant
+#: universe for the dashboard's autocomplete — not an exhaustive directory of
+#: every symbol Yahoo Finance can actually serve.
+_YAHOO_COMMON_SYMBOLS_CSV = Path(__file__).parent / "data" / "yahoo_common_symbols.csv"
 
 
 def build_config_from_inputs(inputs: dict[str, Any]) -> ExperimentConfig:
@@ -92,3 +104,30 @@ def run_dashboard_stress_tests(
 def default_end_date() -> date:
     """A safe default end date that does not depend on wall-clock time."""
     return date(2024, 12, 31)
+
+
+@lru_cache(maxsize=1)
+def yahoo_common_symbols() -> list[SymbolSuggestion]:
+    """The bundled S&P 500 + major-ETF reference list, loaded once.
+
+    Static and shipped with the package (no network call), so the dashboard
+    can offer it as one instant, client-side-filtered dropdown — the same
+    shape as :func:`binance_trading_symbols`, just from a file instead of a
+    live download.
+    """
+    with _YAHOO_COMMON_SYMBOLS_CSV.open(newline="", encoding="utf-8") as f:
+        return [
+            SymbolSuggestion(symbol=row["symbol"], description=row["description"])
+            for row in csv.DictReader(f)
+        ]
+
+
+def binance_trading_symbols() -> list[SymbolSuggestion]:
+    """Fetch Binance's full active spot-symbol universe.
+
+    Meant to be cached by the caller (fetching the whole universe once):
+    small enough to load entirely upfront, so the dashboard can offer it as
+    one instant, client-side-filtered dropdown instead of querying per
+    keystroke.
+    """
+    return BinanceDataSource().list_trading_symbols()

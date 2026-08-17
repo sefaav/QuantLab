@@ -23,16 +23,19 @@ from quantlab.dashboard.components import (
     render_trade_table,
 )
 from quantlab.dashboard.state import (
+    binance_trading_symbols,
     build_config_from_inputs,
     default_end_date,
     run_dashboard_backtest,
     run_dashboard_stress_tests,
+    yahoo_common_symbols,
 )
 from quantlab.logging_config import get_logger
 from quantlab.strategies.base import available_strategies
 
 if TYPE_CHECKING:
     from quantlab.backtesting.result import BacktestResult
+    from quantlab.data.base import SymbolSuggestion
 
 logger = get_logger(__name__)
 
@@ -42,6 +45,155 @@ st.set_page_config(page_title="QuantLab", page_icon="📈", layout="wide")
 def _parse_symbols(raw: str) -> list[str]:
     """Normalise symbols and remove duplicates while preserving their order."""
     return list(dict.fromkeys(s.strip().upper() for s in raw.split(",") if s.strip()))
+
+
+@st.cache_data(ttl=3600, show_spinner="Loading Binance's symbol list…")
+def _cached_binance_universe() -> list[SymbolSuggestion]:
+    """Binance's full active spot-symbol universe, refreshed hourly.
+
+    Fetched once per hour (per Streamlit cache entry, no arguments) rather
+    than per keystroke: once loaded, picking symbols from it is instant,
+    client-side dropdown filtering — no server round trip per character.
+    """
+    return binance_trading_symbols()
+
+
+def _label_for(suggestion: SymbolSuggestion) -> str:
+    if suggestion.description:
+        return f"{suggestion.symbol} — {suggestion.description}"
+    return suggestion.symbol
+
+
+def _binance_universe_labels() -> dict[str, str]:
+    """Binance's cached universe as ``{symbol: display label}``."""
+    return {s.symbol: _label_for(s) for s in _cached_binance_universe()}
+
+
+def _yahoo_universe_labels() -> dict[str, str]:
+    """The bundled S&P 500 + major-ETF reference list as ``{symbol: label}``.
+
+    Yahoo has no downloadable "every symbol" endpoint the way Binance does,
+    so this static, bundled list stands in as an instant, offline universe —
+    covering what most dashboard users will look for, not every symbol Yahoo
+    can actually serve.
+    """
+    return {s.symbol: _label_for(s) for s in yahoo_common_symbols()}
+
+
+#: Shown in the widget's help tooltip whenever a symbol picker's preloaded
+#: list isn't a complete universe — currently only Yahoo's, since Binance's
+#: list genuinely is complete.
+_INCOMPLETE_LIST_NOTE = (
+    "Not every symbol is suggested — if yours is missing, type its exact "
+    "ticker and it'll still be accepted."
+)
+#: Shown whenever mixing symbols across markets is possible (csv and yahoo;
+#: Binance is exempt since every pair already shares the same 24/7 calendar).
+_MARKET_CALENDAR_NOTE = (
+    "One market calendar applies to the entire universe, so every symbol "
+    "must follow the same trading schedule."
+)
+
+
+def _symbols_picker(
+    label_by_symbol: dict[str, str],
+    key: str,
+    default_symbols: tuple[str, ...],
+    *,
+    accept_new_options: bool = False,
+    warn_market_calendar: bool = False,
+) -> list[str]:
+    """A single instant, client-side-filtered dropdown over a preloaded universe.
+
+    Typing filters the already-loaded option list in the browser (like a
+    search-engine dropdown) — no server round trip per character. When
+    ``accept_new_options`` is set, a symbol absent from the preloaded list
+    (Yahoo's bundled universe is large but not exhaustive — Yahoo has no
+    downloadable "every symbol" list to preload the way Binance does) can
+    still be typed and added directly.
+    """
+    help_text = "Tradable universe — start typing to filter"
+    help_text += (
+        ", or enter an exact symbol not in the list. " if accept_new_options else ". "
+    )
+    help_text += (
+        "pairs_trading needs at least two symbols; its two legs are then picked below."
+    )
+    if accept_new_options:
+        help_text += " " + _INCOMPLETE_LIST_NOTE
+    if warn_market_calendar:
+        help_text += " " + _MARKET_CALENDAR_NOTE
+
+    if key not in st.session_state:
+        st.session_state[key] = [
+            label_by_symbol[s] for s in default_symbols if s in label_by_symbol
+        ]
+    # No `label_visibility="collapsed"` here: Streamlit hides the help
+    # tooltip icon along with a collapsed label, and that icon is the only
+    # place the market-calendar/incomplete-list notes above are surfaced.
+    with st.container(border=True):
+        picked_labels = st.multiselect(
+            "Symbols",
+            options=list(label_by_symbol.values()),
+            key=key,
+            placeholder=(
+                "Type to find or add any symbol…"
+                if accept_new_options
+                else "Type to find a symbol…"
+            ),
+            accept_new_options=accept_new_options,
+            help=help_text,
+        )
+    symbol_by_label = {label: symbol for symbol, label in label_by_symbol.items()}
+    return [
+        symbol_by_label.get(label, label.strip().upper()) for label in picked_labels
+    ]
+
+
+def _binance_symbols_picker() -> list[str]:
+    return _symbols_picker(
+        _binance_universe_labels(), "binance_symbols", ("BTCUSDT", "ETHUSDT")
+    )
+
+
+def _yahoo_symbols_picker() -> list[str]:
+    return _symbols_picker(
+        _yahoo_universe_labels(),
+        "yahoo_symbols",
+        ("SPY", "QQQ", "TLT", "GLD"),
+        accept_new_options=True,
+        warn_market_calendar=True,
+    )
+
+
+def _symbol_selectbox(
+    label_by_symbol: dict[str, str],
+    key: str,
+    default_symbol: str,
+    help_text: str,
+    *,
+    accept_new_options: bool = False,
+) -> str:
+    """A single-symbol dropdown over an already-known ``{symbol: label}`` map."""
+    if accept_new_options:
+        help_text += " " + _INCOMPLETE_LIST_NOTE
+    options = list(label_by_symbol.values())
+    default_label = label_by_symbol.get(
+        default_symbol, options[0] if options else default_symbol
+    )
+    if key not in st.session_state:
+        st.session_state[key] = default_label
+    picked_label = st.selectbox(
+        "Benchmark symbol",
+        options=options,
+        key=key,
+        help=help_text,
+        accept_new_options=accept_new_options,
+    )
+    symbol_by_label = {label: symbol for symbol, label in label_by_symbol.items()}
+    if picked_label is None:
+        return ""
+    return symbol_by_label.get(picked_label, picked_label.strip().upper())
 
 
 def _strategy_param_inputs(strategy_name: str, symbols: list[str]) -> dict:
@@ -449,17 +601,20 @@ with st.sidebar:
         )
     else:
         use_bundled_demo_data = False
-    symbols_raw = st.text_input(
-        "Symbols (comma-separated)",
-        "SPY, QQQ, TLT, GLD",
-        help=(
-            "Tradable universe. pairs_trading needs at least two symbols "
-            "here; its two legs are then picked below. One market calendar "
-            "applies to the entire universe, so every symbol must follow the "
-            "same trading schedule."
-        ),
-    )
-    symbols = _parse_symbols(symbols_raw)
+    if source == "binance":
+        symbols = _binance_symbols_picker()
+    elif source == "yahoo":
+        symbols = _yahoo_symbols_picker()
+    else:
+        symbols_raw = st.text_input(
+            "Symbols (comma-separated)",
+            "SPY, QQQ, TLT, GLD",
+            help=(
+                "Tradable universe. pairs_trading needs at least two symbols "
+                f"here; its two legs are then picked below. {_MARKET_CALENDAR_NOTE}"
+            ),
+        )
+        symbols = _parse_symbols(symbols_raw)
 
     # Sidebar date fields need the full width to keep labels and values readable.
     start_date = st.date_input(
@@ -779,11 +934,33 @@ with st.sidebar:
         ),
     )
     if benchmark_kind == "symbol":
-        benchmark_symbol = st.text_input(
-            "Benchmark symbol",
-            "SPY",
-            help="External symbol to download and compare against, e.g. SPY.",
-        )
+        if source == "binance":
+            benchmark_symbol = _symbol_selectbox(
+                _binance_universe_labels(),
+                "binance_benchmark_symbol",
+                "BTCUSDT",
+                "External symbol to compare against — pick from Binance's "
+                "active spot pairs.",
+            )
+        elif source == "yahoo":
+            benchmark_symbol = _symbol_selectbox(
+                _yahoo_universe_labels(),
+                "yahoo_benchmark_symbol",
+                "SPY",
+                "External symbol to compare against — pick from the same "
+                "bundled list as Symbols above, or type an exact symbol "
+                f"not in the list. {_MARKET_CALENDAR_NOTE}",
+                accept_new_options=True,
+            )
+        else:
+            benchmark_symbol = st.text_input(
+                "Benchmark symbol",
+                "SPY",
+                help=(
+                    "External symbol to download and compare against, e.g. "
+                    f"SPY. {_MARKET_CALENDAR_NOTE}"
+                ),
+            )
     else:
         benchmark_symbol = ""
         if benchmark_kind == "first_asset":

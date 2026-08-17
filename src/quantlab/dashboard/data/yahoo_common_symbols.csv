@@ -1,0 +1,691 @@
+symbol,description
+005380.KS,Hyundai Motor Company
+005930.KS,"Samsung Electronics Co., Ltd."
+0700.HK,Tencent Holdings Limited
+0A2M.L,Koninklijke Philips NV
+0IW5.IL,Thales SA
+0OQV.IL,Orange SA
+1299.HK,AIA Group Limited
+1ACA.MI,Credit Agricole SA
+1MUV2.MI,Munich Re
+1NESN.MI,Nestle SA
+2888.HK,Standard Chartered plc
+3690.HK,Meituan
+6501.T,"Hitachi, Ltd."
+6752.T,Panasonic Holdings Corp.
+7201.T,"Nissan Motor Co., Ltd."
+7751.T,Canon Inc.
+9984.T,SoftBank Group Corp.
+A,Agilent Technologies
+AAPL,Apple Inc.
+ABBN.SW,ABB Ltd
+ABBV,AbbVie
+ABNB,Airbnb
+ABT,Abbott Laboratories
+ACGL,Arch Capital Group
+ACN,Accenture
+ADBE,Adobe Inc.
+ADI,Analog Devices
+ADM,Archer Daniels Midland
+ADP,Automatic Data Processing
+ADS.DE,Adidas AG
+ADSK,Autodesk
+AEE,Ameren
+AEP,American Electric Power
+AES,AES Corporation
+AFL,Aflac
+AGG,iShares Core U.S. Aggregate Bond ETF
+AI.PA,Air Liquide SA
+AIG,American International Group
+AIR.PA,Airbus SE
+AIZ,Assurant
+AJG,Arthur J. Gallagher & Co.
+AKAM,Akamai Technologies
+ALB,Albemarle Corporation
+ALGN,Align Technology
+ALL,Allstate
+ALLE,Allegion
+ALV.DE,Allianz SE
+AMAT,Applied Materials
+AMCR,Amcor
+AMD,Advanced Micro Devices
+AME,Ametek
+AMGN,Amgen
+AMP,Ameriprise Financial
+AMT,American Tower
+AMZN,Amazon
+ANET,Arista Networks
+AON,Aon plc
+AOS,A. O. Smith
+APA,APA Corporation
+APD,Air Products
+APH,Amphenol
+APO,Apollo Global Management
+APP,AppLovin
+APTV,Aptiv
+ARE,Alexandria Real Estate Equities
+ARES,Ares Management
+ARKK,ARK Innovation ETF
+ASML,ASML Holding NV
+ATO,Atmos Energy
+AV.L,Aviva plc
+AVB,AvalonBay Communities
+AVGO,Broadcom
+AVY,Avery Dennison
+AWK,American Water Works
+AXON,Axon Enterprise
+AXP,American Express
+AZN,AstraZeneca plc
+AZO,AutoZone
+B,Barrick Mining Corporation
+BA,Boeing
+BA.L,BAE Systems plc
+BABA,Alibaba Group Holding Limited
+BAC,Bank of America
+BALL,Ball Corporation
+BARC.L,Barclays plc
+BASFY,BASF SE
+BATS.L,British American Tobacco plc
+BAX,Baxter International
+BAYN.DE,Bayer AG
+BBY,Best Buy
+BDX,Becton Dickinson
+BEN,Franklin Resources
+BF-B,Brown–Forman
+BG,Bunge Global
+BHP,BHP Group Limited
+BIDU,"Baidu, Inc."
+BIIB,Biogen
+BKNG,Booking Holdings
+BKR,Baker Hughes
+BLDR,Builders FirstSource
+BLK,BlackRock
+BMW.DE,Bayerische Motoren Werke AG (BMW)
+BMY,Bristol Myers Squibb
+BN.PA,Danone SA
+BND,Vanguard Total Bond Market ETF
+BNDX,Vanguard Total International Bond ETF
+BNP.PA,BNP Paribas SA
+BNTGF,Brenntag SE
+BNY,BNY Mellon
+BP,BP plc
+BR,Broadridge Financial Solutions
+BRK-B,Berkshire Hathaway
+BRO,Brown & Brown
+BSX,Boston Scientific
+BX,Blackstone Inc.
+BXP,"BXP, Inc."
+C,Citigroup
+CA.PA,Carrefour SA
+CAH,Cardinal Health
+CAP.PA,Capgemini SE
+CARR,Carrier Global
+CASY,Casey's
+CAT,Caterpillar Inc.
+CB,Chubb Limited
+CBK.DE,Commerzbank AG
+CBOE,Cboe Global Markets
+CBRE,CBRE Group
+CCI,Crown Castle
+CCL,Carnival Corporation
+CDNS,Cadence Design Systems
+CDW,CDW Corporation
+CEG,Constellation Energy
+CF,CF Industries
+CFG,Citizens Financial Group
+CFR.SW,Compagnie Financiere Richemont SA
+CHD,Church & Dwight
+CHRW,C.H. Robinson
+CHTR,Charter Communications
+CI,Cigna
+CIEN,Ciena
+CINF,Cincinnati Financial
+CL,Colgate-Palmolive
+CLX,Clorox
+CMCSA,Comcast
+CME,CME Group
+CMG,Chipotle Mexican Grill
+CMI,Cummins
+CMS,CMS Energy
+CNC,Centene Corporation
+CNP,CenterPoint Energy
+CNR.TO,Canadian National Railway Co.
+COF,Capital One
+COHR,Coherent Corp.
+COIN,Coinbase
+CON.DE,Continental AG
+COO,Cooper Companies (The)
+COP,ConocoPhillips
+COR,Cencora
+COST,Costco
+CPAY,Corpay
+CPRT,Copart
+CPT,Camden Property Trust
+CRH,CRH plc
+CRL,Charles River Laboratories
+CRM,Salesforce
+CRWD,CrowdStrike
+CS.PA,AXA SA
+CSCO,Cisco
+CSGP,CoStar Group
+CSX,CSX Corporation
+CTAS,Cintas
+CTSH,Cognizant
+CTVA,Corteva
+CVNA,Carvana
+CVS,CVS Health
+CVX,Chevron Corporation
+CWW0.F,Commonwealth Bank of Australia
+D,Dominion Energy
+DAL,Delta Air Lines
+DASH,DoorDash
+DB,Deutsche Bank AG
+DBC,Invesco DB Commodity Index Tracking Fund
+DD,DuPont
+DDOG,Datadog
+DE,Deere & Company
+DECK,Deckers Brands
+DELL,Dell Technologies
+DEO,Diageo plc
+DG,Dollar General
+DG.PA,Vinci SA
+DGX,Quest Diagnostics
+DHI,D. R. Horton
+DHL.DE,DHL Group (Deutsche Post)
+DHR,Danaher Corporation
+DIA,SPDR Dow Jones Industrial Average ETF
+DIS,Walt Disney Company (The)
+DLR,Digital Realty
+DLTR,Dollar Tree
+DOC,Healthpeak Properties
+DOV,Dover Corporation
+DOW,Dow Inc.
+DPZ,Domino's
+DRI,Darden Restaurants
+DSY.PA,Dassault Systemes SE
+DTE,DTE Energy
+DTEGY,Deutsche Telekom AG
+DUK,Duke Energy
+DVA,DaVita
+DVN,Devon Energy
+DXCM,Dexcom
+EBAY,eBay Inc.
+ECHO,EchoStar
+ECL,Ecolab
+ED,Consolidated Edison
+EEM,iShares MSCI Emerging Markets ETF
+EFA,iShares MSCI EAFE ETF
+EFX,Equifax
+EG,Everest Group
+EIX,Edison International
+EL,Estée Lauder Companies (The)
+EL.PA,EssilorLuxottica SA
+ELV,Elevance Health
+EME,Emcor
+EMR,Emerson Electric
+EN.PA,Bouygues SA
+ENB,Enbridge Inc.
+ENGI.PA,Engie SA
+EOAN.DE,E.ON SE
+EOG,EOG Resources
+EQIX,Equinix
+EQR,Equity Residential
+EQT,EQT Corporation
+ERIE,Erie Indemnity
+ES,Eversource Energy
+ESS,Essex Property Trust
+ETN,Eaton Corporation
+ETR,Entergy
+EVRG,Evergy
+EW,Edwards Lifesciences
+EXC,Exelon
+EXE,Expand Energy
+EXPD,Expeditors International
+EXPE,Expedia Group
+EXR,Extra Space Storage
+F,Ford Motor Company
+FANG,Diamondback Energy
+FAST,Fastenal
+FCX,Freeport-McMoRan
+FDS,FactSet
+FDX,FedEx
+FDXF,FedEx Freight
+FE,FirstEnergy
+FERG,Ferguson Enterprises
+FFIV,"F5, Inc."
+FICO,Fair Isaac
+FIS,Fidelity National Information Services
+FISV,Fiserv
+FITB,Fifth Third Bancorp
+FIX,Comfort Systems USA
+FLEX,Flex Ltd.
+FOX,Fox Corporation (Class B)
+FOXA,Fox Corporation (Class A)
+FRE.DE,Fresenius SE & Co. KGaA
+FRT,Federal Realty Investment Trust
+FSLR,First Solar
+FTNT,Fortinet
+FTV,Fortive
+GD,General Dynamics
+GDDY,GoDaddy
+GDX,VanEck Gold Miners ETF
+GE,GE Aerospace
+GEHC,GE HealthCare
+GEN,Gen Digital
+GEV,GE Vernova
+GILD,Gilead Sciences
+GIS,General Mills
+GL,Globe Life
+GLD,SPDR Gold Shares
+GLE.PA,Societe Generale SA
+GLEN.L,Glencore plc
+GLW,Corning Inc.
+GM,General Motors
+GNRC,Generac
+GOOG,Alphabet Inc. (Class C)
+GOOGL,Alphabet Inc. (Class A)
+GPC,Genuine Parts Company
+GPN,Global Payments
+GRMN,Garmin
+GS,Goldman Sachs
+GSK,GSK plc
+GWW,W. W. Grainger
+HAL,Halliburton
+HAS,Hasbro
+HBAN,Huntington Bancshares
+HCA,HCA Healthcare
+HD,Home Depot (The)
+HDB,HDFC Bank Limited
+HEN3.DE,Henkel AG & Co. KGaA
+HESAF,Hermes International SA
+HIG,Hartford (The)
+HII,Huntington Ingalls Industries
+HLT,Hilton Worldwide
+HMC,"Honda Motor Co., Ltd."
+HNK1.SG,Heineken NV
+HON,Honeywell Technologies
+HONA,Honeywell Aerospace
+HOOD,Robinhood Markets
+HPE,Hewlett Packard Enterprise
+HPQ,HP Inc.
+HRL,Hormel Foods
+HSBC,HSBC Holdings plc
+HSIC,Henry Schein
+HST,Host Hotels & Resorts
+HSY,Hershey Company (The)
+HUBB,Hubbell Incorporated
+HUM,Humana
+HVRRY,Hannover Re
+HWM,Howmet Aerospace
+HYG,iShares iBoxx High Yield Corporate Bond ETF
+I1FO34.SA,Infosys Limited
+IBB,iShares Biotechnology ETF
+IBKR,Interactive Brokers
+IBM,IBM
+IBN,ICICI Bank Limited
+ICE,Intercontinental Exchange
+IDXX,Idexx Laboratories
+IEF,iShares 7-10 Year Treasury Bond ETF
+IEX,IDEX Corporation
+IFF,International Flavors & Fragrances
+IFX.DE,Infineon Technologies AG
+INCY,Incyte
+ING,ING Groep NV
+INTC,Intel
+INTU,Intuit
+INVH,Invitation Homes
+IP,International Paper
+IQV,IQVIA
+IR,Ingersoll Rand
+IRM,Iron Mountain
+ISRG,Intuitive Surgical
+IT,Gartner
+ITW,Illinois Tool Works
+IVV,iShares Core S&P 500 ETF
+IVZ,Invesco
+IWM,iShares Russell 2000 ETF
+J,Jacobs Solutions
+JBHT,J.B. Hunt
+JBL,Jabil
+JCI,Johnson Controls
+JD,"JD.com, Inc."
+JKHY,Jack Henry & Associates
+JNJ,Johnson & Johnson
+JPM,JPMorgan Chase
+KDP,Keurig Dr Pepper
+KER.PA,Kering SA
+KEY,KeyCorp
+KEYS,Keysight Technologies
+KHC,Kraft Heinz
+KIM,Kimco Realty
+KKR,KKR & Co.
+KLAC,KLA Corporation
+KMB,Kimberly-Clark
+KMI,Kinder Morgan
+KO,Coca-Cola Company (The)
+KR,Kroger
+KVUE,Kenvue
+L,Loews Corporation
+LDOS,Leidos
+LEN,Lennar
+LGEN.L,Legal & General Group plc
+LH,Labcorp
+LHX,L3Harris
+LII,Lennox International
+LIN,Linde plc
+LITE,Lumentum
+LLY,Lilly (Eli)
+LMT,Lockheed Martin
+LNT,Alliant Energy
+LOR.DE,L'Oreal SA
+LOW,Lowe's
+LQD,iShares iBoxx Investment Grade Corporate Bond ETF
+LRCX,Lam Research
+LSEG.L,London Stock Exchange Group plc
+LULU,Lululemon Athletica
+LUV,Southwest Airlines
+LVS,Las Vegas Sands
+LYB,LyondellBasell
+LYG,Lloyds Banking Group plc
+LYV,Live Nation Entertainment
+MA,Mastercard
+MAA,Mid-America Apartment Communities
+MAR,Marriott International
+MAS,Masco
+MBG.DE,Mercedes-Benz Group AG
+MC.PA,LVMH Moet Hennessy Louis Vuitton
+MCD,McDonald's
+MCHP,Microchip Technology
+MCK,McKesson Corporation
+MCO,Moody's Corporation
+MDLZ,Mondelez International
+MDT,Medtronic
+MET,MetLife
+META,Meta Platforms
+MGM,MGM Resorts
+MKC,McCormick & Company
+MKKGY,Merck KGaA
+ML.PA,Compagnie Generale des Etablissements Michelin
+MLM,Martin Marietta Materials
+MMM,3M
+MNST,Monster Beverage
+MO,Altria
+MOS,Mosaic Company (The)
+MPC,Marathon Petroleum
+MPWR,Monolithic Power Systems
+MRK,Merck & Co.
+MRNA,Moderna
+MRSH,Marsh McLennan
+MRVL,Marvell Technology
+MS,Morgan Stanley
+MSCI,MSCI
+MSFT,Microsoft
+MSI,Motorola Solutions
+MTB,M&T Bank
+MTD,Mettler Toledo
+MTX.DE,MTU Aero Engines AG
+MU,Micron Technology
+MUB,iShares National Muni Bond ETF
+MUFG,Mitsubishi UFJ Financial Group
+NCLH,Norwegian Cruise Line Holdings
+NDAQ,"Nasdaq, Inc."
+NDSN,Nordson Corporation
+NEE,NextEra Energy
+NEM,Newmont
+NFLX,Netflix
+NGG,National Grid plc
+NGL0.F,Anglo American plc
+NI,NiSource
+NIO,NIO Inc.
+NKE,"Nike, Inc."
+NOC,Northrop Grumman
+NOW,ServiceNow
+NRG,NRG Energy
+NSC,Norfolk Southern
+NTAP,NetApp
+NTDOY,"Nintendo Co., Ltd."
+NTRS,Northern Trust
+NUE,Nucor
+NVDA,Nvidia
+NVR,"NVR, Inc."
+NVS,Novartis AG
+NWG.L,NatWest Group plc
+NWS,News Corp (Class B)
+NWSA,News Corp (Class A)
+NXPI,NXP Semiconductors
+NXT.L,Next plc
+O,Realty Income
+ODFL,Old Dominion
+OKE,Oneok
+OMC,Omnicom Group
+ON,ON Semiconductor
+ORCL,Oracle Corporation
+ORLY,O'Reilly Automotive
+OTIS,Otis Worldwide
+OXY,Occidental Petroleum
+P911.DE,Porsche AG
+PANW,Palo Alto Networks
+PAYX,Paychex
+PC60.F,PetroChina Co. Ltd.
+PCAR,Paccar
+PCG,PG&E Corporation
+PEG,Public Service Enterprise Group
+PEP,PepsiCo
+PFE,Pfizer
+PFG,Principal Financial Group
+PG,Procter & Gamble
+PGR,Progressive Corporation
+PH,Parker Hannifin
+PHM,PulteGroup
+PKG,Packaging Corporation of America
+PLD,Prologis
+PLTR,Palantir Technologies
+PM,Philip Morris International
+PNC,PNC Financial Services
+PNR,Pentair
+PNW,Pinnacle West Capital
+PODD,Insulet Corporation
+PPG,PPG Industries
+PPL,PPL Corporation
+PRNDY,Pernod Ricard SA
+PRU,Prudential Financial
+PRU1N.MX,Prudential plc
+PSA,Public Storage
+PSKY,Paramount Skydance Corporation
+PSX,Phillips 66
+PTC,PTC Inc.
+PUB.PA,Publicis Groupe SA
+PWR,Quanta Services
+PYPL,PayPal
+Q,Qnity Electronics
+QCOM,Qualcomm
+QQQ,Invesco QQQ Trust (Nasdaq-100)
+RCL,Royal Caribbean Group
+REG,Regency Centers
+REGN,Regeneron Pharmaceuticals
+RELIANCE.NS,Reliance Industries Limited
+RELX,RELX plc
+RF,Regions Financial Corporation
+RHHBY,Roche Holding AG
+RHM.DE,Rheinmetall AG
+RIO,Rio Tinto plc
+RJF,Raymond James Financial
+RKT.L,Reckitt Benckiser Group plc
+RL,Ralph Lauren Corporation
+RMD,ResMed|
+RNO.PA,Renault SA
+ROK,Rockwell Automation
+ROL,"Rollins, Inc."
+ROP,Roper Technologies
+ROST,Ross Stores
+RR.L,Rolls-Royce Holdings plc
+RSG,Republic Services
+RTX,RTX Corporation
+RVTY,Revvity
+RWE.DE,RWE AG
+RY.TO,Royal Bank of Canada
+SAP.DE,SAP SE
+SBAC,SBA Communications
+SBUX,Starbucks
+SCHD,Schwab US Dividend Equity ETF
+SCHW,Charles Schwab Corporation
+SGO.PA,Compagnie de Saint-Gobain
+SHEL,Shell plc
+SHOP,Shopify Inc.
+SHW,Sherwin-Williams
+SHY,iShares 1-3 Year Treasury Bond ETF
+SIE.DE,Siemens AG
+SJM,J.M. Smucker Company (The)
+SKHY,SK Hynix Inc.
+SLB,Schlumberger
+SLV,iShares Silver Trust
+SMCI,Supermicro
+SMH,VanEck Semiconductor ETF
+SNA,Snap-on
+SNDK,Sandisk
+SNPS,Synopsys
+SNY,Sanofi
+SO,Southern Company
+SOLV,Solventum
+SONY,Sony Group Corporation
+SPG,Simon Property Group
+SPGI,S&P Global
+SPXS,Direxion Daily S&P 500 Bear 3x Shares
+SPY,SPDR S&P 500 ETF Trust
+SQQQ,ProShares UltraPro Short QQQ (-3x Nasdaq-100)
+SRE,Sempra
+SREN.SW,Swiss Re AG
+SRT3.DE,Sartorius AG
+STE,Steris
+STLD,Steel Dynamics
+STM,STMicroelectronics NV
+STT,State Street Corporation
+STX,Seagate Technology
+STZ,Constellation Brands
+SU.PA,Schneider Electric SE
+SW,Smurfit Westrock
+SWK,Stanley Black & Decker
+SWKS,Skyworks Solutions
+SYF,Synchrony Financial
+SYK,Stryker Corporation
+SYY,Sysco
+T,AT&T
+TAK,Takeda Pharmaceutical Company Ltd.
+TAP,Molson Coors Beverage Company
+TD.TO,Toronto-Dominion Bank
+TDG,TransDigm Group
+TDY,Teledyne Technologies
+TECH,Bio-Techne
+TEL,TE Connectivity
+TER,Teradyne
+TFC,Truist Financial
+TGT,Target Corporation
+TIP,iShares TIPS Bond ETF
+TJX,TJX Companies
+TKO,TKO Group Holdings
+TLT,iShares 20+ Year Treasury Bond ETF
+TM,Toyota Motor Corporation
+TMCV.NS,Tata Motors Limited
+TMO,Thermo Fisher Scientific
+TMUS,T-Mobile US
+TPL,Texas Pacific Land Corporation
+TPR,"Tapestry, Inc."
+TQQQ,ProShares UltraPro QQQ (3x Nasdaq-100)
+TRGP,Targa Resources
+TRMB,Trimble Inc.
+TROW,T. Rowe Price
+TRV,Travelers Companies (The)
+TSCO,Tractor Supply
+TSCO.L,Tesco plc
+TSLA,"Tesla, Inc."
+TSM,Taiwan Semiconductor Manufacturing Co. Ltd.
+TSN,Tyson Foods
+TT,Trane Technologies
+TTD,Trade Desk (The)
+TTE.PA,TotalEnergies SE
+TTWO,Take-Two Interactive
+TXN,Texas Instruments
+TXT,Textron
+TYL,Tyler Technologies
+UAL,United Airlines Holdings
+UBER,Uber
+UBS,UBS Group AG
+UDR,"UDR, Inc."
+UHS,Universal Health Services
+UL,Unilever plc
+ULTA,Ulta Beauty
+UNG,United States Natural Gas Fund
+UNH,UnitedHealth Group
+UNP,Union Pacific Corporation
+UPRO,ProShares UltraPro S&P500 (3x)
+UPS,United Parcel Service
+URI,United Rentals
+USB,U.S. Bancorp
+USO,United States Oil Fund
+V,Visa Inc.
+VEA,Vanguard FTSE Developed Markets ETF
+VEEV,Veeva Systems
+VICI,Vici Properties
+VIG,Vanguard Dividend Appreciation ETF
+VLO,Valero Energy
+VLTO,Veralto
+VMC,Vulcan Materials Company
+VNQ,Vanguard Real Estate ETF
+VOD.L,Vodafone Group plc
+VONOY,Vonovia SE
+VOO,Vanguard S&P 500 ETF
+VOW3.DE,Volkswagen AG
+VRSK,Verisk Analytics
+VRSN,Verisign
+VRT,Vertiv
+VRTX,Vertex Pharmaceuticals
+VST,Vistra Corp.
+VTI,Vanguard Total Stock Market ETF
+VTR,Ventas
+VTRS,Viatris
+VVD.MU,Veolia Environnement SA
+VWO,Vanguard FTSE Emerging Markets ETF
+VXUS,Vanguard Total International Stock ETF
+VYM,Vanguard High Dividend Yield ETF
+VZ,Verizon
+WAB,Wabtec
+WAT,Waters Corporation
+WBD,Warner Bros. Discovery
+WDAY,"Workday, Inc."
+WDC,Western Digital
+WDS.AX,Woodside Energy Group Ltd
+WEC,WEC Energy Group
+WELL,Welltower
+WFC,Wells Fargo
+WM,Waste Management
+WMB,Williams Companies
+WMT,Walmart
+WRB,W. R. Berkley Corporation
+WSM,"Williams-Sonoma, Inc."
+WST,West Pharmaceutical Services
+WTW,Willis Towers Watson
+WY,Weyerhaeuser
+WYNN,Wynn Resorts
+XBI,SPDR S&P Biotech ETF
+XEL,Xcel Energy
+XGR.F,Compass Group plc
+XLB,Materials Select Sector SPDR Fund
+XLC,Communication Services Select Sector SPDR Fund
+XLE,Energy Select Sector SPDR Fund
+XLF,Financial Select Sector SPDR Fund
+XLI,Industrial Select Sector SPDR Fund
+XLK,Technology Select Sector SPDR Fund
+XLP,Consumer Staples Select Sector SPDR Fund
+XLRE,Real Estate Select Sector SPDR Fund
+XLU,Utilities Select Sector SPDR Fund
+XLV,Health Care Select Sector SPDR Fund
+XLY,Consumer Discretionary Select Sector SPDR Fund
+XOM,ExxonMobil
+XYL,Xylem Inc.
+XYZ,"Block, Inc."
+YUM,Yum! Brands
+ZAL.DE,Zalando SE
+ZBH,Zimmer Biomet
+ZBRA,Zebra Technologies
+ZTS,Zoetis
+ZURN.SW,Zurich Insurance Group AG

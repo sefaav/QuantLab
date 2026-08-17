@@ -187,3 +187,107 @@ def test_to_millis_utc() -> None:
 
     ms = _to_millis(dt.date(2020, 1, 1))
     assert ms == 1577836800000
+
+
+class _RaisingSession:
+    def get(self, *_args: object, **_kwargs: object) -> _FakeResponse:
+        raise requests.ConnectionError("network is unreachable")
+
+
+def test_yahoo_search_symbols_parses_quotes() -> None:
+    payload = {
+        "quotes": [
+            {
+                "symbol": "aapl",
+                "shortname": "Apple Inc.",
+                "exchDisp": "NASDAQ",
+            },
+            {"symbol": "AAPL.MX", "longname": "Apple Inc. (Mexico)"},
+        ]
+    }
+    session = _FakeSession([_FakeResponse(200, payload)])
+    source = YahooFinanceDataSource(session=session)  # type: ignore[arg-type]
+
+    results = source.search_symbols("apple")
+
+    assert results[0].symbol == "AAPL"
+    assert results[0].description == "Apple Inc. · NASDAQ"
+    assert results[1].symbol == "AAPL.MX"
+    assert results[1].description == "Apple Inc. (Mexico)"
+
+
+def test_yahoo_search_symbols_empty_query_makes_no_request() -> None:
+    session = _FakeSession([])
+    source = YahooFinanceDataSource(session=session)  # type: ignore[arg-type]
+
+    assert source.search_symbols("   ") == []
+    assert session.calls == 0
+
+
+def test_yahoo_search_symbols_handles_http_error_gracefully() -> None:
+    session = _FakeSession([_FakeResponse(500, {})])
+    source = YahooFinanceDataSource(session=session)  # type: ignore[arg-type]
+
+    assert source.search_symbols("apple") == []
+
+
+def test_yahoo_search_symbols_handles_network_failure_gracefully() -> None:
+    source = YahooFinanceDataSource(session=_RaisingSession())  # type: ignore[arg-type]
+
+    assert source.search_symbols("apple") == []
+
+
+def test_yahoo_search_symbols_ignores_malformed_quotes_payload() -> None:
+    session = _FakeSession([_FakeResponse(200, {"quotes": "not-a-list"})])
+    source = YahooFinanceDataSource(session=session)  # type: ignore[arg-type]
+
+    assert source.search_symbols("apple") == []
+
+
+def test_yahoo_search_symbols_skips_entries_without_a_symbol() -> None:
+    payload = {"quotes": [{"shortname": "No symbol here"}, {"symbol": "MSFT"}]}
+    session = _FakeSession([_FakeResponse(200, payload)])
+    source = YahooFinanceDataSource(session=session)  # type: ignore[arg-type]
+
+    results = source.search_symbols("micro")
+
+    assert [r.symbol for r in results] == ["MSFT"]
+
+
+def test_binance_list_trading_symbols_filters_non_trading_pairs() -> None:
+    payload = {
+        "symbols": [
+            {
+                "symbol": "BTCUSDT",
+                "status": "TRADING",
+                "baseAsset": "BTC",
+                "quoteAsset": "USDT",
+            },
+            {
+                "symbol": "DELISTEDCOIN",
+                "status": "BREAK",
+                "baseAsset": "DEL",
+                "quoteAsset": "USDT",
+            },
+        ]
+    }
+    session = _FakeSession([_FakeResponse(200, payload)])
+    source = BinanceDataSource(session=session)  # type: ignore[arg-type]
+
+    results = source.list_trading_symbols()
+
+    assert [r.symbol for r in results] == ["BTCUSDT"]
+    assert results[0].description == "BTC/USDT"
+
+
+def test_binance_list_trading_symbols_handles_network_failure_gracefully() -> None:
+    source = BinanceDataSource(session=_RaisingSession())  # type: ignore[arg-type]
+
+    assert source.list_trading_symbols() == []
+
+
+def test_binance_list_trading_symbols_ignores_malformed_symbols_payload() -> None:
+    session = _FakeSession([_FakeResponse(200, {"symbols": "not-a-list"})])
+    source = BinanceDataSource(session=session)  # type: ignore[arg-type]
+
+    assert source.list_trading_symbols() == []
