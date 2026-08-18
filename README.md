@@ -141,13 +141,27 @@ already covers the requested period.
 ## Command-line interface
 
 ```bash
-quantlab download      --config configs/momentum_sp500.yaml
-quantlab backtest      --config configs/momentum_sp500.yaml
-quantlab walk-forward  --config configs/momentum_sp500.yaml
-quantlab report        --experiment cross_sectional_momentum_etfs
+quantlab download          --config configs/momentum_sp500.yaml
+quantlab backtest          --config configs/momentum_sp500.yaml
+quantlab walk-forward      --config configs/momentum_sp500.yaml
+quantlab stress-test       --config configs/momentum_sp500.yaml
+quantlab bootstrap         --config configs/momentum_sp500.yaml
+quantlab permutation-test  --config configs/momentum_sp500.yaml
+quantlab sensitivity       --config configs/momentum_sp500.yaml
+quantlab robustness        --config configs/momentum_sp500.yaml
+quantlab report            --experiment cross_sectional_momentum_etfs
 quantlab dashboard
 quantlab --help
 ```
+
+`stress-test`/`bootstrap`/`permutation-test`/`sensitivity` each run one
+robustness technique (with a matching `--n-iterations`/`--block-size`/
+`--param-x` etc. override); `robustness` runs every technique enabled under
+a config's `robustness:` block in one pass. All five branch on
+`validation.method`: with `walk_forward`, they re-run the whole walk-forward
+selection process per scenario instead of a single backtest, so the
+evidence never silently comes from a different validation method than the
+one configured.
 
 Each backtest, walk-forward or report run writes a structured artefact
 folder under the generated-reports directory. In a source checkout this is
@@ -182,6 +196,18 @@ Regenerate them (after `quantlab download` for each config) with
 ```bash
 streamlit run src/quantlab/dashboard/app.py
 ```
+
+A **Backtest** / **Walk-forward** mode switch sits above the sidebar.
+Walk-forward mode runs the same train/validation/test parameter selection as
+`quantlab walk-forward`, with its own sidebar (windows, expanding mode,
+optimization metric, parameter-grid picker) and Results/Trades/Robustness/
+Report tabs built from the stitched out-of-sample result, driven by a live
+progress bar with an ETA while a run is in flight. Both modes' Robustness
+tab includes stress tests, block bootstrap, a Monte Carlo permutation test
+and a 2-parameter sensitivity heatmap,
+individually or via "Run all robustness tests" — in Walk-forward mode,
+stress tests and sensitivity re-run the whole selection process per
+scenario/cell rather than a single backtest.
 
 ![QuantLab dashboard results](reports/figures/dashboard_results.png)
 

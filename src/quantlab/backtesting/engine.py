@@ -36,8 +36,8 @@ from pathlib import Path
 import pandas as pd
 
 from quantlab.backtesting.accounting import (
-    AccountingResult,
     compute_asset_returns,
+    portfolio_metrics_from_accounting,
     run_accounting,
 )
 from quantlab.backtesting.benchmark import build_benchmark
@@ -55,7 +55,6 @@ from quantlab.portfolio.allocator import PortfolioAllocator
 from quantlab.portfolio.constraints import constraints_from_config
 from quantlab.portfolio.rebalancing import rebalance_and_cap_turnover
 from quantlab.portfolio.volatility_targeting import apply_volatility_target
-from quantlab.risk.exposure import average_gross_exposure, average_net_exposure
 from quantlab.risk.metrics import compute_metrics
 from quantlab.strategies.base import BaseStrategy
 
@@ -320,7 +319,9 @@ class BacktestEngine:
             risk_free_rate=config.backtest.risk_free_rate,
             periods_per_year=config.periods_per_year,
         )
-        metrics.update(self._portfolio_metrics(accounting, config.periods_per_year))
+        metrics.update(
+            portfolio_metrics_from_accounting(accounting, config.periods_per_year)
+        )
         metrics["number_of_trades"] = float(len(trades))
         metrics["average_trade_size"] = (
             float(trades["traded_notional"].mean()) if len(trades) else 0.0
@@ -357,22 +358,6 @@ class BacktestEngine:
             gross_equity=accounting.gross_equity,
             turnover=accounting.turnover,
         )
-
-    @staticmethod
-    def _portfolio_metrics(
-        accounting: AccountingResult, periods_per_year: int
-    ) -> dict[str, float]:
-        """Exposure and turnover metrics."""
-        turnover = accounting.turnover
-        return {
-            "annual_turnover": float(turnover.mean() * periods_per_year)
-            if len(turnover)
-            else 0.0,
-            "average_gross_exposure": average_gross_exposure(
-                accounting.executed_weights
-            ),
-            "average_net_exposure": average_net_exposure(accounting.executed_weights),
-        }
 
     @staticmethod
     def _build_metadata(

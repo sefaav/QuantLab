@@ -268,6 +268,7 @@ def test_walk_forward_skips_only_structurally_unwarmed_pair_combinations(
         _data: pd.DataFrame,
         candidate: ExperimentConfig,
         *_bounds: pd.Timestamp,
+        execution_delay: int = 0,
     ) -> pd.Series:
         evaluated.append(
             {
@@ -559,7 +560,7 @@ def test_parameter_axes_reject_bad_names_and_value_collections() -> None:
         run_parameter_sensitivity(
             pd.DataFrame(), config, "", [1], "top_fraction", [0.3]
         )
-    with pytest.raises(ValueError, match="Unknown parameters"):
+    with pytest.raises(ValueError, match="Unknown or unsweepable"):
         run_parameter_sensitivity(
             pd.DataFrame(), config, "not_a_param", [1], "top_fraction", [0.3]
         )

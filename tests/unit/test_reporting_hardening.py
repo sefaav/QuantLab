@@ -146,6 +146,61 @@ def test_robustness_tables_format_percentage_columns() -> None:
     assert "0.42" in rendered
 
 
+def _sensitivity_frame() -> pd.DataFrame:
+    return pd.DataFrame(
+        {
+            "lookback_period": [60, 60, 120, 120],
+            "top_fraction": [0.3, 0.5, 0.3, 0.5],
+            "sharpe": [0.5, 0.8, 0.2, 0.6],
+            "cagr": [0.1, 0.15, 0.05, 0.12],
+            "max_drawdown": [-0.1, -0.12, -0.2, -0.15],
+            "turnover": [1.0, 1.0, 1.0, 1.0],
+            "num_trades": [10, 10, 10, 10],
+            "status": ["ok"] * 4,
+            "error": [None] * 4,
+        }
+    )
+
+
+def test_sensitivity_heatmap_chart_infers_swept_parameters() -> None:
+    """The two swept-parameter columns are whatever is left after excluding
+    the fixed metric/status columns every sensitivity table carries."""
+    figure = charts.sensitivity_heatmap_chart(_sensitivity_frame())
+    try:
+        assert figure.axes[0].get_xlabel() == "lookback_period"
+        assert figure.axes[0].get_ylabel() == "top_fraction"
+    finally:
+        figure.clear()
+
+
+def test_sensitivity_heatmap_chart_rejects_ambiguous_columns() -> None:
+    sensitivity = pd.DataFrame(
+        {"a": [1], "b": [2], "c": [3], "sharpe": [0.5], "status": ["ok"]}
+    )
+    with pytest.raises(ValueError, match="exactly two"):
+        charts.sensitivity_heatmap_chart(sensitivity)
+
+
+def test_render_robustness_embeds_sensitivity_heatmap() -> None:
+    rendered = _render_robustness({"sensitivity": _sensitivity_frame()})
+    assert '<img src="data:image/png;base64,' in rendered
+    assert "Parameter sensitivity heatmap" in rendered
+
+
+def test_render_robustness_sensitivity_heatmap_failure_does_not_crash_report() -> None:
+    """A malformed sensitivity table (here, only one swept-parameter column)
+    must not take down the whole report — same resilience as the other
+    charts (see report_figures)."""
+    malformed = pd.DataFrame(
+        {"lookback_period": [60], "sharpe": [0.5], "status": ["ok"]}
+    )
+    warnings: list[str] = []
+    rendered = _render_robustness({"sensitivity": malformed}, warnings)
+    assert "Chart unavailable" in rendered
+    assert warnings
+    assert "60" in rendered  # the raw table must still render
+
+
 def test_methodology_describes_volume_slippage_and_constraints() -> None:
     result: Any = SimpleNamespace(
         config=_config(volume_slippage=True),

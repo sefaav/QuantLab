@@ -60,3 +60,23 @@ validation:
 
 reproducibility:
   random_seed: 42
+
+# `quantlab stress-test|bootstrap|permutation-test|sensitivity --shipped-config
+# demo_offline` each run one technique regardless of `enabled` below (only
+# the `robustness` orchestrator reads it). Since validation.method is
+# walk_forward above, stress-test and sensitivity re-run the whole
+# walk-forward process per scenario/cell (slower, still fast offline on
+# this small bundled dataset); bootstrap and permutation-test just resample
+# the already-realised OOS returns.
+robustness:
+  stress_test:
+    enabled: true
+  bootstrap:
+    enabled: true
+  permutation_test:
+    enabled: true
+  sensitivity:
+    enabled: true
+    parameters:
+      lookback_period: [126, 189, 252]
+      top_fraction: [0.25, 0.50]

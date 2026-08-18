@@ -674,6 +674,76 @@ class ReproducibilityConfig(_StrictModel):
     random_seed: int = Field(default=42, ge=0)
 
 
+class StressTestSettings(_StrictModel):
+    """Toggle for the ``robustness stress-test`` / orchestrator run."""
+
+    enabled: bool = False
+
+
+class BootstrapSettings(_StrictModel):
+    """Settings for a block-bootstrap resample of realised returns."""
+
+    enabled: bool = False
+    n_iterations: int = Field(default=1000, gt=0)
+    block_size: int = Field(default=1, gt=0)
+
+
+class PermutationTestSettings(_StrictModel):
+    """Settings for the random-sign Monte Carlo permutation test."""
+
+    enabled: bool = False
+    n_iterations: int = Field(default=1000, gt=0)
+
+
+class SensitivitySettings(_StrictModel):
+    """Two-parameter sweep for the parameter-sensitivity heatmap.
+
+    ``parameters`` must name exactly two strategy parameters (the sweep's x
+    and y axes) with their candidate values; unlike ``validation.
+    parameter_grid``, there is no default here — sensitivity has no
+    meaningful "no parameters selected" fallback.
+    """
+
+    enabled: bool = False
+    parameters: dict[str, list[Any]] | None = None
+
+    @model_validator(mode="after")
+    def _check_parameters_shape(self) -> SensitivitySettings:
+        if self.parameters is not None:
+            if len(self.parameters) != 2:
+                raise ValueError(
+                    "robustness.sensitivity.parameters must name exactly 2 "
+                    f"parameters (the x and y axes), got {len(self.parameters)}."
+                )
+            for name, candidates in self.parameters.items():
+                if not name.strip():
+                    raise ValueError(
+                        "robustness.sensitivity.parameters names must be "
+                        "non-empty strings."
+                    )
+                if not candidates:
+                    raise ValueError(
+                        f"robustness.sensitivity.parameters.{name} must "
+                        "contain at least one candidate value."
+                    )
+        return self
+
+
+class RobustnessConfig(_StrictModel):
+    """Optional CLI/dashboard robustness-suite settings (``robustness:``).
+
+    Absent from YAML means every technique stays disabled — running a
+    backtest or walk-forward is unaffected either way.
+    """
+
+    stress_test: StressTestSettings = Field(default_factory=StressTestSettings)
+    bootstrap: BootstrapSettings = Field(default_factory=BootstrapSettings)
+    permutation_test: PermutationTestSettings = Field(
+        default_factory=PermutationTestSettings
+    )
+    sensitivity: SensitivitySettings = Field(default_factory=SensitivitySettings)
+
+
 class ExperimentConfig(_StrictModel):
     """Top-level, reproducible description of a single experiment.
 
@@ -691,6 +761,7 @@ class ExperimentConfig(_StrictModel):
     reproducibility: ReproducibilityConfig = Field(
         default_factory=ReproducibilityConfig
     )
+    robustness: RobustnessConfig = Field(default_factory=RobustnessConfig)
 
     @field_validator("experiment_name")
     @classmethod
@@ -710,6 +781,7 @@ class ExperimentConfig(_StrictModel):
         from quantlab.strategies import (
             available_strategies,
             strategy_parameter_names,
+            strategy_sweepable_parameter_names,
             validate_strategy_parameters,
         )
 
@@ -745,6 +817,20 @@ class ExperimentConfig(_StrictModel):
                         **self.strategy.parameters,
                         **dict(zip(names, values, strict=True)),
                     },
+                )
+        sensitivity_parameters = self.robustness.sensitivity.parameters
+        if sensitivity_parameters is not None:
+            # Boolean/structural parameters (e.g. long_only) are excluded:
+            # sweeping one changes which other parameters are even
+            # meaningful, so sensitivity treats them as fixed, matching the
+            # default walk-forward grid's own rule.
+            accepted = strategy_sweepable_parameter_names(self.strategy.name)
+            unknown = sorted(set(sensitivity_parameters) - accepted)
+            if unknown:
+                raise ValueError(
+                    f"Unknown or unsweepable robustness.sensitivity.parameters "
+                    f"key(s) {unknown} for strategy '{self.strategy.name}'. "
+                    f"Accepted parameters: {sorted(accepted)}."
                 )
         # A pairs strategy can trade only symbols present in the loaded universe.
         if self.strategy.name == "pairs_trading":

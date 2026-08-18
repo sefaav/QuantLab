@@ -69,3 +69,21 @@ validation:
 
 reproducibility:
   random_seed: 42
+
+robustness:
+  stress_test:
+    enabled: true
+  bootstrap:
+    enabled: true
+    n_iterations: 1000
+    block_size: 5
+  permutation_test:
+    enabled: true
+    n_iterations: 1000
+  sensitivity:
+    enabled: true
+    # Signal timing vs selection breadth — distinct from the walk-forward
+    # grid above (lookback_period/skip_period), not a repeat of it.
+    parameters:
+      lookback_period: [126, 189, 252]
+      top_fraction: [0.10, 0.25, 0.50]

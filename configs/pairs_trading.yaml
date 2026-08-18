@@ -50,3 +50,16 @@ validation:
 
 reproducibility:
   random_seed: 42
+
+robustness:
+  stress_test:
+    enabled: true
+  bootstrap:
+    enabled: true
+  permutation_test:
+    enabled: true
+  sensitivity:
+    enabled: true
+    parameters:
+      formation_window: [126, 252, 504]
+      zscore_window: [21, 63, 126]

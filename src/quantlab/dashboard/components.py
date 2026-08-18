@@ -59,6 +59,79 @@ def render_metric_cards(st: Any, result: BacktestResult) -> None:
         cols[i % 4].metric(label, value, help=help_text)
 
 
+def render_gross_net_comparison(st: Any, result: BacktestResult) -> None:
+    """Render gross-vs-net performance and cost drag."""
+    comparison = result.gross_net_comparison()
+
+    def fmt_pct(key: str) -> str:
+        value = comparison.get(key)
+        return f"{value:.2%}" if value is not None and np.isfinite(value) else "n/a"
+
+    def fmt_num(key: str) -> str:
+        value = comparison.get(key)
+        return f"{value:.2f}" if value is not None and np.isfinite(value) else "n/a"
+
+    st.markdown("#### Gross vs Net")
+    cards = [
+        ("Net total return", fmt_pct("net_total_return"), None),
+        ("Gross total return", fmt_pct("gross_total_return"), None),
+        (
+            "Cost drag",
+            fmt_pct("cost_drag"),
+            "Gross minus net total return — the cumulative performance "
+            "given up to trading costs.",
+        ),
+        ("Net Sharpe", fmt_num("net_sharpe"), None),
+        ("Gross Sharpe", fmt_num("gross_sharpe"), None),
+    ]
+    cols = st.columns(5)
+    for i, (label, value, help_text) in enumerate(cards):
+        cols[i].metric(label, value, help=help_text)
+
+
+def render_sensitivity_heatmap(
+    st: Any,
+    sensitivity: pd.DataFrame,
+    parameter_x: str,
+    parameter_y: str,
+    metric: str = "sharpe",
+) -> None:
+    """Render a parameter-sensitivity sweep as a Plotly heatmap.
+
+    Shared by Backtest and Walk-forward mode: both feed this the same shape
+    of ``sensitivity`` DataFrame (from ``run_parameter_sensitivity`` or its
+    walk-forward-aware variant), so only the data source differs upstream.
+    """
+    import plotly.graph_objects as go
+
+    from quantlab.validation.parameter_sensitivity import sensitivity_heatmap_data
+
+    failed = int((sensitivity["status"] == "failed").sum()) if len(sensitivity) else 0
+    if failed:
+        st.caption(
+            f"{failed} of {len(sensitivity)} combination(s) failed and are "
+            "excluded from the heatmap below."
+        )
+    heatmap = sensitivity_heatmap_data(sensitivity, parameter_x, parameter_y, metric)
+    fig = go.Figure(
+        go.Heatmap(
+            z=heatmap.to_numpy(),
+            x=[str(v) for v in heatmap.columns],
+            y=[str(v) for v in heatmap.index],
+            colorscale="RdYlGn",
+            colorbar={"title": metric},
+        )
+    )
+    fig.update_layout(
+        title=f"Sensitivity: {metric} by {parameter_x} / {parameter_y}",
+        xaxis_title=parameter_x,
+        yaxis_title=parameter_y,
+        height=380,
+    )
+    st.plotly_chart(fig, width="stretch")
+    st.dataframe(sensitivity, width="stretch", hide_index=True)
+
+
 def _line(x: Any, y: Any, name: str, color: str, dash: str | None = None) -> Any:
     import plotly.graph_objects as go
 
@@ -139,15 +212,6 @@ def render_charts(st: Any, result: BacktestResult) -> None:
 
     col3, col4 = st.columns(2)
 
-    # Exposure.
-    gross = gross_exposure_series(result.positions)
-    net = net_exposure_series(result.positions)
-    fig_exp = go.Figure()
-    fig_exp.add_trace(_line(gross.index, gross.to_numpy(), "Gross", STRATEGY))
-    fig_exp.add_trace(_line(net.index, net.to_numpy(), "Net", ACCENT))
-    fig_exp.update_layout(title="Gross / net exposure", height=300)
-    col3.plotly_chart(fig_exp, width="stretch")
-
     # Turnover.
     if result.turnover is not None:
         fig_to = go.Figure(
@@ -158,18 +222,7 @@ def render_charts(st: Any, result: BacktestResult) -> None:
             )
         )
         fig_to.update_layout(title="Turnover", height=300)
-        col4.plotly_chart(fig_to, width="stretch")
-
-    col5, col6 = st.columns(2)
-
-    # Cumulative costs.
-    if "total" in result.costs.columns:
-        cum = result.costs["total"].cumsum()
-        fig_cost = go.Figure(
-            go.Scatter(x=cum.index, y=cum.to_numpy(), line={"color": NEGATIVE})
-        )
-        fig_cost.update_layout(title="Cumulative cost (fraction)", height=300)
-        col5.plotly_chart(fig_cost, width="stretch")
+        col3.plotly_chart(fig_to, width="stretch")
 
     # Same adaptive window and formula as the HTML report's rolling charts.
     window = adaptive_rolling_window(len(rets))
@@ -182,9 +235,9 @@ def render_charts(st: Any, result: BacktestResult) -> None:
         )
     )
     fig_rs.update_layout(title=f"Rolling Sharpe ({window}p)", height=300)
-    col6.plotly_chart(fig_rs, width="stretch")
+    col4.plotly_chart(fig_rs, width="stretch")
 
-    col7, col8 = st.columns(2)
+    col5, col6 = st.columns(2)
 
     # Rolling volatility.
     roll_vol = rets.rolling(window).std(ddof=1) * np.sqrt(ppy)
@@ -192,14 +245,14 @@ def render_charts(st: Any, result: BacktestResult) -> None:
         go.Scatter(x=roll_vol.index, y=roll_vol.to_numpy(), line={"color": BENCHMARK})
     )
     fig_rv.update_layout(title=f"Rolling volatility ({window}p)", height=300)
-    col7.plotly_chart(fig_rv, width="stretch")
+    col5.plotly_chart(fig_rv, width="stretch")
 
     # Return distribution.
     fig_hist = go.Figure(
         go.Histogram(x=rets.dropna().to_numpy(), nbinsx=50, marker_color=STRATEGY)
     )
     fig_hist.update_layout(title="Return distribution", height=300)
-    col8.plotly_chart(fig_hist, width="stretch")
+    col6.plotly_chart(fig_hist, width="stretch")
 
     # Positions over time.
     fig_pos = go.Figure()
@@ -215,6 +268,29 @@ def render_charts(st: Any, result: BacktestResult) -> None:
         )
     fig_pos.update_layout(title="Positions over time", height=340)
     st.plotly_chart(fig_pos, width="stretch")
+
+
+def render_exposure_and_cost_charts(st: Any, result: BacktestResult) -> None:
+    """Render gross/net exposure and cumulative cost, shown after Gross vs Net."""
+    import plotly.graph_objects as go
+
+    col1, col2 = st.columns(2)
+
+    gross = gross_exposure_series(result.positions)
+    net = net_exposure_series(result.positions)
+    fig_exp = go.Figure()
+    fig_exp.add_trace(_line(gross.index, gross.to_numpy(), "Gross", STRATEGY))
+    fig_exp.add_trace(_line(net.index, net.to_numpy(), "Net", ACCENT))
+    fig_exp.update_layout(title="Gross / net exposure", height=300)
+    col1.plotly_chart(fig_exp, width="stretch")
+
+    if "total" in result.costs.columns:
+        cum = result.costs["total"].cumsum()
+        fig_cost = go.Figure(
+            go.Scatter(x=cum.index, y=cum.to_numpy(), line={"color": NEGATIVE})
+        )
+        fig_cost.update_layout(title="Cumulative cost (fraction)", height=300)
+        col2.plotly_chart(fig_cost, width="stretch")
 
 
 def render_trade_table(st: Any, result: BacktestResult) -> None:
