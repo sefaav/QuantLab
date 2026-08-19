@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import math
 from collections.abc import Callable
-from typing import TYPE_CHECKING
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import pandas as pd
@@ -23,6 +24,12 @@ from quantlab.risk._validation import (
 )
 from quantlab.risk.drawdown import max_drawdown
 from quantlab.risk.stress import remove_best_days, scale_costs
+from quantlab.validation.checkpoint import (
+    clear_checkpoint,
+    compute_provenance,
+    load_checkpoint,
+    save_checkpoint,
+)
 
 if TYPE_CHECKING:
     from quantlab.validation.walk_forward import WalkForwardResult
@@ -74,6 +81,7 @@ def run_stress_tests(
     config: ExperimentConfig,
     *,
     on_progress: Callable[[int, int], None] | None = None,
+    checkpoint_path: Path | None = None,
 ) -> pd.DataFrame:
     """Re-run the experiment under cost, delay and universe perturbations.
 
@@ -85,6 +93,9 @@ def run_stress_tests(
             (baseline plus) up to 6 scenarios below completes — each is a
             single backtest, so this is coarser than a fold-level signal but
             still enough to show a stalled run is actually progressing.
+        checkpoint_path: Optional path to persist per-scenario progress to,
+            so an interrupted run resumes from its last completed scenario
+            instead of starting over. See ``quantlab.validation.checkpoint``.
     """
     if not isinstance(data, pd.DataFrame):
         raise TypeError("data must be a pandas DataFrame.")
@@ -97,58 +108,95 @@ def run_stress_tests(
 
     reduced_universe = len(config.symbols) > 2
     total_scenarios = 1 + 3 + 2 + (1 if reduced_universe else 0)
-    completed_scenarios = 0
-    if on_progress is not None:
-        on_progress(0, total_scenarios)
 
-    baseline = run_backtest_from_config(data, config)
-    rows = [
-        _metrics_row("baseline", baseline.returns, periods_per_year, risk_free_rate)
-    ]
-    completed_scenarios += 1
+    rows: list[dict[str, object]] = []
+    # "best 10 days removed" needs the actual baseline returns Series later,
+    # not just its already-computed metrics row, so it has to be part of the
+    # checkpointed state too, or resuming past "baseline" would lose it.
+    baseline_returns: pd.Series | None = None
+    provenance: dict[str, Any] | None = None
+    if checkpoint_path is not None:
+        provenance = compute_provenance(config, data)
+        checkpoint_state = load_checkpoint(checkpoint_path, provenance)
+        if checkpoint_state is not None:
+            rows, baseline_returns = checkpoint_state
+            logger.info(
+                "Resuming stress tests from checkpoint: %d/%d scenarios already done.",
+                len(rows),
+                total_scenarios,
+            )
+    completed_scenarios = len(rows)
+
+    def _checkpoint() -> None:
+        if checkpoint_path is not None and provenance is not None:
+            save_checkpoint(
+                checkpoint_path,
+                provenance,
+                (rows, baseline_returns),
+                completed_scenarios,
+            )
+
     if on_progress is not None:
         on_progress(completed_scenarios, total_scenarios)
+
+    if completed_scenarios < 1:
+        baseline = run_backtest_from_config(data, config)
+        baseline_returns = baseline.returns
+        rows.append(
+            _metrics_row("baseline", baseline_returns, periods_per_year, risk_free_rate)
+        )
+        completed_scenarios += 1
+        _checkpoint()
+        if on_progress is not None:
+            on_progress(completed_scenarios, total_scenarios)
 
     scenarios = {
         "commission x2": scale_costs(config, commission_mult=2.0),
         "commission x5": scale_costs(config, commission_mult=5.0),
         "slippage x2": scale_costs(config, slippage_mult=2.0),
     }
-    for name, scenario_config in scenarios.items():
-        result = run_backtest_from_config(data, scenario_config)
+    for position, (name, scenario_config) in enumerate(scenarios.items(), start=2):
+        if completed_scenarios < position:
+            result = run_backtest_from_config(data, scenario_config)
+            rows.append(
+                _metrics_row(name, result.returns, periods_per_year, risk_free_rate)
+            )
+            completed_scenarios += 1
+            _checkpoint()
+            if on_progress is not None:
+                on_progress(completed_scenarios, total_scenarios)
+
+    if completed_scenarios < 5:
+        delayed = run_backtest_from_config(data, config, execution_delay=1)
         rows.append(
-            _metrics_row(name, result.returns, periods_per_year, risk_free_rate)
+            _metrics_row(
+                "execution delay +1",
+                delayed.returns,
+                periods_per_year,
+                risk_free_rate,
+            )
         )
         completed_scenarios += 1
+        _checkpoint()
         if on_progress is not None:
             on_progress(completed_scenarios, total_scenarios)
 
-    delayed = run_backtest_from_config(data, config, execution_delay=1)
-    rows.append(
-        _metrics_row(
-            "execution delay +1",
-            delayed.returns,
-            periods_per_year,
-            risk_free_rate,
+    if completed_scenarios < 6:
+        assert baseline_returns is not None
+        rows.append(
+            _metrics_row(
+                "best 10 days removed",
+                remove_best_days(baseline_returns, 10),
+                periods_per_year,
+                risk_free_rate,
+            )
         )
-    )
-    completed_scenarios += 1
-    if on_progress is not None:
-        on_progress(completed_scenarios, total_scenarios)
+        completed_scenarios += 1
+        _checkpoint()
+        if on_progress is not None:
+            on_progress(completed_scenarios, total_scenarios)
 
-    rows.append(
-        _metrics_row(
-            "best 10 days removed",
-            remove_best_days(baseline.returns, 10),
-            periods_per_year,
-            risk_free_rate,
-        )
-    )
-    completed_scenarios += 1
-    if on_progress is not None:
-        on_progress(completed_scenarios, total_scenarios)
-
-    if reduced_universe:
+    if reduced_universe and completed_scenarios < 7:
         reduced_symbols = config.symbols[:-1]
         data_config = config.data.revalidated_copy(update={"symbols": reduced_symbols})
         reduced_config = config.revalidated_copy(update={"data": data_config})
@@ -171,9 +219,12 @@ def run_stress_tests(
                 )
             )
         completed_scenarios += 1
+        _checkpoint()
         if on_progress is not None:
             on_progress(completed_scenarios, total_scenarios)
 
+    if checkpoint_path is not None:
+        clear_checkpoint(checkpoint_path)
     return pd.DataFrame(rows, columns=_STRESS_COLUMNS)
 
 
@@ -183,6 +234,7 @@ def run_walk_forward_stress_tests(
     wf_baseline: WalkForwardResult,
     *,
     on_progress: Callable[[int, int], None] | None = None,
+    checkpoint_path: Path | None = None,
 ) -> pd.DataFrame:
     """Re-run the whole walk-forward process under cost/delay/universe stress.
 
@@ -224,6 +276,17 @@ def run_walk_forward_stress_tests(
             are each a full walk-forward run; the three cost-only rescores
             and "best 10 days removed" are
             cheap).
+        checkpoint_path: Optional path to persist progress to, so an
+            interrupted run resumes instead of starting over — at the
+            scenario-block level (baseline / [cache-build + the 3 cost-only
+            rescores] / execution-delay+1 / best-10-days / reduced-universe)
+            for this function's own progress, plus a separate, nested
+            checkpoint for the cache-build block specifically (passed
+            through to :meth:`~quantlab.validation.walk_forward.
+            WalkForwardValidator.run_with_weight_cache`), since that block is
+            the expensive one and the whole point of the weight-cache
+            optimisation is not to have to redo it. See
+            ``quantlab.validation.checkpoint``.
     """
     from quantlab.validation.parameter_grid import parameter_grid_for_config
     from quantlab.validation.walk_forward import (
@@ -265,12 +328,6 @@ def run_walk_forward_stress_tests(
             execution_delay=execution_delay,
         )
 
-    rows = [
-        _metrics_row(
-            "baseline", wf_baseline.oos_result.returns, periods_per_year, risk_free_rate
-        )
-    ]
-
     cost_scenarios = {
         "commission x2": scale_costs(config, commission_mult=2.0),
         "commission x5": scale_costs(config, commission_mult=5.0),
@@ -288,62 +345,140 @@ def run_walk_forward_stress_tests(
         if on_progress is not None:
             on_progress(done, total_units)
 
-    # Signals and portfolio allocation never depend on execution costs, so
-    # build the per-candidate weight cache once (this is where the
-    # candidate-level progress reported above comes from — finer-grained
-    # than one tick per fold, since this build does roughly twice the work
-    # of a plain walk-forward fold) and reuse it for every cost-only
-    # scenario below instead of paying for a full re-run each.
-    validator = WalkForwardValidator(config)
-    _, weight_cache = validator.run_with_weight_cache(
-        data,
-        parameter_grid=grid,
-        train_window=train_window,
-        validation_window=validation_window,
-        test_window=test_window,
-        expanding=expanding,
-        execution_delay=0,
-        on_progress=_cache_progress,
-    )
-    completed_units = n_cache_units
+    # Scenario-block-level checkpoint (own file): baseline / [cache-build +
+    # the 3 cost-only rescores, as one block] / execution-delay+1 /
+    # best-10-days / reduced-universe. `rows` is the only state that needs
+    # to survive between blocks — every block computes from `config`/`data`/
+    # `wf_baseline`, already covered by `provenance`, not from a prior
+    # block's output.
+    rows: list[dict[str, object]] = []
+    provenance: dict[str, Any] | None = None
+    cache_checkpoint_path: Path | None = None
+    if checkpoint_path is not None:
+        provenance = compute_provenance(config, data)
+        cache_checkpoint_path = checkpoint_path.with_name(
+            checkpoint_path.stem + "_cache.pkl"
+        )
+        checkpoint_state = load_checkpoint(checkpoint_path, provenance)
+        if checkpoint_state is not None:
+            rows = checkpoint_state
+            logger.info(
+                "Resuming walk-forward stress tests from checkpoint: %d/%d "
+                "scenario blocks already done.",
+                len(rows),
+                4 + (1 if reduced_universe else 0),
+            )
+    completed_blocks = len(rows)
+    # Units already behind us for on_progress purposes, seeded from however
+    # many blocks a resume already found done — block 1 (baseline) isn't
+    # itself counted in total_units (see its definition above), only 2-5 are.
+    completed_units = 0
+    if completed_blocks >= 2:
+        completed_units += n_cache_units + len(cost_scenarios)
+    completed_units += max(0, completed_blocks - 2)
+    if on_progress is not None and completed_blocks >= 2:
+        # Otherwise block 2 is about to run (fresh or resumed) and
+        # run_with_weight_cache() below already emits its own accurate
+        # first tick via _cache_progress — a seed call here would either
+        # duplicate its (0, total_units) or, when resuming mid-cache-build,
+        # jump straight from a stale 0 to whatever candidate it actually
+        # resumes at.
+        on_progress(completed_units, total_units)
 
-    for name, scenario_config in cost_scenarios.items():
-        wf = validator.rescore_with_costs(weight_cache, scenario_config)
-        assert wf.oos_result is not None  # same data/windows as the baseline
+    def _checkpoint_block() -> None:
+        if checkpoint_path is not None and provenance is not None:
+            save_checkpoint(checkpoint_path, provenance, rows, completed_blocks)
+
+    if completed_blocks < 1:
         rows.append(
-            _metrics_row(name, wf.oos_result.returns, periods_per_year, risk_free_rate)
+            _metrics_row(
+                "baseline",
+                wf_baseline.oos_result.returns,
+                periods_per_year,
+                risk_free_rate,
+            )
+        )
+        completed_blocks += 1
+        _checkpoint_block()
+
+    if completed_blocks < 2:
+        # Signals and portfolio allocation never depend on execution costs,
+        # so build the per-candidate weight cache once (this is where the
+        # candidate-level progress reported above comes from — finer-grained
+        # than one tick per fold, since this build does roughly twice the
+        # work of a plain walk-forward fold) and reuse it for every
+        # cost-only scenario below instead of paying for a full re-run each.
+        # This block gets its own nested checkpoint (see the docstring):
+        # it's the expensive one, and the whole point of the weight-cache
+        # optimisation is not having to redo it.
+        validator = WalkForwardValidator(config)
+        _, weight_cache = validator.run_with_weight_cache(
+            data,
+            parameter_grid=grid,
+            train_window=train_window,
+            validation_window=validation_window,
+            test_window=test_window,
+            expanding=expanding,
+            execution_delay=0,
+            on_progress=_cache_progress,
+            checkpoint_path=cache_checkpoint_path,
+        )
+        # No separate on_progress call needed here: run_with_weight_cache's
+        # own ticks (via _cache_progress) already reached completed_units ==
+        # n_cache_units by the time it returns.
+        completed_units = n_cache_units
+
+        for name, scenario_config in cost_scenarios.items():
+            wf = validator.rescore_with_costs(weight_cache, scenario_config)
+            assert wf.oos_result is not None  # same data/windows as the baseline
+            rows.append(
+                _metrics_row(
+                    name, wf.oos_result.returns, periods_per_year, risk_free_rate
+                )
+            )
+            completed_units += 1
+            if on_progress is not None:
+                on_progress(completed_units, total_units)
+        completed_blocks += 1
+        if cache_checkpoint_path is not None:
+            clear_checkpoint(cache_checkpoint_path)
+        _checkpoint_block()
+    # else: already done on a previous attempt — completed_units was already
+    # seeded correctly above, nothing left to recompute for this block.
+
+    if completed_blocks < 3:
+        delayed = _run_walk_forward(config, data, grid, execution_delay=1)
+        assert delayed.oos_result is not None
+        rows.append(
+            _metrics_row(
+                "execution delay +1",
+                delayed.oos_result.returns,
+                periods_per_year,
+                risk_free_rate,
+            )
         )
         completed_units += 1
+        completed_blocks += 1
+        _checkpoint_block()
         if on_progress is not None:
             on_progress(completed_units, total_units)
 
-    delayed = _run_walk_forward(config, data, grid, execution_delay=1)
-    assert delayed.oos_result is not None
-    rows.append(
-        _metrics_row(
-            "execution delay +1",
-            delayed.oos_result.returns,
-            periods_per_year,
-            risk_free_rate,
+    if completed_blocks < 4:
+        rows.append(
+            _metrics_row(
+                "best 10 days removed",
+                remove_best_days(wf_baseline.oos_result.returns, 10),
+                periods_per_year,
+                risk_free_rate,
+            )
         )
-    )
-    completed_units += 1
-    if on_progress is not None:
-        on_progress(completed_units, total_units)
+        completed_units += 1
+        completed_blocks += 1
+        _checkpoint_block()
+        if on_progress is not None:
+            on_progress(completed_units, total_units)
 
-    rows.append(
-        _metrics_row(
-            "best 10 days removed",
-            remove_best_days(wf_baseline.oos_result.returns, 10),
-            periods_per_year,
-            risk_free_rate,
-        )
-    )
-    completed_units += 1
-    if on_progress is not None:
-        on_progress(completed_units, total_units)
-
-    if reduced_universe:
+    if reduced_universe and completed_blocks < 5:
         reduced_symbols = config.symbols[:-1]
         data_config = config.data.revalidated_copy(update={"symbols": reduced_symbols})
         reduced_config = config.revalidated_copy(update={"data": data_config})
@@ -371,9 +506,13 @@ def run_walk_forward_stress_tests(
                 )
             )
         completed_units += 1
+        completed_blocks += 1
+        _checkpoint_block()
         if on_progress is not None:
             on_progress(completed_units, total_units)
 
+    if checkpoint_path is not None:
+        clear_checkpoint(checkpoint_path)
     return pd.DataFrame(rows, columns=_STRESS_COLUMNS)
 
 

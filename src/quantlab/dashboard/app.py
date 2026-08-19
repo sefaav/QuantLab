@@ -11,7 +11,6 @@ HTML research report.
 
 from __future__ import annotations
 
-import time
 from collections.abc import Callable
 from datetime import date
 from typing import TYPE_CHECKING, Any, cast
@@ -28,7 +27,6 @@ from quantlab.dashboard.components import (
     render_trade_table,
 )
 from quantlab.dashboard.state import (
-    ProgressPacer,
     binance_trading_symbols,
     build_config_from_inputs,
     default_end_date,
@@ -44,6 +42,7 @@ from quantlab.dashboard.state import (
     yahoo_common_symbols,
 )
 from quantlab.logging_config import get_logger
+from quantlab.progress import ProgressReporter
 from quantlab.strategies.base import (
     available_strategies,
     strategy_parameter_names,
@@ -1333,31 +1332,16 @@ def _make_progress_callback(
 ) -> Callable[[int, int], None]:
     """Build an ``on_progress(done, total)`` callback driving a live progress bar.
 
-    Paces its remaining-time estimate with a `state.ProgressPacer`, since a
-    pre-run duration guess needs a measured single-run duration that isn't
-    available before the first fold/candidate/scenario actually completes.
+    Text/ETA come from a shared `ProgressReporter` (also used by the CLI's
+    terminal progress line, for the same estimate on both interfaces) — this
+    function only renders it into the Streamlit widget.
     """
-    started = time.monotonic()
-    pacer = ProgressPacer()
+    reporter = ProgressReporter(title)
 
     def _on_progress(done: int, total: int) -> None:
-        now = time.monotonic() - started
-        fraction = min(1.0, done / total) if total > 0 else 0.0
-        if total > 0 and done >= total:
-            text = f"{title}: finishing…"
-        else:
-            pacer.update(done, now)
-            remaining = pacer.remaining(done, total) if total > 0 else None
-            if remaining is not None and remaining >= 1.0:
-                text = f"{title}: {done}/{total} — ~{remaining:.0f}s remaining"
-            elif total > 0:
-                # No pace yet, or the estimate ran out while work remains —
-                # "~0s remaining" would misleadingly read as "any moment
-                # now" instead of "still going, longer than expected".
-                text = f"{title}: {done}/{total}"
-            else:
-                text = f"{title}: running…"
-        progress_bar.progress(fraction, text=text)
+        progress_bar.progress(
+            reporter.fraction(done, total), text=reporter.text(done, total)
+        )
 
     return _on_progress
 

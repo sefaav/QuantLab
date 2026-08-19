@@ -426,7 +426,9 @@ def test_cli_walk_forward_delegates_all_validation_csvs_to_result_save(
     )
     monkeypatch.setattr(walk_forward_module, "WalkForwardValidator", FakeValidator)
     monkeypatch.setattr(
-        robustness_module, "run_stress_tests", lambda _data, _cfg: stress
+        robustness_module,
+        "run_stress_tests",
+        lambda _data, _cfg, **_kwargs: stress,
     )
     monkeypatch.setattr(
         runner_module,

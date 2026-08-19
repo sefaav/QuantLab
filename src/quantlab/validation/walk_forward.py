@@ -8,6 +8,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from numbers import Integral, Real
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -50,6 +51,12 @@ from quantlab.portfolio.rebalancing import (
 from quantlab.risk import metrics as M
 from quantlab.risk._validation import boolean, finite_real, positive_int
 from quantlab.strategies import strategy_parameter_names
+from quantlab.validation.checkpoint import (
+    clear_checkpoint,
+    compute_provenance,
+    load_checkpoint,
+    save_checkpoint,
+)
 from quantlab.validation.splits import WalkForwardWindow, walk_forward_windows
 
 logger = get_logger(__name__)
@@ -234,6 +241,7 @@ class WalkForwardValidator:
         expanding: bool = True,
         execution_delay: int = 0,
         on_progress: Callable[[int, int], None] | None = None,
+        checkpoint_path: Path | None = None,
     ) -> WalkForwardResult:
         """Execute chronological parameter selection and OOS accounting.
 
@@ -248,10 +256,11 @@ class WalkForwardValidator:
             expanding: Grow the training window across folds instead of
                 sliding it.
             on_progress: Optional callback invoked as ``on_progress(done,
-                total)`` once before the first candidate (``done=0``) and
-                once after each candidate is considered plus once more after
-                each fold's out-of-sample weights are computed — ``total``
-                being folds x (grid size + 1), matching
+                total)`` once before the first candidate (``done=0``, or the
+                resumed count if ``checkpoint_path`` supplied a partial run)
+                and once after each candidate is considered plus once more
+                after each fold's out-of-sample weights are computed —
+                ``total`` being folds x (grid size + 1), matching
                 ``estimate_walk_forward_backtest_count`` — for a caller (e.g.
                 the dashboard) to drive a live progress bar instead of
                 estimating a duration upfront. One tick per whole fold was
@@ -264,6 +273,11 @@ class WalkForwardValidator:
                 out-of-sample weights (the "acting on stale signals" stress
                 scenario, re-run through the whole selection process rather
                 than only rescaling the final numbers).
+            checkpoint_path: Optional path to persist per-fold progress to,
+                so an interrupted run resumes from its last completed fold
+                instead of starting over. Silently ignored (fresh start) if
+                nothing valid is there yet; automatically cleared once this
+                call completes. See ``quantlab.validation.checkpoint``.
         """
         started = time.perf_counter()
         expanding = boolean(expanding, name="expanding")
@@ -281,14 +295,39 @@ class WalkForwardValidator:
         fold_parameters: list[dict[str, Any]] = []
         fold_scores: list[float] = []
         target_pieces: list[pd.DataFrame] = []
+
+        provenance: dict[str, Any] | None = None
+        if checkpoint_path is not None:
+            provenance = compute_provenance(
+                self.base_config,
+                data,
+                train_window=train_window,
+                validation_window=validation_window,
+                test_window=test_window,
+                expanding=expanding,
+                execution_delay=execution_delay,
+                parameter_grid={k: list(v) for k, v in parameter_grid.items()},
+            )
+            checkpoint_state = load_checkpoint(checkpoint_path, provenance)
+            if checkpoint_state is not None:
+                fold_windows, fold_parameters, fold_scores, target_pieces = (
+                    checkpoint_state
+                )
+                logger.info(
+                    "Resuming walk-forward from checkpoint: %d/%d folds already done.",
+                    len(fold_windows),
+                    len(prepared.windows),
+                )
+        resumed_folds = len(fold_windows)
+
         # One tick per candidate considered plus one for the fold's final
         # out-of-sample weights, not one tick per whole fold: see the
         # on_progress docstring above for why the coarser version made a
         # caller's live pace estimate too imprecise.
         total_units = len(prepared.windows) * (len(prepared.combinations) + 1)
-        units_done = 0
+        units_done = resumed_folds * (len(prepared.combinations) + 1)
         if on_progress is not None:
-            on_progress(0, total_units)
+            on_progress(units_done, total_units)
 
         def _tick() -> None:
             nonlocal units_done
@@ -296,7 +335,7 @@ class WalkForwardValidator:
             if on_progress is not None:
                 on_progress(units_done, total_units)
 
-        for window in prepared.windows:
+        for window in prepared.windows[resumed_folds:]:
             best = self._select_on_validation(
                 data,
                 window,
@@ -313,8 +352,15 @@ class WalkForwardValidator:
             fold_scores.append(best["score"])
             _tick()
             target_pieces.append(targets)
+            if checkpoint_path is not None and provenance is not None:
+                save_checkpoint(
+                    checkpoint_path,
+                    provenance,
+                    (fold_windows, fold_parameters, fold_scores, target_pieces),
+                    len(fold_windows),
+                )
 
-        return self._finalize(
+        result = self._finalize(
             fold_windows,
             fold_parameters,
             fold_scores,
@@ -332,6 +378,9 @@ class WalkForwardValidator:
             expanding,
             started,
         )
+        if checkpoint_path is not None:
+            clear_checkpoint(checkpoint_path)
+        return result
 
     def run_with_weight_cache(
         self,
@@ -344,6 +393,7 @@ class WalkForwardValidator:
         expanding: bool = True,
         execution_delay: int = 0,
         on_progress: Callable[[int, int], None] | None = None,
+        checkpoint_path: Path | None = None,
     ) -> tuple[WalkForwardResult, WalkForwardWeightCache]:
         """Like :meth:`run`, but also return a cache of per-candidate weights.
 
@@ -361,7 +411,13 @@ class WalkForwardValidator:
         Args: as :meth:`run`, except ``on_progress`` is reported per
             candidate evaluated (``total`` = folds x candidates) rather than
             per fold, since this method does roughly twice the work of
-            :meth:`run` per fold.
+            :meth:`run` per fold. ``checkpoint_path``, if given, checkpoints
+            per fold (a fold's cached candidates are only ever used or
+            dropped as a whole) — an interruption while this cache is being
+            built resumes at the right fold instead of recomputing it from
+            scratch, which matters here specifically because building it is
+            the expensive part the cost-only stress scenarios are meant to
+            amortise.
         """
         started = time.perf_counter()
         expanding = boolean(expanding, name="expanding")
@@ -380,6 +436,36 @@ class WalkForwardValidator:
         fold_scores: list[float] = []
         target_pieces: list[pd.DataFrame] = []
         cached_candidates: list[list[_FoldCandidateWeights]] = []
+
+        provenance: dict[str, Any] | None = None
+        if checkpoint_path is not None:
+            provenance = compute_provenance(
+                self.base_config,
+                data,
+                train_window=train_window,
+                validation_window=validation_window,
+                test_window=test_window,
+                expanding=expanding,
+                execution_delay=execution_delay,
+                parameter_grid={k: list(v) for k, v in parameter_grid.items()},
+            )
+            checkpoint_state = load_checkpoint(checkpoint_path, provenance)
+            if checkpoint_state is not None:
+                (
+                    fold_windows,
+                    fold_parameters,
+                    fold_scores,
+                    target_pieces,
+                    cached_candidates,
+                ) = checkpoint_state
+                logger.info(
+                    "Resuming weight-cache build from checkpoint: %d/%d folds "
+                    "already done.",
+                    len(fold_windows),
+                    len(prepared.windows),
+                )
+        resumed_folds = len(fold_windows)
+
         # Reported per candidate evaluated, not per fold: this method does
         # roughly twice the work of run() per fold (it also captures every
         # candidate's test-block targets, not only the winner's), so
@@ -387,10 +473,10 @@ class WalkForwardValidator:
         # especially with few folds — and look stalled to a caller like the
         # dashboard's progress bar.
         total_candidates = len(prepared.windows) * len(prepared.combinations)
-        candidates_done = 0
+        candidates_done = resumed_folds * len(prepared.combinations)
         if on_progress is not None:
-            on_progress(0, total_candidates)
-        for window in prepared.windows:
+            on_progress(candidates_done, total_candidates)
+        for window in prepared.windows[resumed_folds:]:
 
             def _tick() -> None:
                 nonlocal candidates_done
@@ -415,6 +501,19 @@ class WalkForwardValidator:
             test_targets = captured[best_index].test_targets
             assert test_targets is not None
             target_pieces.append(test_targets)
+            if checkpoint_path is not None and provenance is not None:
+                save_checkpoint(
+                    checkpoint_path,
+                    provenance,
+                    (
+                        fold_windows,
+                        fold_parameters,
+                        fold_scores,
+                        target_pieces,
+                        cached_candidates,
+                    ),
+                    len(fold_windows),
+                )
 
         result = self._finalize(
             fold_windows,
@@ -446,6 +545,8 @@ class WalkForwardValidator:
             expanding=expanding,
             execution_delay=prepared.delay,
         )
+        if checkpoint_path is not None:
+            clear_checkpoint(checkpoint_path)
         return result, cache
 
     def rescore_with_costs(

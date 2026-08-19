@@ -163,6 +163,12 @@ selection process per scenario instead of a single backtest, so the
 evidence never silently comes from a different validation method than the
 one configured.
 
+`walk-forward`, `stress-test`, `sensitivity` and `robustness` show a live
+progress bar with an ETA in the terminal, and checkpoint their progress to
+disk as they go — an interruption (Ctrl+C, a crash, closing the terminal)
+resumes automatically on the next matching run instead of starting over.
+Pass `--fresh` to discard a checkpoint and start clean.
+
 Each backtest, walk-forward or report run writes a structured artefact
 folder under the generated-reports directory. In a source checkout this is
 `reports/generated/<experiment>/`; after a regular package installation it is

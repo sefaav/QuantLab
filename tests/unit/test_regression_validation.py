@@ -629,8 +629,19 @@ def test_report_command_preserves_walk_forward_run_timestamp(
 
 
 def test_generate_report_preserves_walk_forward_artifacts(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """Pins git_dirty=False: `load_previous_walk_forward_robustness` refuses
+    reuse whenever either save saw a dirty tree (git_commit can't be trusted
+    otherwise), which is real, intentional behaviour — but leaving it to
+    whatever the ambient repo state happens to be during a test run makes
+    this test's pass/fail depend on something it doesn't control (an
+    ordinarily-uncommitted working session, or an unrelated CI build step,
+    would fail it for a reason that has nothing to do with the reuse logic
+    actually under test here)."""
+    import quantlab.backtesting.engine as engine_module
+
+    monkeypatch.setattr(engine_module, "_git_is_dirty", lambda: False)
     from quantlab.backtesting.result import save_with_walk_forward_reuse
     from quantlab.backtesting.runner import run_backtest_from_config
 

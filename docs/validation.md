@@ -59,7 +59,13 @@ quantlab walk-forward --config configs/momentum_sp500.yaml
 ```
 
 This writes the walk-forward CSV artefacts and incorporates compatible evidence
-into the generated HTML report.
+into the generated HTML report. Progress (and an ETA) is shown live in the
+terminal or dashboard while it runs. An interruption (Ctrl+C, a crash, closing
+the terminal) is resumed automatically the next time the same command runs
+against the same experiment, config, data and code — no partial folds are
+recomputed. Pass `--fresh` to discard that progress and start over instead.
+The same applies to `stress-test`, `sensitivity` and `robustness` in
+walk-forward mode.
 
 ## Parameter sensitivity
 

@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import math
-from typing import TypedDict
+from pathlib import Path
+from typing import Any, TypedDict
 
 import numpy as np
 import pandas as pd
@@ -54,6 +55,15 @@ class _WalkForwardRunKwargs(TypedDict):
     validation_window: int
     test_window: int
     expanding: bool
+
+
+class _SensitivitySweepKwargs(TypedDict):
+    """Precise keyword types for ``**sweep_kwargs`` call-site unpacking."""
+
+    parameter_x: str
+    values_x: list[Any]
+    parameter_y: str
+    values_y: list[Any]
 
 
 def _panel(n: int = 900) -> pd.DataFrame:
@@ -210,6 +220,124 @@ def test_walk_forward_run_reports_fold_progress() -> None:
     assert progress_calls[-1] == (total_units, total_units)
     assert [done for done, _ in progress_calls] == list(range(total_units + 1))
     assert all(total == total_units for _, total in progress_calls)
+
+
+def test_walk_forward_run_resumes_from_a_checkpoint_and_matches_a_fresh_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An interrupted run's checkpoint, resumed, must produce exactly the
+    same WalkForwardResult as an uninterrupted run — resuming is not an
+    approximation, it picks up the identical remaining computation."""
+    data = _panel()
+    grid = {"lookback_period": [60, 120]}
+    checkpoint_path = tmp_path / "checkpoint.pkl"
+
+    fresh = WalkForwardValidator(_config()).run(
+        data,
+        parameter_grid=grid,
+        train_window=300,
+        validation_window=120,
+        test_window=120,
+        expanding=True,
+    )
+    assert len(fresh.folds) >= 2, "need at least 2 folds to interrupt after the 1st"
+
+    real_select = WalkForwardValidator._select_on_validation
+    starts = {"n": 0}
+
+    def _flaky_select(self: WalkForwardValidator, *args: object, **kwargs: object):  # type: ignore[no-untyped-def]
+        starts["n"] += 1
+        if starts["n"] == 2:
+            raise RuntimeError("simulated interruption")
+        return real_select(self, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(WalkForwardValidator, "_select_on_validation", _flaky_select)
+    with pytest.raises(RuntimeError, match="simulated interruption"):
+        WalkForwardValidator(_config()).run(
+            data,
+            parameter_grid=grid,
+            train_window=300,
+            validation_window=120,
+            test_window=120,
+            expanding=True,
+            checkpoint_path=checkpoint_path,
+        )
+    assert checkpoint_path.is_file()
+    monkeypatch.undo()
+
+    resumed = WalkForwardValidator(_config()).run(
+        data,
+        parameter_grid=grid,
+        train_window=300,
+        validation_window=120,
+        test_window=120,
+        expanding=True,
+        checkpoint_path=checkpoint_path,
+    )
+    assert not checkpoint_path.is_file()  # cleared after completing successfully
+    assert resumed.oos_result is not None
+    assert fresh.oos_result is not None
+    pd.testing.assert_series_equal(resumed.oos_result.returns, fresh.oos_result.returns)
+    assert [f.best_params for f in resumed.folds] == [
+        f.best_params for f in fresh.folds
+    ]
+
+
+def test_walk_forward_run_does_not_reuse_a_checkpoint_from_a_different_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A checkpoint written by one config must not be silently reused by a
+    later run against a different one sharing the same checkpoint path —
+    every candidate must actually be (re-)computed, not skipped."""
+    data = _panel()
+    checkpoint_path = tmp_path / "checkpoint.pkl"
+
+    # Interrupt after the 1st fold completes, so there is something on disk
+    # to (not) reuse below.
+    real_select = WalkForwardValidator._select_on_validation
+    starts = {"n": 0}
+
+    def _flaky_select(self: WalkForwardValidator, *args: object, **kwargs: object):  # type: ignore[no-untyped-def]
+        starts["n"] += 1
+        if starts["n"] == 2:
+            raise RuntimeError("simulated interruption")
+        return real_select(self, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(WalkForwardValidator, "_select_on_validation", _flaky_select)
+    with pytest.raises(RuntimeError, match="simulated interruption"):
+        WalkForwardValidator(_config()).run(
+            data,
+            parameter_grid={"lookback_period": [60, 120]},
+            train_window=300,
+            validation_window=120,
+            test_window=120,
+            expanding=True,
+            checkpoint_path=checkpoint_path,
+        )
+    assert checkpoint_path.is_file()
+    monkeypatch.undo()
+
+    calls = {"n": 0}
+    real_select2 = WalkForwardValidator._select_on_validation
+
+    def _counting_select(self: WalkForwardValidator, *args: object, **kwargs: object):  # type: ignore[no-untyped-def]
+        calls["n"] += 1
+        return real_select2(self, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(WalkForwardValidator, "_select_on_validation", _counting_select)
+    # A different grid: same checkpoint path, different provenance.
+    different_config = _config()
+    result = WalkForwardValidator(different_config).run(
+        data,
+        parameter_grid={"lookback_period": [60, 90, 120]},
+        train_window=300,
+        validation_window=120,
+        test_window=120,
+        expanding=True,
+        checkpoint_path=checkpoint_path,
+    )
+    # Every fold was actually selected on, not skipped as "already done".
+    assert calls["n"] == len(result.folds)
 
 
 def test_walk_forward_oos_result_is_a_coherent_backtest_result() -> None:
@@ -432,6 +560,59 @@ def test_run_with_weight_cache_matches_plain_run() -> None:
     pd.testing.assert_series_equal(cached.oos_result.returns, plain.oos_result.returns)
 
 
+def test_run_with_weight_cache_resumes_from_a_checkpoint_and_matches_a_fresh_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Same guarantee as :func:`test_walk_forward_run_resumes_from_a_checkpoint_
+    and_matches_a_fresh_run`, for run_with_weight_cache() specifically — this is
+    the method run_walk_forward_stress_tests() relies on to avoid rebuilding
+    its weight cache from scratch on resume, so it must be independently
+    resumable and bit-for-bit reproducible on its own."""
+    data = _cost_sensitive_panel()
+    config = _cost_sensitive_config(commission_bps=50.0)
+    grid = {"entry_zscore": [0.5, 3.0]}
+    windows: _WalkForwardWindows = {
+        "train_window": 150,
+        "validation_window": 60,
+        "test_window": 60,
+        "expanding": True,
+    }
+    checkpoint_path = tmp_path / "checkpoint.pkl"
+
+    fresh, _fresh_cache = WalkForwardValidator(config).run_with_weight_cache(
+        data, parameter_grid=grid, **windows
+    )
+    assert len(fresh.folds) >= 2, "need at least 2 folds to interrupt after the 1st"
+
+    real_capture = WalkForwardValidator._select_and_capture
+    starts = {"n": 0}
+
+    def _flaky_capture(self: WalkForwardValidator, *args: object, **kwargs: object):  # type: ignore[no-untyped-def]
+        starts["n"] += 1
+        if starts["n"] == 2:
+            raise RuntimeError("simulated interruption")
+        return real_capture(self, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(WalkForwardValidator, "_select_and_capture", _flaky_capture)
+    with pytest.raises(RuntimeError, match="simulated interruption"):
+        WalkForwardValidator(config).run_with_weight_cache(
+            data, parameter_grid=grid, checkpoint_path=checkpoint_path, **windows
+        )
+    assert checkpoint_path.is_file()
+    monkeypatch.undo()
+
+    resumed, _resumed_cache = WalkForwardValidator(config).run_with_weight_cache(
+        data, parameter_grid=grid, checkpoint_path=checkpoint_path, **windows
+    )
+    assert not checkpoint_path.is_file()
+    assert resumed.oos_result is not None
+    assert fresh.oos_result is not None
+    pd.testing.assert_series_equal(resumed.oos_result.returns, fresh.oos_result.returns)
+    assert [f.best_params for f in resumed.folds] == [
+        f.best_params for f in fresh.folds
+    ]
+
+
 def test_rescore_with_costs_matches_a_fresh_scenario_run() -> None:
     """rescore_with_costs() must reproduce a fresh full re-run's fold
     selection and OOS returns under a scaled-cost scenario — it must be a
@@ -558,6 +739,78 @@ def test_run_walk_forward_stress_tests_reports_scenario_progress() -> None:
     assert [done for done, _ in progress_calls] == list(range(total_units + 1))
 
 
+def test_run_walk_forward_stress_tests_resumes_the_weight_cache_build(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The weight-cache build inside run_walk_forward_stress_tests() — the
+    expensive part the cache exists to amortise across the 3 cost-only
+    scenarios — must itself be resumable via its own nested checkpoint: an
+    interruption partway through it must not force rebuilding the cache
+    from scratch, or the whole point of caching is defeated on any restart.
+    """
+    data = _panel()
+    config = _config()
+    train_window, validation_window, test_window = resolve_walk_forward_windows(config)
+    wf_baseline = WalkForwardValidator(config).run(
+        data,
+        parameter_grid={"lookback_period": [60, 120]},
+        train_window=train_window,
+        validation_window=validation_window,
+        test_window=test_window,
+        expanding=config.validation.expanding,
+    )
+    assert wf_baseline.oos_result is not None
+    n_folds = len(wf_baseline.folds)
+    assert n_folds >= 2, "need >= 2 folds to interrupt mid-cache-build"
+
+    checkpoint_path = tmp_path / "checkpoint.pkl"
+    cache_checkpoint_path = tmp_path / "checkpoint_cache.pkl"
+
+    real_capture = WalkForwardValidator._select_and_capture
+    starts = {"n": 0}
+
+    def _flaky_capture(self: WalkForwardValidator, *args: object, **kwargs: object):  # type: ignore[no-untyped-def]
+        starts["n"] += 1
+        if starts["n"] == 2:
+            raise RuntimeError("simulated interruption")
+        return real_capture(self, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(WalkForwardValidator, "_select_and_capture", _flaky_capture)
+    with pytest.raises(RuntimeError, match="simulated interruption"):
+        run_walk_forward_stress_tests(
+            data, config, wf_baseline, checkpoint_path=checkpoint_path
+        )
+    # "baseline" (block 1) completed and checkpointed before the cache-build
+    # (block 2) even started, so the outer, scenario-level checkpoint exists
+    # too — it just still only has 1 block recorded.
+    assert checkpoint_path.is_file()
+    assert cache_checkpoint_path.is_file()
+    monkeypatch.undo()
+
+    calls = {"n": 0}
+    real_capture2 = WalkForwardValidator._select_and_capture
+
+    def _counting_capture(self: WalkForwardValidator, *args: object, **kwargs: object):  # type: ignore[no-untyped-def]
+        calls["n"] += 1
+        return real_capture2(self, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(WalkForwardValidator, "_select_and_capture", _counting_capture)
+    resumed = run_walk_forward_stress_tests(
+        data, config, wf_baseline, checkpoint_path=checkpoint_path
+    )
+    # Only the folds *not* already cached at interruption time were
+    # recomputed — proof the cache build actually resumed, not restarted.
+    assert calls["n"] == n_folds - 1
+    assert not checkpoint_path.is_file()
+    assert not cache_checkpoint_path.is_file()
+    monkeypatch.undo()
+
+    fresh = run_walk_forward_stress_tests(data, config, wf_baseline)
+    pd.testing.assert_frame_equal(
+        resumed.reset_index(drop=True), fresh.reset_index(drop=True)
+    )
+
+
 def test_walk_forward_parameter_sensitivity_grid() -> None:
     data = _panel()
     sens = run_walk_forward_parameter_sensitivity(
@@ -593,6 +846,50 @@ def test_walk_forward_parameter_sensitivity_reports_cell_progress() -> None:
     assert progress_calls[0] == (0, n_cells)
     assert progress_calls[-1] == (n_cells, n_cells)
     assert [done for done, _ in progress_calls] == list(range(n_cells + 1))
+
+
+def test_walk_forward_parameter_sensitivity_resumes_from_a_checkpoint(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An interrupted sweep, resumed, must produce exactly the same rows
+    (same order, same values) as an uninterrupted one — cells are
+    independent, so resuming is a matter of not recomputing already-done
+    ones, not approximating anything."""
+    data = _panel()
+    checkpoint_path = tmp_path / "checkpoint.pkl"
+    sweep_kwargs: _SensitivitySweepKwargs = {
+        "parameter_x": "lookback_period",
+        "values_x": [60, 120],
+        "parameter_y": "top_fraction",
+        "values_y": [0.3, 0.5],
+    }
+
+    real_run = WalkForwardValidator.run
+    starts = {"n": 0}
+
+    def _flaky_run(self: WalkForwardValidator, *args: object, **kwargs: object):  # type: ignore[no-untyped-def]
+        starts["n"] += 1
+        if starts["n"] == 3:
+            raise RuntimeError("simulated interruption")
+        return real_run(self, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(WalkForwardValidator, "run", _flaky_run)
+    with pytest.raises(RuntimeError, match="simulated interruption"):
+        run_walk_forward_parameter_sensitivity(
+            data, _config(), checkpoint_path=checkpoint_path, **sweep_kwargs
+        )
+    assert checkpoint_path.is_file()
+    monkeypatch.undo()
+
+    resumed = run_walk_forward_parameter_sensitivity(
+        data, _config(), checkpoint_path=checkpoint_path, **sweep_kwargs
+    )
+    assert not checkpoint_path.is_file()
+
+    fresh = run_walk_forward_parameter_sensitivity(data, _config(), **sweep_kwargs)
+    pd.testing.assert_frame_equal(
+        resumed.reset_index(drop=True), fresh.reset_index(drop=True)
+    )
 
 
 def test_walk_forward_sensitivity_differs_from_plain_backtest_sensitivity() -> None:
@@ -671,6 +968,75 @@ def test_stress_tests_reports_scenario_progress() -> None:
     assert progress_calls[0] == (0, n_scenarios)
     assert progress_calls[-1] == (n_scenarios, n_scenarios)
     assert [done for done, _ in progress_calls] == list(range(n_scenarios + 1))
+
+
+def test_stress_tests_resumes_from_a_checkpoint_including_baseline_returns(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Interrupting right after "baseline" and resuming must still get
+    "best 10 days removed" right — it needs the actual baseline returns
+    Series, not just its already-computed metrics row, so the checkpoint
+    has to carry that Series across the interruption, not only `rows`."""
+    import quantlab.validation.robustness as robustness_module
+
+    data = _panel()
+    config = _config()
+    checkpoint_path = tmp_path / "checkpoint.pkl"
+
+    real_backtest = robustness_module.run_backtest_from_config
+    calls = {"n": 0}
+
+    def _flaky_backtest(*args: object, **kwargs: object):  # type: ignore[no-untyped-def]
+        calls["n"] += 1
+        if calls["n"] == 2:  # 1st call is "baseline"; interrupt right after it
+            raise RuntimeError("simulated interruption")
+        return real_backtest(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(robustness_module, "run_backtest_from_config", _flaky_backtest)
+    with pytest.raises(RuntimeError, match="simulated interruption"):
+        run_stress_tests(data, config, checkpoint_path=checkpoint_path)
+    assert checkpoint_path.is_file()
+    monkeypatch.undo()
+
+    resumed = run_stress_tests(data, config, checkpoint_path=checkpoint_path)
+    assert not checkpoint_path.is_file()
+    fresh = run_stress_tests(data, config)
+    pd.testing.assert_frame_equal(
+        resumed.reset_index(drop=True), fresh.reset_index(drop=True)
+    )
+
+
+def test_run_stress_tests_does_not_reuse_a_checkpoint_from_a_different_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import quantlab.validation.robustness as robustness_module
+
+    data = _panel()
+    checkpoint_path = tmp_path / "checkpoint.pkl"
+
+    real_backtest = robustness_module.run_backtest_from_config
+    calls = {"n": 0}
+
+    def _flaky_backtest(*args: object, **kwargs: object):  # type: ignore[no-untyped-def]
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise RuntimeError("simulated interruption")
+        return real_backtest(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(robustness_module, "run_backtest_from_config", _flaky_backtest)
+    with pytest.raises(RuntimeError, match="simulated interruption"):
+        run_stress_tests(data, _config(), checkpoint_path=checkpoint_path)
+    assert checkpoint_path.is_file()
+    monkeypatch.undo()
+
+    # A config with a different commission -> different provenance -> the
+    # checkpoint above must be ignored, not partially reused.
+    different_config = scale_costs(_config(), commission_mult=3.0)
+    result = run_stress_tests(data, different_config, checkpoint_path=checkpoint_path)
+    expected = run_stress_tests(data, different_config)
+    pd.testing.assert_frame_equal(
+        result.reset_index(drop=True), expected.reset_index(drop=True)
+    )
 
 
 def test_monte_carlo_permutation_reports_pvalue() -> None:

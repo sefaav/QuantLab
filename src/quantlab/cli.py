@@ -28,6 +28,7 @@ configured QuantLab log directory.
 from __future__ import annotations
 
 import sys
+from collections.abc import Callable
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import TYPE_CHECKING, Any
 
@@ -36,6 +37,7 @@ import typer
 from quantlab.constants import GENERATED_REPORTS_DIR
 from quantlab.exceptions import InsufficientDataError, QuantLabError
 from quantlab.logging_config import configure_logging, get_logger
+from quantlab.progress import ProgressReporter
 
 if TYPE_CHECKING:
     # Only for type checking: the CLI otherwise lazy-imports heavy modules
@@ -76,6 +78,34 @@ def _echo_step(message: str) -> None:
     """
     typer.secho(f"-> {message}", fg=typer.colors.CYAN)
     logger.info(message)
+
+
+def _make_cli_progress_callback(title: str) -> Callable[[int, int], None] | None:
+    """Build an ``on_progress(done, total)`` callback for a live terminal line.
+
+    Text/ETA come from the same `quantlab.progress.ProgressReporter` the
+    dashboard uses, so a walk-forward/stress-test/sensitivity run gives a
+    consistent, already-tuned estimate on both interfaces. Returns ``None``
+    when stdout isn't a terminal (piped/redirected output, CI logs): a
+    carriage-return-redrawn line only makes sense on a real tty, and callers
+    already treat ``on_progress=None`` as "don't report progress".
+    """
+    if not sys.stdout.isatty():
+        return None
+    reporter = ProgressReporter(title)
+
+    def _on_progress(done: int, total: int) -> None:
+        text = reporter.text(done, total)
+        # \r (not an ANSI clear-line code) plus padding for portability
+        # across terminals that don't interpret escape sequences; padding
+        # overwrites any leftover characters from a longer previous line.
+        sys.stdout.write(f"\r  {text}".ljust(100))
+        sys.stdout.flush()
+        if total > 0 and done >= total:
+            sys.stdout.write("\n")
+            sys.stdout.flush()
+
+    return _on_progress
 
 
 def _resolve_config_path(config: Path | None, shipped_config: str | None) -> Path:
@@ -203,7 +233,11 @@ def _echo_parameter_grid(strategy_name: str, grid: dict[str, list[Any]]) -> None
 
 
 def _run_active_validation(
-    cfg: ExperimentConfig, data: pd.DataFrame, report: DataQualityReport
+    cfg: ExperimentConfig,
+    data: pd.DataFrame,
+    report: DataQualityReport,
+    *,
+    checkpoint_path: Path | None = None,
 ) -> tuple[BacktestResult, WalkForwardResult | None]:
     """Run whichever process ``cfg.validation.method`` names.
 
@@ -211,6 +245,16 @@ def _run_active_validation(
     series applies right now": a plain backtest for 'holdout' (or unset), or
     the full walk-forward process for 'walk_forward' — never a plain backtest
     silently standing in when walk-forward is configured.
+
+    Args:
+        cfg: The loaded, validated experiment config.
+        data: Canonical long OHLCV frame already loaded for ``cfg``.
+        report: Data-quality report from loading ``data``, attached to a
+            plain backtest's metadata.
+        checkpoint_path: Forwarded to ``WalkForwardValidator.run()`` when the
+            walk-forward branch is taken, so an interrupted run resumes
+            instead of starting over. Ignored for a plain backtest, which is
+            fast enough not to need it.
 
     Returns:
         ``(result, None)`` for a plain backtest, or ``(wf.oos_result, wf)``
@@ -234,6 +278,8 @@ def _run_active_validation(
             validation_window=validation_window,
             test_window=test_window,
             expanding=cfg.validation.expanding,
+            on_progress=_make_cli_progress_callback("Walk-forward"),
+            checkpoint_path=checkpoint_path,
         )
         if wf.oos_result is None:
             raise InsufficientDataError(
@@ -278,7 +324,12 @@ def _attach_walk_forward_evidence(
 
 
 def _compute_stress_tests(
-    data: pd.DataFrame, cfg: ExperimentConfig, wf: WalkForwardResult | None
+    data: pd.DataFrame,
+    cfg: ExperimentConfig,
+    wf: WalkForwardResult | None,
+    *,
+    on_progress: Callable[[int, int], None] | None = None,
+    checkpoint_path: Path | None = None,
 ) -> pd.DataFrame:
     """Stress scenarios for the active validation method.
 
@@ -291,10 +342,14 @@ def _compute_stress_tests(
     if wf is not None:
         from quantlab.validation.robustness import run_walk_forward_stress_tests
 
-        return run_walk_forward_stress_tests(data, cfg, wf)
+        return run_walk_forward_stress_tests(
+            data, cfg, wf, on_progress=on_progress, checkpoint_path=checkpoint_path
+        )
     from quantlab.validation.robustness import run_stress_tests
 
-    return run_stress_tests(data, cfg)
+    return run_stress_tests(
+        data, cfg, on_progress=on_progress, checkpoint_path=checkpoint_path
+    )
 
 
 def _compute_bootstrap(
@@ -404,6 +459,9 @@ def _compute_sensitivity(
     values_x: list[Any],
     parameter_y: str,
     values_y: list[Any],
+    *,
+    on_progress: Callable[[int, int], None] | None = None,
+    checkpoint_path: Path | None = None,
 ) -> pd.DataFrame:
     """Two-parameter sensitivity sweep for the active validation method.
 
@@ -411,6 +469,9 @@ def _compute_sensitivity(
     (:func:`~quantlab.validation.parameter_sensitivity.
     run_walk_forward_parameter_sensitivity`) instead of the plain
     single-backtest variant, for the same reason as stress tests above.
+    ``on_progress``/``checkpoint_path`` only apply to that walk-forward
+    variant — the plain one has no ``on_progress`` either (already judged
+    fast enough).
     """
     if wf is not None:
         from quantlab.validation.parameter_sensitivity import (
@@ -418,7 +479,14 @@ def _compute_sensitivity(
         )
 
         return run_walk_forward_parameter_sensitivity(
-            data, cfg, parameter_x, values_x, parameter_y, values_y
+            data,
+            cfg,
+            parameter_x,
+            values_x,
+            parameter_y,
+            values_y,
+            on_progress=on_progress,
+            checkpoint_path=checkpoint_path,
         )
     from quantlab.validation.parameter_sensitivity import run_parameter_sensitivity
 
@@ -547,6 +615,11 @@ def backtest(
 def walk_forward(
     config: Path | None = _CONFIG_OPTION,
     shipped_config: str | None = _SHIPPED_CONFIG_OPTION,
+    fresh: bool = typer.Option(
+        False,
+        "--fresh",
+        help="Discard any existing checkpoint and start over.",
+    ),
 ) -> None:
     """Run walk-forward validation and robustness tests."""
     configure_logging()
@@ -554,11 +627,19 @@ def walk_forward(
         cfg = _load_config(_resolve_config_path(config, shipped_config))
         from quantlab.backtesting.runner import run_backtest_from_config
         from quantlab.data.loader import DataLoader
+        from quantlab.validation.checkpoint import clear_checkpoint
         from quantlab.validation.robustness import run_stress_tests
         from quantlab.validation.walk_forward import (
             WalkForwardValidator,
             resolve_walk_forward_windows,
         )
+
+        out = GENERATED_REPORTS_DIR / cfg.experiment_name
+        wf_checkpoint = out / ".checkpoint_walk_forward.pkl"
+        stress_checkpoint = out / ".checkpoint_stress_test.pkl"
+        if fresh:
+            clear_checkpoint(wf_checkpoint)
+            clear_checkpoint(stress_checkpoint)
 
         _echo_step("Loading and validating data")
         data, report = DataLoader().load(cfg)
@@ -589,6 +670,8 @@ def walk_forward(
             validation_window=validation_window,
             test_window=test_window,
             expanding=cfg.validation.expanding,
+            on_progress=_make_cli_progress_callback("Walk-forward"),
+            checkpoint_path=wf_checkpoint,
         )
 
         if not wf.folds:
@@ -599,9 +682,12 @@ def walk_forward(
             )
 
         _echo_step("Running stress tests")
-        stress = run_stress_tests(data, cfg)
-
-        out = GENERATED_REPORTS_DIR / cfg.experiment_name
+        stress = run_stress_tests(
+            data,
+            cfg,
+            on_progress=_make_cli_progress_callback("Stress tests"),
+            checkpoint_path=stress_checkpoint,
+        )
 
         # Attach OOS metrics to a fresh full-sample result before saving one bundle.
         result = run_backtest_from_config(data, cfg, data_quality_report=report)
@@ -653,6 +739,11 @@ def walk_forward(
 def stress_test(
     config: Path | None = _CONFIG_OPTION,
     shipped_config: str | None = _SHIPPED_CONFIG_OPTION,
+    fresh: bool = typer.Option(
+        False,
+        "--fresh",
+        help="Discard any existing checkpoint and start over.",
+    ),
 ) -> None:
     """Run stress-test scenarios (commission/slippage/delay/reduced universe).
 
@@ -664,14 +755,30 @@ def stress_test(
     try:
         cfg = _load_config(_resolve_config_path(config, shipped_config))
         from quantlab.data.loader import DataLoader
+        from quantlab.validation.checkpoint import clear_checkpoint
+
+        out = GENERATED_REPORTS_DIR / cfg.experiment_name
+        wf_checkpoint = out / ".checkpoint_walk_forward.pkl"
+        stress_checkpoint = out / ".checkpoint_stress_test.pkl"
+        if fresh:
+            clear_checkpoint(wf_checkpoint)
+            clear_checkpoint(stress_checkpoint)
 
         _echo_step("Loading and validating data")
         data, report = DataLoader().load(cfg)
         _echo_data_warnings(report)
 
-        result, wf = _run_active_validation(cfg, data, report)
+        result, wf = _run_active_validation(
+            cfg, data, report, checkpoint_path=wf_checkpoint
+        )
         _echo_step("Running stress tests")
-        stress = _compute_stress_tests(data, cfg, wf)
+        stress = _compute_stress_tests(
+            data,
+            cfg,
+            wf,
+            on_progress=_make_cli_progress_callback("Stress tests"),
+            checkpoint_path=stress_checkpoint,
+        )
 
         validation_artifacts: dict[str, Any] = {"stress_tests.csv": stress}
         robustness_extra: dict[str, Any] = {"stress_tests": stress}
@@ -684,7 +791,7 @@ def stress_test(
 
         out_dir = save_with_robustness_reuse(
             result,
-            GENERATED_REPORTS_DIR / cfg.experiment_name,
+            out,
             robustness=robustness_extra,
             validation_artifacts=validation_artifacts,
         )
@@ -711,18 +818,32 @@ def bootstrap(
         "--block-size",
         help="Override robustness.bootstrap.block_size from the config.",
     ),
+    fresh: bool = typer.Option(
+        False,
+        "--fresh",
+        help="Discard any existing walk-forward checkpoint and start over.",
+    ),
 ) -> None:
     """Block-bootstrap the active result's returns (backtest or walk-forward OOS)."""
     configure_logging()
     try:
         cfg = _load_config(_resolve_config_path(config, shipped_config))
         from quantlab.data.loader import DataLoader
+        from quantlab.validation.checkpoint import clear_checkpoint
+
+        wf_checkpoint = (
+            GENERATED_REPORTS_DIR / cfg.experiment_name / ".checkpoint_walk_forward.pkl"
+        )
+        if fresh:
+            clear_checkpoint(wf_checkpoint)
 
         _echo_step("Loading and validating data")
         data, report = DataLoader().load(cfg)
         _echo_data_warnings(report)
 
-        result, wf = _run_active_validation(cfg, data, report)
+        result, wf = _run_active_validation(
+            cfg, data, report, checkpoint_path=wf_checkpoint
+        )
         _echo_step("Running bootstrap")
         summary = _compute_bootstrap(
             cfg, result, n_iterations=n_iterations, block_size=block_size
@@ -761,18 +882,32 @@ def permutation_test(
         "--n-iterations",
         help="Override robustness.permutation_test.n_iterations from the config.",
     ),
+    fresh: bool = typer.Option(
+        False,
+        "--fresh",
+        help="Discard any existing walk-forward checkpoint and start over.",
+    ),
 ) -> None:
     """Random-sign Monte Carlo permutation test on the active result's returns."""
     configure_logging()
     try:
         cfg = _load_config(_resolve_config_path(config, shipped_config))
         from quantlab.data.loader import DataLoader
+        from quantlab.validation.checkpoint import clear_checkpoint
+
+        wf_checkpoint = (
+            GENERATED_REPORTS_DIR / cfg.experiment_name / ".checkpoint_walk_forward.pkl"
+        )
+        if fresh:
+            clear_checkpoint(wf_checkpoint)
 
         _echo_step("Loading and validating data")
         data, report = DataLoader().load(cfg)
         _echo_data_warnings(report)
 
-        result, wf = _run_active_validation(cfg, data, report)
+        result, wf = _run_active_validation(
+            cfg, data, report, checkpoint_path=wf_checkpoint
+        )
         _echo_step("Running Monte Carlo permutation test")
         outcome = _compute_permutation_test(cfg, result, n_iterations=n_iterations)
         import pandas as pd
@@ -820,6 +955,11 @@ def sensitivity(
     values_y: str | None = typer.Option(
         None, "--values-y", help="Comma-separated candidate values for --param-y."
     ),
+    fresh: bool = typer.Option(
+        False,
+        "--fresh",
+        help="Discard any existing checkpoint and start over.",
+    ),
 ) -> None:
     """Two-parameter sensitivity sweep, scored on the active validation method.
 
@@ -835,17 +975,37 @@ def sensitivity(
             cfg, param_x, values_x, param_y, values_y
         )
         from quantlab.data.loader import DataLoader
+        from quantlab.validation.checkpoint import clear_checkpoint
+
+        out = GENERATED_REPORTS_DIR / cfg.experiment_name
+        wf_checkpoint = out / ".checkpoint_walk_forward.pkl"
+        sensitivity_checkpoint = out / ".checkpoint_sensitivity.pkl"
+        if fresh:
+            clear_checkpoint(wf_checkpoint)
+            clear_checkpoint(sensitivity_checkpoint)
 
         _echo_step("Loading and validating data")
         data, report = DataLoader().load(cfg)
         _echo_data_warnings(report)
 
-        result, wf = _run_active_validation(cfg, data, report)
+        result, wf = _run_active_validation(
+            cfg, data, report, checkpoint_path=wf_checkpoint
+        )
         _echo_step(
             f"Running parameter sensitivity ({x_name} x {y_name}, "
             f"{len(x_values) * len(y_values)} combinations)"
         )
-        sens = _compute_sensitivity(data, cfg, wf, x_name, x_values, y_name, y_values)
+        sens = _compute_sensitivity(
+            data,
+            cfg,
+            wf,
+            x_name,
+            x_values,
+            y_name,
+            y_values,
+            on_progress=_make_cli_progress_callback("Sensitivity"),
+            checkpoint_path=sensitivity_checkpoint,
+        )
 
         validation_artifacts: dict[str, Any] = {"sensitivity.csv": sens}
         robustness_extra: dict[str, Any] = {"sensitivity": sens}
@@ -858,7 +1018,7 @@ def sensitivity(
 
         out_dir = save_with_robustness_reuse(
             result,
-            GENERATED_REPORTS_DIR / cfg.experiment_name,
+            out,
             robustness=robustness_extra,
             validation_artifacts=validation_artifacts,
         )
@@ -875,6 +1035,11 @@ def sensitivity(
 def robustness(
     config: Path | None = _CONFIG_OPTION,
     shipped_config: str | None = _SHIPPED_CONFIG_OPTION,
+    fresh: bool = typer.Option(
+        False,
+        "--fresh",
+        help="Discard any existing checkpoint and start over.",
+    ),
 ) -> None:
     """Run every robustness.* technique enabled in the config, in one pass.
 
@@ -887,12 +1052,24 @@ def robustness(
     try:
         cfg = _load_config(_resolve_config_path(config, shipped_config))
         from quantlab.data.loader import DataLoader
+        from quantlab.validation.checkpoint import clear_checkpoint
+
+        out = GENERATED_REPORTS_DIR / cfg.experiment_name
+        wf_checkpoint = out / ".checkpoint_walk_forward.pkl"
+        stress_checkpoint = out / ".checkpoint_stress_test.pkl"
+        sensitivity_checkpoint = out / ".checkpoint_sensitivity.pkl"
+        if fresh:
+            clear_checkpoint(wf_checkpoint)
+            clear_checkpoint(stress_checkpoint)
+            clear_checkpoint(sensitivity_checkpoint)
 
         _echo_step("Loading and validating data")
         data, report = DataLoader().load(cfg)
         _echo_data_warnings(report)
 
-        result, wf = _run_active_validation(cfg, data, report)
+        result, wf = _run_active_validation(
+            cfg, data, report, checkpoint_path=wf_checkpoint
+        )
         validation_artifacts: dict[str, Any] = {}
         robustness_extra: dict[str, Any] = {}
         _attach_walk_forward_evidence(
@@ -903,7 +1080,13 @@ def robustness(
         if cfg.robustness.stress_test.enabled:
             ran_any = True
             _echo_step("Running stress tests")
-            stress = _compute_stress_tests(data, cfg, wf)
+            stress = _compute_stress_tests(
+                data,
+                cfg,
+                wf,
+                on_progress=_make_cli_progress_callback("Stress tests"),
+                checkpoint_path=stress_checkpoint,
+            )
             validation_artifacts["stress_tests.csv"] = stress
             robustness_extra["stress_tests"] = stress
             typer.echo("")
@@ -942,7 +1125,15 @@ def robustness(
             (x_name, x_values), (y_name, y_values) = list(parameters.items())
             _echo_step(f"Running parameter sensitivity ({x_name} x {y_name})")
             sens = _compute_sensitivity(
-                data, cfg, wf, x_name, x_values, y_name, y_values
+                data,
+                cfg,
+                wf,
+                x_name,
+                x_values,
+                y_name,
+                y_values,
+                on_progress=_make_cli_progress_callback("Sensitivity"),
+                checkpoint_path=sensitivity_checkpoint,
             )
             validation_artifacts["sensitivity.csv"] = sens
             robustness_extra["sensitivity"] = sens
@@ -961,7 +1152,7 @@ def robustness(
 
         out_dir = save_with_robustness_reuse(
             result,
-            GENERATED_REPORTS_DIR / cfg.experiment_name,
+            out,
             robustness=robustness_extra,
             validation_artifacts=validation_artifacts,
         )

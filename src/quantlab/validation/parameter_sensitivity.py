@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -14,6 +15,12 @@ from quantlab.config import ExperimentConfig
 from quantlab.exceptions import InvalidConfigurationError, QuantLabError
 from quantlab.logging_config import get_logger
 from quantlab.strategies import strategy_sweepable_parameter_names
+from quantlab.validation.checkpoint import (
+    clear_checkpoint,
+    compute_provenance,
+    load_checkpoint,
+    save_checkpoint,
+)
 
 logger = get_logger(__name__)
 
@@ -101,6 +108,7 @@ def run_walk_forward_parameter_sensitivity(
     values_y: list[Any],
     *,
     on_progress: Callable[[int, int], None] | None = None,
+    checkpoint_path: Path | None = None,
 ) -> pd.DataFrame:
     """Two-parameter sweep where each cell re-runs the full walk-forward process.
 
@@ -123,9 +131,13 @@ def run_walk_forward_parameter_sensitivity(
         parameter_y: Second swept strategy-parameter name (y-axis).
         values_y: Candidate values for parameter_y.
         on_progress: Optional callback invoked as ``on_progress(done, total)``
-            once before the first cell and once after each cell completes —
-            each cell here is itself a full walk-forward run, so this reports
+            once before the first cell (or the resumed count, see
+            ``checkpoint_path``) and once after each cell completes — each
+            cell here is itself a full walk-forward run, so this reports
             coarser, cell-level progress, not individual fold progress.
+        checkpoint_path: Optional path to persist per-cell progress to, so
+            an interrupted sweep resumes from its last completed cell
+            instead of starting over. See ``quantlab.validation.checkpoint``.
     """
     from quantlab.validation.walk_forward import (
         WalkForwardValidator,
@@ -142,69 +154,96 @@ def run_walk_forward_parameter_sensitivity(
     )
     expanding = base_config.validation.expanding
 
-    total_cells = len(values_x) * len(values_y)
-    completed_cells = 0
-    if on_progress is not None:
-        on_progress(0, total_cells)
+    # A flat list, not the nested loop below directly, so a resume can slice
+    # off however many cells a checkpoint already has rows for.
+    combinations = [(x, y) for x in values_x for y in values_y]
+    total_cells = len(combinations)
 
     rows: list[dict[str, Any]] = []
-    for x in values_x:
-        for y in values_y:
-            row: dict[str, Any] = {parameter_x: x, parameter_y: y}
-            try:
-                config = _with_two_params(base_config, parameter_x, x, parameter_y, y)
-                wf = WalkForwardValidator(config).run(
-                    data,
-                    # No inner grid: x/y are pinned, so this cell measures
-                    # exactly that combination's walk-forward OOS behaviour,
-                    # not a further optimization on top of it.
-                    parameter_grid={},
-                    train_window=train_window,
-                    validation_window=validation_window,
-                    test_window=test_window,
-                    expanding=expanding,
+    provenance: dict[str, Any] | None = None
+    if checkpoint_path is not None:
+        provenance = compute_provenance(
+            base_config,
+            data,
+            parameter_x=parameter_x,
+            values_x=list(values_x),
+            parameter_y=parameter_y,
+            values_y=list(values_y),
+        )
+        checkpoint_state = load_checkpoint(checkpoint_path, provenance)
+        if checkpoint_state is not None:
+            rows = checkpoint_state
+            logger.info(
+                "Resuming walk-forward sensitivity from checkpoint: %d/%d "
+                "cells already done.",
+                len(rows),
+                total_cells,
+            )
+    completed_cells = len(rows)
+    if on_progress is not None:
+        on_progress(completed_cells, total_cells)
+
+    for x, y in combinations[completed_cells:]:
+        row: dict[str, Any] = {parameter_x: x, parameter_y: y}
+        try:
+            config = _with_two_params(base_config, parameter_x, x, parameter_y, y)
+            wf = WalkForwardValidator(config).run(
+                data,
+                # No inner grid: x/y are pinned, so this cell measures
+                # exactly that combination's walk-forward OOS behaviour,
+                # not a further optimization on top of it.
+                parameter_grid={},
+                train_window=train_window,
+                validation_window=validation_window,
+                test_window=test_window,
+                expanding=expanding,
+            )
+            if wf.oos_result is None:
+                raise InvalidConfigurationError(
+                    "No walk-forward fold fit this parameter combination."
                 )
-                if wf.oos_result is None:
-                    raise InvalidConfigurationError(
-                        "No walk-forward fold fit this parameter combination."
-                    )
-            except (QuantLabError, ValidationError) as exc:
-                logger.warning(
-                    "Walk-forward sensitivity combination %s=%s, %s=%s failed: %s",
-                    parameter_x,
-                    x,
-                    parameter_y,
-                    y,
-                    exc,
-                )
-                row.update(
-                    {
-                        "sharpe": float("nan"),
-                        "cagr": float("nan"),
-                        "max_drawdown": float("nan"),
-                        "turnover": float("nan"),
-                        "num_trades": float("nan"),
-                        "status": "failed",
-                        "error": str(exc),
-                    }
-                )
-            else:
-                metrics = wf.oos_result.metrics
-                row.update(
-                    {
-                        "sharpe": metrics.get("sharpe_ratio", float("nan")),
-                        "cagr": metrics.get("cagr", float("nan")),
-                        "max_drawdown": metrics.get("max_drawdown", float("nan")),
-                        "turnover": metrics.get("annual_turnover", float("nan")),
-                        "num_trades": metrics.get("number_of_trades", 0.0),
-                        "status": "ok",
-                        "error": None,
-                    }
-                )
-            rows.append(row)
-            completed_cells += 1
-            if on_progress is not None:
-                on_progress(completed_cells, total_cells)
+        except (QuantLabError, ValidationError) as exc:
+            logger.warning(
+                "Walk-forward sensitivity combination %s=%s, %s=%s failed: %s",
+                parameter_x,
+                x,
+                parameter_y,
+                y,
+                exc,
+            )
+            row.update(
+                {
+                    "sharpe": float("nan"),
+                    "cagr": float("nan"),
+                    "max_drawdown": float("nan"),
+                    "turnover": float("nan"),
+                    "num_trades": float("nan"),
+                    "status": "failed",
+                    "error": str(exc),
+                }
+            )
+        else:
+            metrics = wf.oos_result.metrics
+            row.update(
+                {
+                    "sharpe": metrics.get("sharpe_ratio", float("nan")),
+                    "cagr": metrics.get("cagr", float("nan")),
+                    "max_drawdown": metrics.get("max_drawdown", float("nan")),
+                    "turnover": metrics.get("annual_turnover", float("nan")),
+                    "num_trades": metrics.get("number_of_trades", 0.0),
+                    "status": "ok",
+                    "error": None,
+                }
+            )
+        rows.append(row)
+        completed_cells += 1
+        if checkpoint_path is not None and provenance is not None:
+            save_checkpoint(checkpoint_path, provenance, rows, completed_cells)
+        if on_progress is not None:
+            on_progress(completed_cells, total_cells)
+
+    if checkpoint_path is not None:
+        clear_checkpoint(checkpoint_path)
     return pd.DataFrame(rows)
 
 

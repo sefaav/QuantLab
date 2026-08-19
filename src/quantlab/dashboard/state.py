@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import csv
 from collections.abc import Callable
-from dataclasses import dataclass, field
 from datetime import date
 from functools import lru_cache
 from pathlib import Path
@@ -15,6 +14,7 @@ import pandas as pd
 from quantlab.backtesting.result import BacktestResult
 from quantlab.backtesting.runner import run_backtest_from_config
 from quantlab.config import ExperimentConfig
+from quantlab.constants import GENERATED_REPORTS_DIR
 from quantlab.data.base import SymbolSuggestion
 from quantlab.data.binance import BinanceDataSource
 from quantlab.data.loader import DataLoader
@@ -113,6 +113,21 @@ def run_dashboard_backtest(
     return result, report.warnings
 
 
+def _checkpoint_path(config: ExperimentConfig, technique: str) -> Path:
+    """Return the on-disk checkpoint path for one technique of ``config``.
+
+    Same convention the CLI uses (``GENERATED_REPORTS_DIR /
+    experiment_name / ".checkpoint_<technique>.pkl"``), so an interrupted
+    dashboard run (e.g. the Streamlit server process itself restarting) and
+    a same-named CLI run can resume each other's progress. Two different
+    dashboard configs that happen to share a default ``experiment_name``
+    don't collide unsafely: ``compute_provenance``'s config/data/code match
+    still gates whether a checkpoint is actually reused.
+    """
+    experiment_dir = GENERATED_REPORTS_DIR / config.experiment_name
+    return experiment_dir / f".checkpoint_{technique}.pkl"
+
+
 def run_dashboard_walk_forward(
     config: ExperimentConfig,
     *,
@@ -149,6 +164,7 @@ def run_dashboard_walk_forward(
         test_window=test_window,
         expanding=config.validation.expanding,
         on_progress=on_progress,
+        checkpoint_path=_checkpoint_path(config, "walk_forward"),
     )
     return result, report.warnings
 
@@ -193,57 +209,6 @@ def estimate_walk_forward_backtest_count(
     return len(windows) * (n_combinations + 1)
 
 
-@dataclass
-class ProgressPacer:
-    """Tracks a seconds-per-unit pace across progress ticks, asymmetrically.
-
-    An exponential moving average (nudged, not replaced, by each
-    observation — the approach `tqdm` uses), smoothed asymmetrically:
-    ``rising_smoothing`` (0.4) partially adopts a tick implying a slower
-    pace than currently tracked, ``falling_smoothing`` (0.2) partially
-    adopts one implying a faster pace. Weighting a slowdown more than a
-    speedup catches up to a genuine sustained slowdown (e.g. an expanding
-    walk-forward's later, bigger-training-window folds) faster than a
-    symmetric average would; keeping both partial rather than full (no
-    single tick fully overrides the tracked rate) avoids one noisy tick
-    (parameter-grid candidates genuinely cost different amounts) swinging
-    the estimate on its own.
-    """
-
-    rising_smoothing: float = 0.4
-    falling_smoothing: float = 0.2
-    _rate_seconds_per_unit: float | None = field(default=None, init=False)
-    _last_done: int = field(default=0, init=False)
-    _last_elapsed: float = field(default=0.0, init=False)
-
-    def update(self, done: int, elapsed: float) -> None:
-        """Record a new ``(done, elapsed)`` observation."""
-        delta_done = done - self._last_done
-        delta_elapsed = elapsed - self._last_elapsed
-        if delta_done > 0 and delta_elapsed > 0:
-            instantaneous = delta_elapsed / delta_done
-            if self._rate_seconds_per_unit is None:
-                self._rate_seconds_per_unit = instantaneous
-            else:
-                smoothing = (
-                    self.rising_smoothing
-                    if instantaneous >= self._rate_seconds_per_unit
-                    else self.falling_smoothing
-                )
-                self._rate_seconds_per_unit = (
-                    smoothing * instantaneous
-                    + (1 - smoothing) * self._rate_seconds_per_unit
-                )
-        self._last_done = done
-        self._last_elapsed = elapsed
-
-    def remaining(self, done: int, total: int) -> float | None:
-        """Return estimated seconds left, or ``None`` before any pace is known."""
-        if self._rate_seconds_per_unit is None:
-            return None
-        return self._rate_seconds_per_unit * max(0, total - done)
-
-
 def run_dashboard_stress_tests(
     config: ExperimentConfig,
     expected_data_hash: str,
@@ -260,7 +225,12 @@ def run_dashboard_stress_tests(
             "Market data changed since the displayed backtest. Run the "
             "backtest again before running stress tests."
         )
-    return run_stress_tests(data, config, on_progress=on_progress)
+    return run_stress_tests(
+        data,
+        config,
+        on_progress=on_progress,
+        checkpoint_path=_checkpoint_path(config, "stress_test"),
+    )
 
 
 def run_dashboard_walk_forward_stress_tests(
@@ -288,7 +258,11 @@ def run_dashboard_walk_forward_stress_tests(
             "walk-forward again before running stress tests."
         )
     return run_walk_forward_stress_tests(
-        data, config, wf_baseline, on_progress=on_progress
+        data,
+        config,
+        wf_baseline,
+        on_progress=on_progress,
+        checkpoint_path=_checkpoint_path(config, "stress_test"),
     )
 
 
@@ -400,6 +374,7 @@ def run_dashboard_walk_forward_sensitivity(
         parameter_y,
         values_y,
         on_progress=on_progress,
+        checkpoint_path=_checkpoint_path(config, "sensitivity"),
     )
 
 

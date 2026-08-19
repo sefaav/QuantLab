@@ -158,6 +158,94 @@ def test_cli_stress_test_walk_forward_mode_reruns_selection(
     assert "walk_forward_oos_metrics" in metadata
 
 
+def test_cli_walk_forward_resumes_from_a_checkpoint_after_an_interruption(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An interrupted `walk-forward` invocation must leave a checkpoint that
+    a later, ordinary re-invocation of the same command picks up — fewer
+    folds get (re-)selected on than a fresh run would need, proving it
+    actually resumed instead of starting over."""
+    config_path, raw = _write_offline_walk_forward_experiment(tmp_path)
+    _patch_raw_dir(monkeypatch, raw)
+    from quantlab.constants import GENERATED_REPORTS_DIR
+    from quantlab.validation.walk_forward import WalkForwardValidator
+
+    exp_dir = GENERATED_REPORTS_DIR / "cli_test"
+    checkpoint_path = exp_dir / ".checkpoint_walk_forward.pkl"
+
+    real_select = WalkForwardValidator._select_on_validation
+    starts = {"n": 0}
+
+    def _flaky_select(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+        starts["n"] += 1
+        if starts["n"] == 2:
+            raise RuntimeError("simulated interruption")
+        return real_select(self, *args, **kwargs)
+
+    monkeypatch.setattr(WalkForwardValidator, "_select_on_validation", _flaky_select)
+    result = runner.invoke(app, ["walk-forward", "--config", str(config_path)])
+    assert result.exit_code != 0
+    assert checkpoint_path.is_file()
+    monkeypatch.undo()
+    _patch_raw_dir(monkeypatch, raw)  # undo() also reverted this patch
+
+    calls = {"n": 0}
+    real_select2 = WalkForwardValidator._select_on_validation
+
+    def _counting_select(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+        calls["n"] += 1
+        return real_select2(self, *args, **kwargs)
+
+    monkeypatch.setattr(WalkForwardValidator, "_select_on_validation", _counting_select)
+    result = runner.invoke(app, ["walk-forward", "--config", str(config_path)])
+    assert result.exit_code == 0, result.stdout
+    assert not checkpoint_path.is_file()
+    assert calls["n"] < 4  # 4 folds total; at least the 1st was already cached
+    assert (exp_dir / "walk_forward_results.csv").is_file()
+
+
+def test_cli_walk_forward_fresh_flag_discards_an_existing_checkpoint(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path, raw = _write_offline_walk_forward_experiment(tmp_path)
+    _patch_raw_dir(monkeypatch, raw)
+    from quantlab.constants import GENERATED_REPORTS_DIR
+    from quantlab.validation.walk_forward import WalkForwardValidator
+
+    exp_dir = GENERATED_REPORTS_DIR / "cli_test"
+    checkpoint_path = exp_dir / ".checkpoint_walk_forward.pkl"
+
+    real_select = WalkForwardValidator._select_on_validation
+    starts = {"n": 0}
+
+    def _flaky_select(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+        starts["n"] += 1
+        if starts["n"] == 2:
+            raise RuntimeError("simulated interruption")
+        return real_select(self, *args, **kwargs)
+
+    monkeypatch.setattr(WalkForwardValidator, "_select_on_validation", _flaky_select)
+    result = runner.invoke(app, ["walk-forward", "--config", str(config_path)])
+    assert result.exit_code != 0
+    assert checkpoint_path.is_file()
+    monkeypatch.undo()
+    _patch_raw_dir(monkeypatch, raw)
+
+    calls = {"n": 0}
+    real_select2 = WalkForwardValidator._select_on_validation
+
+    def _counting_select(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+        calls["n"] += 1
+        return real_select2(self, *args, **kwargs)
+
+    monkeypatch.setattr(WalkForwardValidator, "_select_on_validation", _counting_select)
+    result = runner.invoke(
+        app, ["walk-forward", "--config", str(config_path), "--fresh"]
+    )
+    assert result.exit_code == 0, result.stdout
+    assert calls["n"] == 4  # every fold recomputed, the stale checkpoint was discarded
+
+
 def test_cli_bootstrap_cli_flag_overrides_yaml_n_iterations(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -411,3 +499,72 @@ def test_cli_robustness_orchestrator_warns_when_nothing_enabled(
 
     assert result.exit_code == 0, result.stdout
     assert "no robustness.* technique is enabled" in result.stdout
+
+
+def test_make_cli_progress_callback_returns_none_when_not_a_tty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Piped/redirected output (e.g. CI logs) must not get a
+    carriage-return-redrawn line — it only makes sense on a real terminal,
+    and every caller already treats on_progress=None as "don't report"."""
+    import sys
+
+    import quantlab.cli as cli_module
+
+    monkeypatch.setattr(sys.stdout, "isatty", lambda: False)
+    assert cli_module._make_cli_progress_callback("Walk-forward") is None
+
+
+def test_make_cli_progress_callback_writes_a_redrawn_line_on_a_tty(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import sys
+
+    import quantlab.cli as cli_module
+
+    monkeypatch.setattr(sys.stdout, "isatty", lambda: True)
+    on_progress = cli_module._make_cli_progress_callback("Walk-forward")
+    assert on_progress is not None
+
+    on_progress(0, 10)
+    on_progress(5, 10)
+    out = capsys.readouterr().out
+    assert out.count("\r") == 2
+    assert "Walk-forward: 5/10" in out
+    assert not out.endswith("\n")  # still in progress, no trailing newline yet
+
+
+def test_make_cli_progress_callback_ends_with_a_newline_on_completion(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import sys
+
+    import quantlab.cli as cli_module
+
+    monkeypatch.setattr(sys.stdout, "isatty", lambda: True)
+    on_progress = cli_module._make_cli_progress_callback("Walk-forward")
+    assert on_progress is not None
+
+    on_progress(0, 4)
+    on_progress(4, 4)
+    out = capsys.readouterr().out
+    assert out.endswith("\n")
+    assert "finishing" in out
+
+
+def test_make_cli_progress_callback_flags_a_resumed_run(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A first tick with done > 0 can only mean a checkpoint was resumed —
+    surfaced in the terminal since nothing else would tell the user."""
+    import sys
+
+    import quantlab.cli as cli_module
+
+    monkeypatch.setattr(sys.stdout, "isatty", lambda: True)
+    on_progress = cli_module._make_cli_progress_callback("Walk-forward")
+    assert on_progress is not None
+
+    on_progress(3, 10)
+    out = capsys.readouterr().out
+    assert "resumed from a previous checkpoint" in out
