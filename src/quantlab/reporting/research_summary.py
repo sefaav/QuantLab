@@ -69,6 +69,12 @@ def executive_summary(result: BacktestResult) -> str:
         if actual_period is not None
         else "over an unavailable observed period"
     )
+    oos_scope = out_of_sample_scope(result)
+    scope_text = (
+        f" These are {oos_scope} results, not a full-sample fit."
+        if oos_scope is not None
+        else ""
+    )
 
     benchmark_text = ""
     if result.benchmark_returns is not None:
@@ -81,7 +87,7 @@ def executive_summary(result: BacktestResult) -> str:
 
     return (
         f"The {cfg.strategy_name.replace('_', ' ')} strategy was tested on "
-        f"{len(cfg.symbols)} instrument(s) {period_text}. Net of modelled "
+        f"{len(cfg.symbols)} instrument(s) {period_text}.{scope_text} Net of modelled "
         f"transaction costs, total return was "
         f"{_format_metric(metrics.get('total_return'), 'pct')} "
         f"(CAGR {_format_metric(metrics.get('cagr'), 'pct')}), annualised volatility "
@@ -164,7 +170,16 @@ def hypothesis(result: BacktestResult) -> str:
 
 
 def _oos_metrics(result: BacktestResult) -> tuple[dict[str, Any], str] | None:
-    """Return attached OOS metrics, preferring walk-forward evidence."""
+    """Return attached OOS metrics, preferring walk-forward evidence.
+
+    Some callers (table builders in particular) are exercised with minimal
+    duck-typed stand-ins that don't implement the full ``BacktestResult``
+    interface, so a missing ``metadata`` attribute is treated the same as
+    an empty one rather than raising.
+    """
+    metadata = getattr(result, "metadata", None)
+    if not isinstance(metadata, Mapping):
+        return None
     candidates = (
         (
             "walk_forward_oos_metrics",
@@ -176,10 +191,29 @@ def _oos_metrics(result: BacktestResult) -> tuple[dict[str, Any], str] | None:
         ),
     )
     for key, label in candidates:
-        metrics = result.metadata.get(key)
+        metrics = metadata.get(key)
         if isinstance(metrics, Mapping) and metrics:
             return dict(metrics), label
     return None
+
+
+def out_of_sample_scope(result: BacktestResult) -> str | None:
+    """Return the OOS scope label only when ``result.metrics`` *is* that series.
+
+    Not just whenever some OOS evidence is attached: a holdout result also
+    carries OOS evidence, but its own ``metrics`` stay a genuine full-sample
+    fit (the holdout block's metrics are held separately, in
+    ``metadata["holdout_oos_metrics"]``) — "full-sample" is still correct
+    there. Only a walk-forward result's ``metrics`` already are the
+    out-of-sample series, so only that case needs "full-sample" labels
+    corrected elsewhere (e.g. Results headings,
+    ``tables.subperiod_table``'s aggregate row).
+    """
+    oos = _oos_metrics(result)
+    if oos is None:
+        return None
+    oos_metrics, scope = oos
+    return scope if oos_metrics == result.metrics else None
 
 
 def _portfolio_methodology(result: BacktestResult) -> str:
@@ -312,28 +346,38 @@ def conclusion(result: BacktestResult) -> str:
     """State full-sample and attached OOS evidence without conflating them."""
     full_sharpe = result.metrics.get("sharpe_ratio")
     full_drawdown = result.metrics.get("max_drawdown")
+    epilogue = (
+        " Future performance remains uncertain and depends materially on "
+        "execution costs, market regime and parameter stability. These "
+        "results are not a guarantee of future profitability and are not "
+        "investment advice."
+    )
     oos = _oos_metrics(result)
     if oos is not None:
         oos_metrics, scope = oos
         oos_sharpe = oos_metrics.get("sharpe_ratio")
         oos_drawdown = oos_metrics.get("max_drawdown")
+        if oos_metrics == result.metrics:
+            # A walk-forward OOS result's `metrics` *is* the stitched
+            # out-of-sample series (see WalkForwardValidator._build_oos_result)
+            # — there is no separate full-sample fit to report alongside it.
+            return (
+                f"Under the tested assumptions, the strategy displayed "
+                f"{_disposition(oos_sharpe)} using {scope} data (Sharpe "
+                f"{_format_metric(oos_sharpe, 'num')}, maximum drawdown "
+                f"{_format_metric(oos_drawdown, 'pct')})." + epilogue
+            )
         return (
             f"Under the tested assumptions, the strategy displayed "
             f"{_disposition(oos_sharpe)} using {scope} data (out-of-sample Sharpe "
             f"{_format_metric(oos_sharpe, 'num')}, out-of-sample maximum drawdown "
             f"{_format_metric(oos_drawdown, 'pct')}). The separate full-sample "
             f"results are Sharpe {_format_metric(full_sharpe, 'num')} and maximum "
-            f"drawdown {_format_metric(full_drawdown, 'pct')}. Future performance "
-            "remains uncertain and depends materially on execution costs, market "
-            "regime and parameter stability. These results are not a guarantee of "
-            "future profitability and are not investment advice."
+            f"drawdown {_format_metric(full_drawdown, 'pct')}." + epilogue
         )
     return (
         f"Under the tested assumptions, the strategy displayed "
         f"{_disposition(full_sharpe)} using full-sample data; no out-of-sample "
         f"validation is attached (Sharpe {_format_metric(full_sharpe, 'num')}, "
-        f"maximum drawdown {_format_metric(full_drawdown, 'pct')}). Future "
-        "performance remains uncertain and depends materially on execution costs, "
-        "market regime and parameter stability. These results are not a guarantee "
-        "of future profitability and are not investment advice."
+        f"maximum drawdown {_format_metric(full_drawdown, 'pct')})." + epilogue
     )

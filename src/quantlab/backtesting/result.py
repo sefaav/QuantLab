@@ -41,6 +41,9 @@ _OPTIONAL_ARTIFACTS = (
     "walk_forward_oos_returns.csv",
     "walk_forward_oos_equity.csv",
     "stress_tests.csv",
+    "bootstrap_summary.csv",
+    "permutation_test.csv",
+    "sensitivity.csv",
 )
 
 _SAVE_IN_PROGRESS_MARKER = ".quantlab-save-in-progress"
@@ -50,8 +53,22 @@ _VALIDATION_ARTIFACT_INDEX = {
     "walk_forward_oos_returns.csv": True,
     "walk_forward_oos_equity.csv": True,
     "stress_tests.csv": False,
+    "bootstrap_summary.csv": False,
+    "permutation_test.csv": False,
+    "sensitivity.csv": False,
 }
 _VALIDATION_ARTIFACTS = frozenset(_VALIDATION_ARTIFACT_INDEX)
+
+#: The four on-demand robustness techniques, each normally run and saved by
+#: its own separate CLI command — the CSV filename each one's `robustness`
+#: dict key round-trips through, used by `load_previous_robustness_artifacts`
+#: to recover what a sibling command already saved.
+_ROBUSTNESS_ARTIFACT_FILES: dict[str, str] = {
+    "stress_tests": "stress_tests.csv",
+    "bootstrap": "bootstrap_summary.csv",
+    "permutation_test": "permutation_test.csv",
+    "sensitivity": "sensitivity.csv",
+}
 
 
 def _bundle_lock_path(output_directory: Path) -> Path:
@@ -330,7 +347,11 @@ class BacktestResult:
                 already verified a file left by a *different* command still
                 describes this exact config/result (e.g. ``quantlab report``
                 reusing a still-valid prior ``walk-forward`` run's CSVs) and
-                will not be rewriting it itself this call.
+                will not be rewriting it itself this call. Prefer
+                :func:`save_with_walk_forward_reuse` or
+                :func:`save_with_robustness_reuse` over passing this
+                directly — both already implement the provenance check this
+                parameter exists to make safe.
             validation_artifacts: Walk-forward and stress-test CSV values to
                 write as part of this save. Their checksums are added to the
                 metadata only after the atomic file replacements succeed.
@@ -698,6 +719,147 @@ def save_with_walk_forward_reuse(result: BacktestResult, exp_dir: str | Path) ->
             robustness=robustness,
             keep_artifacts=keep_artifacts,
             validation_artifacts={},
+        )
+
+
+def load_previous_robustness_artifacts(
+    exp_dir: Path, result: BacktestResult
+) -> dict[str, Any]:
+    """Recover prior stress/bootstrap/permutation/sensitivity artefacts.
+
+    Each on-demand robustness technique is run and saved by its own CLI
+    command; without this, running `stress-test` then `bootstrap` against
+    the same experiment would silently delete `stress_tests.csv`, since
+    `result.save()`'s pre-save cleanup removes any `_OPTIONAL_ARTIFACTS`
+    file the current call doesn't re-supply. Applies to holdout/plain
+    backtests; walk-forward has its own, longer-lived
+    `load_previous_walk_forward_robustness`. Callers merge the result under
+    their own freshly computed values, so a stale entry never survives a
+    technique actually being recomputed.
+
+    Provenance is config + data_hash + code_hash + dependency_versions, not
+    git_dirty/git_commit (unlike `load_previous_walk_forward_robustness`):
+    `code_hash` already hashes current file contents including uncommitted
+    changes, so it alone gives the guarantee needed here, without refusing
+    reuse in an ordinarily-uncommitted working session.
+
+    Returns an empty dict, rather than raising, whenever provenance can't
+    be confirmed to still match ``result``.
+    """
+    save_marker = exp_dir / _SAVE_IN_PROGRESS_MARKER
+    if save_marker.exists() or save_marker.is_symlink():
+        logger.warning(
+            "Not reusing prior robustness artefacts in %s: a prior bundle "
+            "save did not complete (%s is still present).",
+            exp_dir,
+            save_marker.name,
+        )
+        return {}
+
+    metadata_path = exp_dir / "metadata.json"
+    config_path = exp_dir / "config.yaml"
+    if not metadata_path.is_file() or not config_path.is_file():
+        return {}
+    old_metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+
+    try:
+        old_config = ExperimentConfig.from_yaml(config_path)
+    except Exception as exc:
+        logger.warning(
+            "Not reusing prior robustness artefacts in %s: %s could not be "
+            "parsed as a valid config (%s).",
+            exp_dir,
+            config_path.name,
+            exc,
+        )
+        return {}
+    if old_config.model_dump(mode="json") != result.config.model_dump(mode="json"):
+        logger.warning(
+            "Not reusing prior robustness artefacts in %s: the config that "
+            "produced them no longer matches the config used for this run.",
+            exp_dir,
+        )
+        return {}
+
+    required_matches = (
+        ("data_hash", "the data used to produce them no longer matches this run's"),
+        (
+            "code_hash",
+            "the quantlab source code that produced them no longer matches "
+            "this run's (code_hash differs or is missing)",
+        ),
+        (
+            "dependency_versions",
+            "the dependency versions (numpy/pandas/etc.) that produced them "
+            "no longer match this run's",
+        ),
+    )
+    for key, reason in required_matches:
+        old_value = old_metadata.get(key)
+        if old_value is None or old_value != result.metadata.get(key):
+            logger.warning(
+                "Not reusing prior robustness artefacts in %s: %s.",
+                exp_dir,
+                reason,
+            )
+            return {}
+
+    recovered: dict[str, Any] = {}
+    for key, filename in _ROBUSTNESS_ARTIFACT_FILES.items():
+        path = exp_dir / filename
+        if not path.is_file():
+            continue
+        try:
+            recovered[key] = pd.read_csv(path)
+        except Exception as exc:
+            logger.warning(
+                "Not reusing %s from %s: the file could not be read (%s).",
+                filename,
+                exp_dir,
+                exc,
+            )
+    return recovered
+
+
+def save_with_robustness_reuse(
+    result: BacktestResult,
+    exp_dir: str | Path,
+    *,
+    robustness: dict[str, Any],
+    validation_artifacts: Mapping[str, pd.Series | pd.DataFrame] | None = None,
+) -> Path:
+    """Save a result while preserving compatible sibling robustness artefacts.
+
+    Used by each individual robustness CLI command (stress-test, bootstrap,
+    permutation-test, sensitivity) instead of calling `result.save()`
+    directly, so that e.g. running `bootstrap` after `stress-test` on the
+    same experiment directory keeps the earlier stress-test evidence in the
+    regenerated report instead of silently deleting it. ``robustness`` and
+    ``validation_artifacts`` are this call's freshly computed results (using
+    the same `_ROBUSTNESS_ARTIFACT_FILES`/CSV-filename keys); a technique
+    genuinely being recomputed here always overrides whatever a prior save
+    left behind for that same technique.
+    """
+    exp_dir = Path(exp_dir)
+    exp_dir.mkdir(parents=True, exist_ok=True)
+    new_validation_artifacts = (
+        dict(validation_artifacts) if validation_artifacts else {}
+    )
+    # Keep the provenance read and the following save under one lock; otherwise
+    # another process could replace the reused CSVs between those two steps.
+    with _locked_bundle(exp_dir):
+        previous = load_previous_robustness_artifacts(exp_dir, result)
+        merged_robustness = {**previous, **robustness}
+        merged_validation_artifacts = dict(new_validation_artifacts)
+        for key, frame in previous.items():
+            filename = _ROBUSTNESS_ARTIFACT_FILES[key]
+            if filename not in merged_validation_artifacts:
+                merged_validation_artifacts[filename] = frame
+        return result._save_locked(
+            exp_dir,
+            robustness=merged_robustness or None,
+            keep_artifacts=set(),
+            validation_artifacts=merged_validation_artifacts,
         )
 
 

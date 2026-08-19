@@ -80,6 +80,149 @@ def test_parameter_grid_is_rejected_for_non_walk_forward_validation() -> None:
         )
 
 
+def _robustness_base_dict(**robustness_overrides: Any) -> dict[str, Any]:
+    return {
+        "experiment_name": "robustness_cfg",
+        "data": {
+            "source": "csv",
+            "symbols": ["AAA"],
+            "start_date": "2020-01-01",
+            "end_date": "2022-01-01",
+            "market_calendar": "XNYS",
+        },
+        "strategy": {
+            "name": "mean_reversion",
+            "parameters": {"lookback_period": 20},
+        },
+        "robustness": robustness_overrides,
+    }
+
+
+def test_robustness_config_defaults_to_everything_disabled() -> None:
+    config = ExperimentConfig.from_dict(
+        {
+            "experiment_name": "no_robustness_block",
+            "data": {
+                "source": "csv",
+                "symbols": ["AAA"],
+                "start_date": "2020-01-01",
+                "end_date": "2022-01-01",
+                "market_calendar": "XNYS",
+            },
+            "strategy": {
+                "name": "mean_reversion",
+                "parameters": {"lookback_period": 20},
+            },
+        }
+    )
+    assert config.robustness.stress_test.enabled is False
+    assert config.robustness.bootstrap.enabled is False
+    assert config.robustness.bootstrap.n_iterations == 1000
+    assert config.robustness.bootstrap.block_size == 1
+    assert config.robustness.permutation_test.enabled is False
+    assert config.robustness.permutation_test.n_iterations == 1000
+    assert config.robustness.sensitivity.enabled is False
+    assert config.robustness.sensitivity.parameters is None
+
+
+def test_robustness_bootstrap_settings_accept_overrides() -> None:
+    config = ExperimentConfig.from_dict(
+        _robustness_base_dict(
+            bootstrap={"enabled": True, "n_iterations": 500, "block_size": 5}
+        )
+    )
+    assert config.robustness.bootstrap.enabled is True
+    assert config.robustness.bootstrap.n_iterations == 500
+    assert config.robustness.bootstrap.block_size == 5
+
+
+@pytest.mark.parametrize("bad_n_iterations", [0, -1])
+def test_robustness_bootstrap_n_iterations_must_be_positive(
+    bad_n_iterations: int,
+) -> None:
+    with pytest.raises(InvalidConfigurationError):
+        ExperimentConfig.from_dict(
+            _robustness_base_dict(bootstrap={"n_iterations": bad_n_iterations})
+        )
+
+
+@pytest.mark.parametrize(
+    "parameters",
+    [
+        {"lookback_period": [10, 20]},
+        {"lookback_period": [10, 20], "entry_zscore": [1.0, 2.0], "exit_zscore": [0.5]},
+    ],
+)
+def test_robustness_sensitivity_parameters_must_have_exactly_two_keys(
+    parameters: dict[str, list[Any]],
+) -> None:
+    with pytest.raises(InvalidConfigurationError, match="exactly 2"):
+        ExperimentConfig.from_dict(
+            _robustness_base_dict(sensitivity={"parameters": parameters})
+        )
+
+
+def test_robustness_sensitivity_parameters_rejects_empty_candidate_list() -> None:
+    with pytest.raises(InvalidConfigurationError, match="at least one candidate"):
+        ExperimentConfig.from_dict(
+            _robustness_base_dict(
+                sensitivity={
+                    "parameters": {"lookback_period": [10, 20], "entry_zscore": []}
+                }
+            )
+        )
+
+
+def test_robustness_sensitivity_parameters_names_validated_against_strategy() -> None:
+    with pytest.raises(InvalidConfigurationError, match="Unknown"):
+        ExperimentConfig.from_dict(
+            _robustness_base_dict(
+                sensitivity={
+                    "parameters": {
+                        "lookback_period": [10, 20],
+                        "not_a_real_parameter": [1, 2],
+                    }
+                }
+            )
+        )
+
+
+def test_robustness_sensitivity_parameters_rejects_boolean_parameter() -> None:
+    """long_only is a structural switch (default value True/False) — sweeping
+    it changes which other parameters are even meaningful, so sensitivity
+    must reject it the same way it rejects an unknown parameter name."""
+    with pytest.raises(InvalidConfigurationError, match="Unknown or unsweepable"):
+        ExperimentConfig.from_dict(
+            _robustness_base_dict(
+                sensitivity={
+                    "parameters": {
+                        "lookback_period": [10, 20],
+                        "long_only": [True, False],
+                    }
+                }
+            )
+        )
+
+
+def test_robustness_sensitivity_parameters_accepts_two_valid_keys() -> None:
+    config = ExperimentConfig.from_dict(
+        _robustness_base_dict(
+            sensitivity={
+                "enabled": True,
+                "parameters": {
+                    "lookback_period": [10, 20],
+                    "entry_zscore": [1.0, 2.0],
+                },
+            }
+        )
+    )
+    assert config.robustness.sensitivity.enabled is True
+    assert config.robustness.sensitivity.parameters == {
+        "lookback_period": [10, 20],
+        "entry_zscore": [1.0, 2.0],
+    }
+
+
 def test_flat_accessors(sample_config: ExperimentConfig) -> None:
     """The flat view must mirror the nested config."""
     assert sample_config.data_source == "csv"

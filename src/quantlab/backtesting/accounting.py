@@ -20,6 +20,7 @@ from quantlab.execution.execution_model import ExecutionCosts, ExecutionModel
 from quantlab.execution.orders import executed_weights as compute_executed_weights
 from quantlab.execution.orders import weight_changes as compute_weight_changes
 from quantlab.logging_config import get_logger
+from quantlab.risk.exposure import average_gross_exposure, average_net_exposure
 
 logger = get_logger(__name__)
 
@@ -46,6 +47,26 @@ class AccountingResult:
     # Net-equity estimate used to size volume-dependent slippage. Reuse it in
     # the trade log to keep per-fill and aggregate costs consistent.
     equity_for_costs: pd.Series
+
+
+def portfolio_metrics_from_accounting(
+    accounting: AccountingResult, periods_per_year: int
+) -> dict[str, float]:
+    """Exposure and turnover metrics shared by every accounting consumer.
+
+    Shared by :class:`~quantlab.backtesting.engine.BacktestEngine` and
+    :class:`~quantlab.validation.walk_forward.WalkForwardValidator` so a
+    single-backtest ``BacktestResult`` and a stitched walk-forward
+    out-of-sample ``BacktestResult`` report these the same way.
+    """
+    turnover = accounting.turnover
+    return {
+        "annual_turnover": float(turnover.mean() * periods_per_year)
+        if len(turnover)
+        else 0.0,
+        "average_gross_exposure": average_gross_exposure(accounting.executed_weights),
+        "average_net_exposure": average_net_exposure(accounting.executed_weights),
+    }
 
 
 def compute_asset_returns(prices: pd.DataFrame) -> pd.DataFrame:

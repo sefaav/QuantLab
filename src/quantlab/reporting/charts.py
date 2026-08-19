@@ -174,6 +174,95 @@ def monthly_returns_heatmap(result: BacktestResult) -> Figure:
     return fig
 
 
+#: Columns `run_parameter_sensitivity`/`run_walk_forward_parameter_sensitivity`
+#: always emit alongside the two swept-parameter columns — whatever is left
+#: over identifies those two parameter names without the caller having to
+#: pass them separately.
+_SENSITIVITY_METRIC_COLUMNS = frozenset(
+    {"sharpe", "cagr", "max_drawdown", "turnover", "num_trades", "status", "error"}
+)
+
+
+def sensitivity_heatmap_chart(
+    sensitivity: pd.DataFrame, metric: str = "sharpe"
+) -> Figure:
+    """Plot a 2-parameter sensitivity sweep as a metric heatmap.
+
+    Infers which two columns are the swept parameters from whatever is left
+    after excluding `_SENSITIVITY_METRIC_COLUMNS`, mirroring the dashboard's
+    interactive Plotly heatmap (`components.render_sensitivity_heatmap`) in
+    a static form for the HTML report.
+    """
+    from quantlab.validation.parameter_sensitivity import sensitivity_heatmap_data
+
+    parameter_columns = [
+        column
+        for column in sensitivity.columns
+        if column not in _SENSITIVITY_METRIC_COLUMNS
+    ]
+    if len(parameter_columns) != 2:
+        raise ValueError(
+            "sensitivity must have exactly two swept-parameter columns; found "
+            f"{parameter_columns}."
+        )
+    parameter_x, parameter_y = parameter_columns
+    pivot = sensitivity_heatmap_data(sensitivity, parameter_x, parameter_y, metric)
+
+    fig, ax = _new_figure((7, max(2.5, 0.5 * len(pivot.index) + 1)))
+    values = pivot.to_numpy(dtype=float)
+    finite = values[np.isfinite(values)]
+    title = f"Sensitivity: {metric} by {parameter_x} / {parameter_y}"
+    if finite.size == 0:
+        ax.text(
+            0.5,
+            0.5,
+            "No successful combinations to plot.",
+            ha="center",
+            va="center",
+            transform=ax.transAxes,
+            color=BENCHMARK,
+        )
+        ax.set_title(title, fontsize=11, fontweight="bold")
+        return fig
+
+    vmin, vmax = float(finite.min()), float(finite.max())
+    span = vmax - vmin if vmax > vmin else 1.0
+    cmap = colormaps["RdYlGn"].with_extremes(bad="#e5e7eb")
+    image = ax.imshow(
+        np.ma.masked_invalid(values), cmap=cmap, vmin=vmin, vmax=vmax, aspect="auto"
+    )
+    ax.set_xticks(range(len(pivot.columns)))
+    ax.set_xticklabels([str(value) for value in pivot.columns])
+    ax.set_yticks(range(len(pivot.index)))
+    ax.set_yticklabels([str(value) for value in pivot.index])
+    ax.set_xlabel(parameter_x, fontsize=9)
+    ax.set_ylabel(parameter_y, fontsize=9)
+    ax.set_title(title, fontsize=11, fontweight="bold")
+    fig.colorbar(image, ax=ax, fraction=0.025, pad=0.02)
+    for row in range(values.shape[0]):
+        for column in range(values.shape[1]):
+            value = values[row, column]
+            label = f"{value:.2f}" if np.isfinite(value) else "n/a"
+            # RdYlGn is light (yellow) near the middle of the range and
+            # darker toward both ends (red/green), so contrast text there.
+            normalized = (value - vmin) / span
+            colour = (
+                "white"
+                if np.isfinite(value) and abs(normalized - 0.5) > 0.3
+                else "#111827"
+            )
+            ax.text(
+                column,
+                row,
+                label,
+                ha="center",
+                va="center",
+                fontsize=7,
+                color=colour,
+            )
+    return fig
+
+
 def adaptive_rolling_window(n_observations: int) -> int:
     """Shrink the rolling Sharpe/volatility window for short samples.
 

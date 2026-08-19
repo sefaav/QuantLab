@@ -7,6 +7,38 @@ from typing import Any
 from quantlab.config import ExperimentConfig
 
 
+def parse_parameter_grid_values(raw: str) -> list[Any]:
+    """Parse comma-separated grid candidates into int/float/bool/str values.
+
+    Shared by the CLI's ``--values-x``/``--values-y`` sensitivity options and
+    the dashboard's grid-parameter text inputs. Server-side validation
+    (``WalkForwardValidator.run()``, ``run_parameter_sensitivity()``) is
+    authoritative; this only turns raw text into the Python types a strategy
+    constructor actually expects (e.g. an int ``lookback_period``, not the
+    string ``"120"``).
+    """
+    values: list[Any] = []
+    for token in raw.split(","):
+        text = token.strip()
+        if not text:
+            continue
+        if text.lower() in {"true", "false"}:
+            values.append(text.lower() == "true")
+            continue
+        try:
+            values.append(int(text))
+            continue
+        except ValueError:
+            pass
+        try:
+            values.append(float(text))
+            continue
+        except ValueError:
+            pass
+        values.append(text)
+    return values
+
+
 def parameter_grid_for_config(config: ExperimentConfig) -> dict[str, list[Any]]:
     """Return the configured walk-forward grid or the strategy default.
 

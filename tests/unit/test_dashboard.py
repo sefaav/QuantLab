@@ -18,7 +18,11 @@ from typing import Any, cast
 import pandas as pd
 import pytest
 
-from quantlab.dashboard.components import _monthly_return_pivot, render_metric_cards
+from quantlab.dashboard.components import (
+    _monthly_return_pivot,
+    render_gross_net_comparison,
+    render_metric_cards,
+)
 
 pytest.importorskip("streamlit")
 
@@ -62,6 +66,34 @@ def _configure_offline_pairs_trade(at: AppTest) -> AppTest:
     _sidebar_text_input(at, "Symbols (comma-separated)").set_value("SPY, QQQ").run()
     _sidebar_date_input(at, "End date").set_value(datetime.date(2019, 6, 1)).run()
     _sidebar_selectbox(at, "Strategy").set_value("pairs_trading").run()
+    return at
+
+
+def _switch_to_walk_forward_mode(at: AppTest) -> AppTest:
+    at.segmented_control[0].set_value("Walk-forward").run()
+    return at
+
+
+def _configure_offline_walk_forward(at: AppTest) -> AppTest:
+    """Point the dashboard at locally cached CSV data with small fold windows.
+
+    ``mean_reversion`` (default ``lookback_period=20``) needs far less
+    warm-up than momentum strategies, but the dashboard's default allocator
+    is ``inverse_volatility`` (``volatility_window=63``), so train+validation
+    must still clear that — hence 70/20 rather than something tinier.
+    """
+    _switch_to_walk_forward_mode(at)
+    _sidebar_selectbox(at, "Data source").set_value("csv").run()
+    _sidebar_text_input(at, "Symbols (comma-separated)").set_value("SPY, QQQ").run()
+    _sidebar_date_input(at, "End date").set_value(datetime.date(2019, 7, 1)).run()
+    _sidebar_selectbox(at, "Strategy").set_value("mean_reversion").run()
+    # Weekly (not the default monthly) guarantees a rebalance date inside
+    # every small test window below, regardless of where a fold happens to
+    # fall in the calendar.
+    _sidebar_selectbox(at, "Rebalance frequency").set_value("weekly").run()
+    _sidebar_number_input(at, "Train window (periods)").set_value(70).run()
+    _sidebar_number_input(at, "Validation window (periods)").set_value(20).run()
+    _sidebar_number_input(at, "Test window (periods)").set_value(20).run()
     return at
 
 
@@ -833,3 +865,636 @@ def test_report_tab_includes_stress_tests_run_in_robustness_tab() -> None:
     assert report_tab.label == "Report"
     _, (html, _warnings) = at.session_state["report_html"]
     assert "Stress Tests" in html
+
+
+def test_advanced_data_settings_reveal_forward_fill_limit_only_when_relevant() -> None:
+    at = AppTest.from_file(APP_PATH, default_timeout=60)
+    at.run()
+
+    policy = _sidebar_selectbox(at, "Missing value policy")
+    assert policy.options == ["drop", "forward_fill", "raise", "none"]
+    assert not any(
+        field.label == "Forward-fill limit (consecutive bars)"
+        for field in at.sidebar.number_input
+    )
+
+    policy.set_value("forward_fill").run()
+    assert not at.exception
+    assert any(
+        field.label == "Forward-fill limit (consecutive bars)"
+        for field in at.sidebar.number_input
+    )
+
+
+def test_advanced_data_settings_are_accepted_by_the_config() -> None:
+    at = AppTest.from_file(APP_PATH, default_timeout=60)
+    at.run()
+    _configure_offline_pairs_trade(at)
+    _sidebar_selectbox(at, "Missing value policy").set_value("forward_fill").run()
+    _sidebar_number_input(at, "Forward-fill limit (consecutive bars)").set_value(
+        3
+    ).run()
+    at.sidebar.button[0].click().run()
+
+    assert not at.exception
+    assert not at.error
+    result = at.session_state["result"]
+    assert result.config.data.missing_value_policy == "forward_fill"
+    assert result.config.data.forward_fill_limit == 3
+
+
+def test_advanced_execution_settings_reveal_impact_coefficient_only_for_volume() -> (
+    None
+):
+    at = AppTest.from_file(APP_PATH, default_timeout=60)
+    at.run()
+
+    model = _sidebar_selectbox(at, "Slippage model")
+    assert model.options == ["constant", "volume"]
+    assert not any(
+        field.label == "Volume impact coefficient" for field in at.sidebar.number_input
+    )
+
+    model.set_value("volume").run()
+    assert not at.exception
+    assert any(
+        field.label == "Volume impact coefficient" for field in at.sidebar.number_input
+    )
+
+
+def test_advanced_execution_settings_are_accepted_by_the_config() -> None:
+    at = AppTest.from_file(APP_PATH, default_timeout=60)
+    at.run()
+    _configure_offline_pairs_trade(at)
+    _sidebar_selectbox(at, "Slippage model").set_value("volume").run()
+    _sidebar_number_input(at, "Volume impact coefficient").set_value(0.25).run()
+    at.sidebar.button[0].click().run()
+
+    assert not at.exception
+    assert not at.error
+    result = at.session_state["result"]
+    assert result.config.execution.slippage_model == "volume"
+    assert result.config.execution.impact_coefficient == pytest.approx(0.25)
+
+
+def test_advanced_portfolio_constraints_hidden_for_pairs_trading() -> None:
+    """A minimum weight, position cap, or exposure cap could drop one leg
+    and break the pair hedge, so these constraints must not even be offered."""
+    at = AppTest.from_file(APP_PATH, default_timeout=60)
+    at.run()
+    _configure_offline_pairs_trade(at)
+
+    assert not any(
+        c.label == "Enable minimum position size" for c in at.sidebar.checkbox
+    )
+    assert any(
+        "Advanced portfolio constraints are disabled for pairs_trading" in c.value
+        for c in at.sidebar.caption
+    )
+
+
+def test_advanced_portfolio_constraints_are_accepted_by_the_config() -> None:
+    at = AppTest.from_file(APP_PATH, default_timeout=60)
+    at.run()
+    _sidebar_selectbox(at, "Data source").set_value("csv").run()
+    _sidebar_text_input(at, "Symbols (comma-separated)").set_value(
+        "SPY, QQQ, TLT, GLD"
+    ).run()
+    _sidebar_date_input(at, "End date").set_value(datetime.date(2019, 6, 1)).run()
+
+    _sidebar_checkbox(at, "Enable minimum position size").set_value(True).run()
+    _sidebar_checkbox(at, "Cap gross exposure").set_value(True).run()
+    _sidebar_checkbox(at, "Cap net exposure").set_value(True).run()
+    _sidebar_checkbox(at, "Cap number of positions").set_value(True).run()
+    _sidebar_checkbox(at, "Cap turnover per rebalance").set_value(True).run()
+    assert not at.exception
+
+    at.sidebar.button[0].click().run()
+    assert not at.exception
+    assert not at.error
+    portfolio = at.session_state["result"].config.portfolio
+    assert portfolio.target_minimum_weight is not None
+    assert portfolio.maximum_gross_exposure is not None
+    assert portfolio.maximum_net_exposure is not None
+    assert portfolio.target_maximum_positions is not None
+    assert portfolio.maximum_turnover is not None
+
+
+def test_gross_vs_net_section_renders_with_real_values() -> None:
+    at = AppTest.from_file(APP_PATH, default_timeout=60)
+    at.run()
+    _sidebar_selectbox(at, "Data source").set_value("csv").run()
+    _sidebar_date_input(at, "End date").set_value(datetime.date(2019, 6, 1)).run()
+    at.sidebar.button[0].click().run()
+
+    assert not at.exception
+    assert not at.error
+    metrics = {m.label: m.value for m in at.tabs[0].metric}
+    for label in (
+        "Net total return",
+        "Gross total return",
+        "Cost drag",
+        "Net Sharpe",
+        "Gross Sharpe",
+    ):
+        assert label in metrics
+        assert metrics[label] != "n/a"
+
+
+def test_gross_vs_net_comparison_uses_a_five_column_grid() -> None:
+    class FakeColumn:
+        def __init__(self, sink: list[tuple[str, str, dict[str, object]]]) -> None:
+            self._sink = sink
+
+        def metric(self, label: str, value: str, **kwargs: object) -> None:
+            self._sink.append((label, value, kwargs))
+
+    class FakeStreamlit:
+        def __init__(self) -> None:
+            self.columns_requested: int | None = None
+            self.metrics: list[tuple[str, str, dict[str, object]]] = []
+
+        def columns(self, n: int) -> list[FakeColumn]:
+            self.columns_requested = n
+            return [FakeColumn(self.metrics) for _ in range(n)]
+
+        def markdown(self, text: str) -> None:
+            pass
+
+    result: Any = SimpleNamespace(
+        gross_net_comparison=lambda: {
+            "net_total_return": 0.05,
+            "net_sharpe": 1.2,
+            "total_cost": 123.0,
+            "gross_sharpe": 1.4,
+            "gross_total_return": 0.07,
+            "cost_drag": 0.02,
+        }
+    )
+    fake = FakeStreamlit()
+
+    render_gross_net_comparison(fake, result)
+
+    assert fake.columns_requested == 5
+    values = {label: value for label, value, _ in fake.metrics}
+    assert values["Net total return"] == "5.00%"
+    assert values["Gross total return"] == "7.00%"
+    assert values["Cost drag"] == "2.00%"
+    assert values["Net Sharpe"] == "1.20"
+    assert values["Gross Sharpe"] == "1.40"
+
+
+def test_gross_vs_net_comparison_shows_na_for_missing_gross_fields() -> None:
+    class FakeColumn:
+        def __init__(self, sink: list[tuple[str, str, dict[str, object]]]) -> None:
+            self._sink = sink
+
+        def metric(self, label: str, value: str, **kwargs: object) -> None:
+            self._sink.append((label, value, kwargs))
+
+    class FakeStreamlit:
+        def __init__(self) -> None:
+            self.metrics: list[tuple[str, str, dict[str, object]]] = []
+
+        def columns(self, n: int) -> list[FakeColumn]:
+            return [FakeColumn(self.metrics) for _ in range(n)]
+
+        def markdown(self, text: str) -> None:
+            pass
+
+    result: Any = SimpleNamespace(
+        gross_net_comparison=lambda: {
+            "net_total_return": 0.05,
+            "net_sharpe": 1.2,
+            "total_cost": 0.0,
+        }
+    )
+    fake = FakeStreamlit()
+
+    render_gross_net_comparison(fake, result)
+
+    values = {label: value for label, value, _ in fake.metrics}
+    assert values["Gross total return"] == "n/a"
+    assert values["Gross Sharpe"] == "n/a"
+
+
+def test_walk_forward_mode_reveals_dedicated_sidebar_controls() -> None:
+    at = AppTest.from_file(APP_PATH, default_timeout=60)
+    at.run()
+    assert any(b.label == "Run backtest" for b in at.sidebar.button)
+    assert any(
+        c.label == "Chronological holdout (train / validation / test)"
+        for c in at.sidebar.checkbox
+    )
+
+    _switch_to_walk_forward_mode(at)
+
+    assert not at.exception
+    assert any(b.label == "Run walk-forward" for b in at.sidebar.button)
+    assert not any(b.label == "Run backtest" for b in at.sidebar.button)
+    assert not any(
+        c.label == "Chronological holdout (train / validation / test)"
+        for c in at.sidebar.checkbox
+    )
+    assert _sidebar_number_input(at, "Train window (periods)").value == 500
+    assert _sidebar_number_input(at, "Validation window (periods)").value == 126
+    assert _sidebar_number_input(at, "Test window (periods)").value == 126
+    assert any(ms.label == "Grid parameters" for ms in at.sidebar.multiselect)
+
+
+def test_walk_forward_mode_hides_buy_and_hold_strategy() -> None:
+    """buy_and_hold has no parameters, so it has nothing for walk-forward's
+    fold-by-fold validation-block selection to select — offering it there
+    would look like optimization is happening when it is not."""
+    at = AppTest.from_file(APP_PATH, default_timeout=60)
+    at.run()
+    strategy = _sidebar_selectbox(at, "Strategy")
+    assert "buy_and_hold" in strategy.options
+
+    _switch_to_walk_forward_mode(at)
+
+    strategy = _sidebar_selectbox(at, "Strategy")
+    assert "buy_and_hold" not in strategy.options
+    # cross_sectional_momentum (index 0 of the filtered, sorted list) still
+    # has parameters to select, so it is a meaningful default here.
+    assert strategy.value == "cross_sectional_momentum"
+
+
+def test_switching_to_walk_forward_with_buy_and_hold_selected_does_not_crash() -> None:
+    """The Strategy widget's persisted value (buy_and_hold, from Backtest
+    mode) is no longer in Walk-forward mode's filtered options list —
+    Streamlit must fall back cleanly, not raise."""
+    at = AppTest.from_file(APP_PATH, default_timeout=60)
+    at.run()
+    _sidebar_selectbox(at, "Strategy").set_value("buy_and_hold").run()
+    assert not at.exception
+
+    _switch_to_walk_forward_mode(at)
+
+    assert not at.exception
+    strategy = _sidebar_selectbox(at, "Strategy")
+    assert strategy.value in strategy.options
+
+
+def test_walk_forward_mode_has_no_static_backtest_count_estimate() -> None:
+    """The static "Estimated ~N backtests" caption was replaced by a live
+    progress bar shown while a run is actually in flight (see
+    test_walk_forward_run_reports_fold_progress in test_validation.py for
+    the underlying on_progress contract) — the sidebar no longer guesses a
+    duration upfront."""
+    at = AppTest.from_file(APP_PATH, default_timeout=60)
+    at.run()
+    _configure_offline_walk_forward(at)
+
+    assert not at.exception
+    assert not any("Estimated ~" in c.value for c in at.sidebar.caption)
+
+
+def test_walk_forward_mode_still_warns_when_no_fold_fits() -> None:
+    """The zero-fold pre-flight warning is a validity check, not a duration
+    estimate, and must survive removing the "Estimated ~" caption above."""
+    at = AppTest.from_file(APP_PATH, default_timeout=60)
+    at.run()
+    _switch_to_walk_forward_mode(at)
+    _sidebar_selectbox(at, "Data source").set_value("csv").run()
+    _sidebar_text_input(at, "Symbols (comma-separated)").set_value("SPY, QQQ").run()
+    _sidebar_date_input(at, "End date").set_value(datetime.date(2019, 6, 1)).run()
+    _sidebar_number_input(at, "Train window (periods)").set_value(10_000).run()
+
+    assert not at.exception
+    assert any("No walk-forward fold fits" in w.value for w in at.sidebar.warning)
+
+
+def test_walk_forward_grid_parameter_selection_adds_a_values_field() -> None:
+    at = AppTest.from_file(APP_PATH, default_timeout=60)
+    at.run()
+    _configure_offline_walk_forward(at)
+
+    grid_picker = _sidebar_multiselect(at, "Grid parameters")
+    assert "lookback_period" in grid_picker.options
+    grid_picker.set_value(["lookback_period"]).run()
+
+    assert not at.exception
+    assert any(
+        field.label == "Candidate values for lookback_period (comma-separated)"
+        for field in at.sidebar.text_input
+    )
+
+
+def test_walk_forward_run_populates_oos_result_and_tabs() -> None:
+    at = AppTest.from_file(APP_PATH, default_timeout=120)
+    at.run()
+    _configure_offline_walk_forward(at)
+    at.sidebar.button[0].click().run()
+
+    assert not at.exception
+    assert not at.error
+    assert "wf_result" in at.session_state
+    wf = at.session_state["wf_result"]
+    assert len(wf.folds) >= 1
+    assert wf.oos_result is not None
+
+    tab_labels = [t.label for t in at.tabs]
+    assert tab_labels == ["Results", "Trades", "Robustness", "Report"]
+    metrics = {m.label: m.value for m in at.tabs[0].metric}
+    for label in ("Total return", "Sharpe", "Net total return", "Gross total return"):
+        assert label in metrics
+        assert metrics[label] != "n/a"
+
+
+def test_walk_forward_robustness_tab_shows_fold_table_and_stability() -> None:
+    at = AppTest.from_file(APP_PATH, default_timeout=120)
+    at.run()
+    _configure_offline_walk_forward(at)
+    _sidebar_multiselect(at, "Grid parameters").set_value(["lookback_period"]).run()
+    _sidebar_text_input(
+        at, "Candidate values for lookback_period (comma-separated)"
+    ).set_value("10, 20").run()
+    at.session_state["dashboard_active_tab"] = "Robustness"
+    at.sidebar.button[0].click().run()
+
+    assert not at.exception
+    robustness_tab = at.tabs[2]
+    assert robustness_tab.label == "Robustness"
+    fold_table = robustness_tab.dataframe[0].value
+    assert "param_lookback_period" in fold_table.columns
+    assert "test_sharpe" in fold_table.columns
+    # Stress tests do appear here, but must be the walk-forward-aware
+    # variant under the hood — verified at the backend level by
+    # test_run_walk_forward_stress_tests_reselects_parameters_under_higher_costs
+    # in test_validation.py, not by this dashboard-rendering test.
+    assert any(b.label == "Run stress tests" for b in robustness_tab.button)
+
+
+def test_walk_forward_report_tab_includes_fold_evidence() -> None:
+    at = AppTest.from_file(APP_PATH, default_timeout=120)
+    at.run()
+    _configure_offline_walk_forward(at)
+    at.session_state["dashboard_active_tab"] = "Report"
+    at.sidebar.button[0].click().run()
+
+    assert not at.exception
+    report_tab = at.tabs[3]
+    assert report_tab.label == "Report"
+    _, (html, _warnings) = at.session_state["wf_report_html"]
+    assert "walk" in html.lower()
+
+
+def test_walk_forward_no_fitting_fold_shows_error_not_crash() -> None:
+    at = AppTest.from_file(APP_PATH, default_timeout=60)
+    at.run()
+    _switch_to_walk_forward_mode(at)
+    _sidebar_selectbox(at, "Data source").set_value("csv").run()
+    _sidebar_text_input(at, "Symbols (comma-separated)").set_value("SPY, QQQ").run()
+    _sidebar_date_input(at, "End date").set_value(datetime.date(2019, 6, 1)).run()
+    _sidebar_number_input(at, "Train window (periods)").set_value(10_000).run()
+    at.sidebar.button[0].click().run()
+
+    assert not at.exception
+    assert any("No walk-forward fold fit" in e.value for e in at.error)
+    assert "wf_result" not in at.session_state
+
+
+def test_switching_to_backtest_mode_does_not_affect_a_stored_walk_forward_result() -> (
+    None
+):
+    at = AppTest.from_file(APP_PATH, default_timeout=120)
+    at.run()
+    _configure_offline_walk_forward(at)
+    at.sidebar.button[0].click().run()
+    assert not at.exception
+    assert "wf_result" in at.session_state
+
+    at.segmented_control[0].set_value("Backtest").run()
+
+    assert not at.exception
+    assert "wf_result" in at.session_state
+    assert any(b.label == "Run backtest" for b in at.sidebar.button)
+    assert any(i.value.startswith("Configure an experiment") for i in at.info)
+
+
+def _configure_offline_mean_reversion(at: AppTest) -> AppTest:
+    """A strategy with real grid-eligible parameters, for sensitivity tests."""
+    _sidebar_selectbox(at, "Data source").set_value("csv").run()
+    _sidebar_text_input(at, "Symbols (comma-separated)").set_value("SPY, QQQ").run()
+    _sidebar_date_input(at, "End date").set_value(datetime.date(2019, 6, 1)).run()
+    _sidebar_selectbox(at, "Strategy").set_value("mean_reversion").run()
+    return at
+
+
+def test_backtest_robustness_tab_bootstrap_runs_and_displays() -> None:
+    at = AppTest.from_file(APP_PATH, default_timeout=60)
+    at.run()
+    _configure_offline_pairs_trade(at)
+    at.session_state["dashboard_active_tab"] = "Robustness"
+    at.sidebar.button[0].click().run()
+    assert not at.exception
+
+    n_iterations = next(
+        n for n in at.tabs[2].number_input if n.label == "Bootstrap iterations"
+    )
+    n_iterations.set_value(100).run()
+    bootstrap_button = next(b for b in at.tabs[2].button if b.label == "Run bootstrap")
+    bootstrap_button.click().run()
+
+    assert not at.exception
+    assert "bootstrap_summary" in at.session_state
+    summary = at.session_state["bootstrap_summary"]
+    assert set(summary["statistic"]) == {
+        "cagr",
+        "sharpe",
+        "max_drawdown",
+        "final_value",
+    }
+    assert len(at.tabs[2].dataframe) >= 1
+
+
+def test_backtest_robustness_tab_permutation_test_runs_and_displays() -> None:
+    at = AppTest.from_file(APP_PATH, default_timeout=60)
+    at.run()
+    _configure_offline_pairs_trade(at)
+    at.session_state["dashboard_active_tab"] = "Robustness"
+    at.sidebar.button[0].click().run()
+    assert not at.exception
+
+    n_iterations = next(
+        n for n in at.tabs[2].number_input if n.label == "Permutation iterations"
+    )
+    n_iterations.set_value(100).run()
+    permutation_button = next(
+        b for b in at.tabs[2].button if b.label == "Run permutation test"
+    )
+    permutation_button.click().run()
+
+    assert not at.exception
+    assert "permutation_test" in at.session_state
+    outcome = at.session_state["permutation_test"]
+    assert {"real_sharpe", "p_value", "n_iterations"} <= set(outcome)
+    metric_labels = {m.label for m in at.tabs[2].metric}
+    assert {"Real Sharpe", "p-value"} <= metric_labels
+
+
+def test_backtest_robustness_tab_sensitivity_runs_and_displays_heatmap() -> None:
+    at = AppTest.from_file(APP_PATH, default_timeout=60)
+    at.run()
+    _configure_offline_mean_reversion(at)
+    at.session_state["dashboard_active_tab"] = "Robustness"
+    at.sidebar.button[0].click().run()
+    assert not at.exception
+
+    robustness_tab = at.tabs[2]
+    x_select = next(
+        sb for sb in robustness_tab.selectbox if sb.label == "Parameter (x-axis)"
+    )
+    x_select.set_value("lookback_period").run()
+    robustness_tab = at.tabs[2]
+    x_values = next(
+        f
+        for f in robustness_tab.text_input
+        if f.label == "Candidate values (x, comma-separated)"
+    )
+    x_values.set_value("10, 20").run()
+    robustness_tab = at.tabs[2]
+    y_select = next(
+        sb for sb in robustness_tab.selectbox if sb.label == "Parameter (y-axis)"
+    )
+    y_select.set_value("entry_zscore").run()
+    robustness_tab = at.tabs[2]
+    y_values = next(
+        f
+        for f in robustness_tab.text_input
+        if f.label == "Candidate values (y, comma-separated)"
+    )
+    y_values.set_value("1.5, 2.5").run()
+
+    robustness_tab = at.tabs[2]
+    run_button = next(
+        b for b in robustness_tab.button if b.label == "Run parameter sensitivity"
+    )
+    assert not run_button.proto.disabled
+    run_button.click().run()
+
+    assert not at.exception
+    assert "sensitivity" in at.session_state
+    sensitivity = at.session_state["sensitivity"]
+    assert len(sensitivity) == 4
+    # AppTest has no plotly_chart accessor; render_sensitivity_heatmap also
+    # renders the raw sensitivity table right after the chart, so its
+    # presence confirms the heatmap section actually rendered.
+    assert any(len(df.value) == 4 for df in at.tabs[2].dataframe)
+
+
+def test_walk_forward_robustness_tab_bootstrap_runs_and_displays() -> None:
+    at = AppTest.from_file(APP_PATH, default_timeout=120)
+    at.run()
+    _configure_offline_walk_forward(at)
+    at.session_state["dashboard_active_tab"] = "Robustness"
+    at.sidebar.button[0].click().run()
+    assert not at.exception
+
+    n_iterations = next(
+        n for n in at.tabs[2].number_input if n.label == "Bootstrap iterations"
+    )
+    n_iterations.set_value(100).run()
+    bootstrap_button = next(b for b in at.tabs[2].button if b.label == "Run bootstrap")
+    bootstrap_button.click().run()
+
+    assert not at.exception
+    assert "wf_bootstrap_summary" in at.session_state
+    summary = at.session_state["wf_bootstrap_summary"]
+    assert set(summary["statistic"]) == {
+        "cagr",
+        "sharpe",
+        "max_drawdown",
+        "final_value",
+    }
+
+
+def test_walk_forward_robustness_tab_permutation_test_runs_and_displays() -> None:
+    at = AppTest.from_file(APP_PATH, default_timeout=120)
+    at.run()
+    _configure_offline_walk_forward(at)
+    at.session_state["dashboard_active_tab"] = "Robustness"
+    at.sidebar.button[0].click().run()
+    assert not at.exception
+
+    n_iterations = next(
+        n for n in at.tabs[2].number_input if n.label == "Permutation iterations"
+    )
+    n_iterations.set_value(100).run()
+    permutation_button = next(
+        b for b in at.tabs[2].button if b.label == "Run permutation test"
+    )
+    permutation_button.click().run()
+
+    assert not at.exception
+    assert "wf_permutation_test" in at.session_state
+
+
+def test_walk_forward_robustness_tab_stress_tests_reruns_selection() -> None:
+    """Confirms the button in Walk-forward mode actually calls the
+    walk-forward-aware state function (distinct session key, real scenarios)
+    rather than Backtest mode's plain-backtest variant."""
+    at = AppTest.from_file(APP_PATH, default_timeout=180)
+    at.run()
+    _configure_offline_walk_forward(at)
+    at.session_state["dashboard_active_tab"] = "Robustness"
+    at.sidebar.button[0].click().run()
+    assert not at.exception
+
+    stress_button = next(b for b in at.tabs[2].button if b.label == "Run stress tests")
+    stress_button.click().run()
+
+    assert not at.exception
+    assert "wf_stress_tests" in at.session_state
+    assert "stress_tests" not in at.session_state  # Backtest mode's own key
+    stress = at.session_state["wf_stress_tests"]
+    assert "commission x5" in set(stress["scenario"])
+
+
+def test_backtest_run_all_robustness_tests_populates_every_technique() -> None:
+    at = AppTest.from_file(APP_PATH, default_timeout=60)
+    at.run()
+    _configure_offline_mean_reversion(at)
+    at.session_state["dashboard_active_tab"] = "Robustness"
+    at.sidebar.button[0].click().run()
+    assert not at.exception
+
+    robustness_tab = at.tabs[2]
+    next(
+        n for n in robustness_tab.number_input if n.label == "Bootstrap iterations"
+    ).set_value(100).run()
+    robustness_tab = at.tabs[2]
+    next(
+        n for n in robustness_tab.number_input if n.label == "Permutation iterations"
+    ).set_value(100).run()
+    robustness_tab = at.tabs[2]
+    next(
+        sb for sb in robustness_tab.selectbox if sb.label == "Parameter (x-axis)"
+    ).set_value("lookback_period").run()
+    robustness_tab = at.tabs[2]
+    next(
+        f
+        for f in robustness_tab.text_input
+        if f.label == "Candidate values (x, comma-separated)"
+    ).set_value("10, 20").run()
+    robustness_tab = at.tabs[2]
+    next(
+        sb for sb in robustness_tab.selectbox if sb.label == "Parameter (y-axis)"
+    ).set_value("entry_zscore").run()
+    robustness_tab = at.tabs[2]
+    next(
+        f
+        for f in robustness_tab.text_input
+        if f.label == "Candidate values (y, comma-separated)"
+    ).set_value("1.5, 2.5").run()
+
+    robustness_tab = at.tabs[2]
+    run_all_button = next(
+        b for b in robustness_tab.button if b.label == "Run all robustness tests"
+    )
+    run_all_button.click().run()
+
+    assert not at.exception
+    for key in ("stress_tests", "bootstrap_summary", "permutation_test", "sensitivity"):
+        assert key in at.session_state, f"{key} was not populated by Run all"

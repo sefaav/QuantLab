@@ -21,6 +21,17 @@ repos:
         args: ["--fix"]
       - id: ruff-format
 
+  - repo: https://github.com/semgrep/pre-commit
+    rev: v1.173.0
+    hooks:
+      - id: semgrep
+        # p/ci is the Semgrep-recommended starting ruleset for pre-commit/CI:
+        # broader packs like p/security-audit surface more findings but also
+        # more noise. --error makes matches fail the hook instead of only
+        # warning; --skip-unknown-extensions leaves non-code files (YAML
+        # configs, notebooks) alone.
+        args: ["--config", "p/ci", "--error", "--skip-unknown-extensions"]
+
   - repo: local
     hooks:
       - id: mypy

@@ -181,6 +181,90 @@ def test_conclusion_cross_references_full_sample_and_oos_sharpe_by_name() -> Non
     assert f"{oos_sharpe:.2f}" in text
 
 
+def test_conclusion_does_not_claim_separate_full_sample_for_walk_forward() -> None:
+    """A walk-forward OOS result's `metrics` *is* the stitched OOS series —
+    the conclusion must not present it a second time as a separate
+    "full-sample" figure alongside an identical "out-of-sample" one."""
+    from quantlab.reporting.research_summary import conclusion
+    from quantlab.validation.walk_forward import WalkForwardValidator
+
+    data, cfg = _rf_test_setup()
+    wf = WalkForwardValidator(cfg).run(
+        data, parameter_grid={}, train_window=200, validation_window=50, test_window=50
+    )
+    assert wf.oos_result is not None
+    text = conclusion(wf.oos_result)
+    assert "separate full-sample" not in text
+    oos_sharpe = wf.oos_result.metadata["walk_forward_oos_metrics"]["sharpe_ratio"]
+    formatted = f"{oos_sharpe:.2f}"
+    assert formatted in text
+    # Printed once, not once as "out-of-sample" and again as a duplicate
+    # "full-sample" figure that happens to be numerically identical.
+    assert text.count(formatted) == 1
+
+
+def test_out_of_sample_scope_distinguishes_walk_forward_from_holdout() -> None:
+    """Only a walk-forward OOS result's `metrics` themselves *are* the
+    out-of-sample series — a holdout result's `metrics` remain a genuine
+    full-sample fit even though OOS evidence is also attached separately,
+    so it must not be flagged the same way."""
+    from quantlab.backtesting.runner import run_backtest_from_config
+    from quantlab.reporting.research_summary import out_of_sample_scope
+    from quantlab.validation.walk_forward import WalkForwardValidator
+
+    data, cfg = _rf_test_setup()
+    wf = WalkForwardValidator(cfg).run(
+        data, parameter_grid={}, train_window=200, validation_window=50, test_window=50
+    )
+    assert wf.oos_result is not None
+    assert (
+        out_of_sample_scope(wf.oos_result)
+        == "out-of-sample (walk-forward test folds only)"
+    )
+
+    holdout_data, holdout_cfg = _holdout_config()
+    holdout_result = run_backtest_from_config(holdout_data, holdout_cfg)
+    assert "holdout_oos_metrics" in holdout_result.metadata
+    assert out_of_sample_scope(holdout_result) is None
+
+    plain_result = run_backtest_from_config(data, cfg)
+    assert out_of_sample_scope(plain_result) is None
+
+
+def test_subperiod_table_labels_walk_forward_aggregate_as_out_of_sample() -> None:
+    """`subperiod_table`'s aggregate row must not call a walk-forward OOS
+    series "Full sample" — the opposite of what it is."""
+    from quantlab.reporting.tables import subperiod_table
+    from quantlab.validation.walk_forward import WalkForwardValidator
+
+    data, cfg = _rf_test_setup()
+    wf = WalkForwardValidator(cfg).run(
+        data, parameter_grid={}, train_window=200, validation_window=50, test_window=50
+    )
+    assert wf.oos_result is not None
+    table = subperiod_table(wf.oos_result)
+    periods = set(table["Period"])
+    assert "Out-of-sample" in periods
+    assert "Full sample" not in periods
+
+
+def test_html_report_labels_walk_forward_results_as_out_of_sample() -> None:
+    """The Results section headings and executive summary must say
+    out-of-sample (walk-forward), never the "Full-sample" wording that's
+    only accurate for a genuine full-sample fit."""
+    from quantlab.validation.walk_forward import WalkForwardValidator
+
+    data, cfg = _rf_test_setup()
+    wf = WalkForwardValidator(cfg).run(
+        data, parameter_grid={}, train_window=200, validation_window=50, test_window=50
+    )
+    assert wf.oos_result is not None
+    html = wf.oos_result.to_html()
+    assert "Out-of-sample (walk-forward) headline metrics" in html
+    assert "Full-sample" not in html
+    assert "These are out-of-sample (walk-forward test folds only) results" in html
+
+
 def test_holdout_test_ratio_without_validation_ratio_does_not_crash() -> None:
     from quantlab.backtesting.runner import run_backtest_from_config
 
@@ -545,8 +629,19 @@ def test_report_command_preserves_walk_forward_run_timestamp(
 
 
 def test_generate_report_preserves_walk_forward_artifacts(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """Pins git_dirty=False: `load_previous_walk_forward_robustness` refuses
+    reuse whenever either save saw a dirty tree (git_commit can't be trusted
+    otherwise), which is real, intentional behaviour — but leaving it to
+    whatever the ambient repo state happens to be during a test run makes
+    this test's pass/fail depend on something it doesn't control (an
+    ordinarily-uncommitted working session, or an unrelated CI build step,
+    would fail it for a reason that has nothing to do with the reuse logic
+    actually under test here)."""
+    import quantlab.backtesting.engine as engine_module
+
+    monkeypatch.setattr(engine_module, "_git_is_dirty", lambda: False)
     from quantlab.backtesting.result import save_with_walk_forward_reuse
     from quantlab.backtesting.runner import run_backtest_from_config
 

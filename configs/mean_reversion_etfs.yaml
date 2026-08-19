@@ -49,3 +49,16 @@ validation:
 
 reproducibility:
   random_seed: 42
+
+robustness:
+  stress_test:
+    enabled: true
+  bootstrap:
+    enabled: true
+  permutation_test:
+    enabled: true
+  sensitivity:
+    enabled: true
+    parameters:
+      lookback_period: [10, 20, 40]
+      entry_zscore: [1.5, 2.0, 2.5]

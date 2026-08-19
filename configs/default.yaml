@@ -43,3 +43,15 @@ validation:
 
 reproducibility:
   random_seed: 42
+
+# `quantlab stress-test|bootstrap|permutation-test --config
+# configs/default.yaml` each run regardless of `enabled` below (only the
+# `robustness` orchestrator reads it). No `sensitivity` block: buy_and_hold
+# has no strategy parameters to sweep.
+robustness:
+  stress_test:
+    enabled: true
+  bootstrap:
+    enabled: true
+  permutation_test:
+    enabled: true
