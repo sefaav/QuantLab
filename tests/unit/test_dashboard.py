@@ -60,10 +60,21 @@ def _sidebar_text_input(at: AppTest, label: str) -> Any:
     return next(field for field in at.sidebar.text_input if field.label == label)
 
 
+def _sidebar_multiselect(at: AppTest, label: str) -> Any:
+    return next(ms for ms in at.sidebar.multiselect if ms.label == label)
+
+
+def _sidebar_multiselect_by_key(at: AppTest, key: str) -> Any:
+    """Yahoo's and Binance's symbol pickers share the label "Symbols" (both
+    built from the shared ``_symbols_picker`` helper in app.py), so they
+    must be told apart by widget key ("yahoo_symbols" / "binance_symbols")
+    instead of by label."""
+    return next(ms for ms in at.sidebar.multiselect if ms.key == key)
+
+
 def _configure_offline_pairs_trade(at: AppTest) -> AppTest:
     """Point the dashboard at locally cached CSV data for SPY/QQQ."""
-    _sidebar_selectbox(at, "Data source").set_value("csv").run()
-    _sidebar_text_input(at, "Symbols (comma-separated)").set_value("SPY, QQQ").run()
+    _sidebar_text_input(at, "CSV symbols (comma-separated)").set_value("SPY, QQQ").run()
     _sidebar_date_input(at, "End date").set_value(datetime.date(2019, 6, 1)).run()
     _sidebar_selectbox(at, "Strategy").set_value("pairs_trading").run()
     return at
@@ -83,8 +94,7 @@ def _configure_offline_walk_forward(at: AppTest) -> AppTest:
     must still clear that — hence 70/20 rather than something tinier.
     """
     _switch_to_walk_forward_mode(at)
-    _sidebar_selectbox(at, "Data source").set_value("csv").run()
-    _sidebar_text_input(at, "Symbols (comma-separated)").set_value("SPY, QQQ").run()
+    _sidebar_text_input(at, "CSV symbols (comma-separated)").set_value("SPY, QQQ").run()
     _sidebar_date_input(at, "End date").set_value(datetime.date(2019, 7, 1)).run()
     _sidebar_selectbox(at, "Strategy").set_value("mean_reversion").run()
     # Weekly (not the default monthly) guarantees a rebalance date inside
@@ -107,86 +117,31 @@ def test_default_dates_are_visible_and_ordered() -> None:
     assert start.value < end.value
 
 
-def test_sidebar_warns_that_one_calendar_applies_to_the_entire_universe() -> None:
-    at = AppTest.from_file(APP_PATH, default_timeout=60)
-    at.run()
-
-    assert any(
-        "One calendar applies to every symbol" in warning.value
-        and "AAPL and 1211.HK" in warning.value
-        for warning in at.sidebar.warning
-    )
-
-
-def _sidebar_multiselect(at: AppTest, label: str) -> Any:
-    return next(ms for ms in at.sidebar.multiselect if ms.label == label)
-
-
-_MARKET_CALENDAR_NOTE = (
-    "One market calendar applies to the entire universe, so every symbol "
-    "must follow the same trading schedule."
-)
-
-
-def test_csv_symbols_and_benchmark_help_mention_market_calendar() -> None:
-    at = AppTest.from_file(APP_PATH, default_timeout=60)
-    at.run()
-
-    symbols_field = _sidebar_text_input(at, "Symbols (comma-separated)")
-    assert _MARKET_CALENDAR_NOTE in symbols_field.proto.help
-
-    _sidebar_selectbox(at, "Benchmark").set_value("symbol").run()
-    benchmark_field = _sidebar_text_input(at, "Benchmark symbol")
-    assert _MARKET_CALENDAR_NOTE in benchmark_field.proto.help
-
-
-def test_yahoo_symbols_and_benchmark_help_mention_market_calendar() -> None:
-    at = AppTest.from_file(APP_PATH, default_timeout=60)
-    at.run()
-    _sidebar_selectbox(at, "Data source").set_value("yahoo").run()
-
-    picker = _sidebar_multiselect(at, "Symbols")
-    assert _MARKET_CALENDAR_NOTE in picker.proto.help
-
-    benchmark = _sidebar_selectbox(at, "Benchmark symbol")
-    assert _MARKET_CALENDAR_NOTE in benchmark.proto.help
-
-
 def test_symbols_picker_help_icon_is_not_hidden_by_a_collapsed_label() -> None:
     """Regression test: Streamlit hides a widget's help tooltip icon along
-    with a `label_visibility="collapsed"` label, which silently swallowed
-    the market-calendar/incomplete-list notes above. The label must stay
-    visible so the help icon (and thus those notes) stays reachable."""
+    with a `label_visibility="collapsed"` label, which would silently
+    swallow the incomplete-list note in `_symbols_picker`'s help text. The
+    label must stay visible so the help icon (and thus that note) stays
+    reachable."""
     at = AppTest.from_file(APP_PATH, default_timeout=60)
     at.run()
-    _sidebar_selectbox(at, "Data source").set_value("yahoo").run()
 
-    picker = _sidebar_multiselect(at, "Symbols")
+    picker = _sidebar_multiselect_by_key(at, "yahoo_symbols")
     assert picker.proto.label_visibility.value == 0  # VISIBLE
 
 
-def test_binance_symbols_and_benchmark_help_omit_market_calendar_note() -> None:
-    """Every Binance pair already shares the same 24/7 calendar, so the
-    cross-market mixing warning (relevant for csv/yahoo) doesn't apply."""
-    at = AppTest.from_file(APP_PATH, default_timeout=60)
-    at.run()
-    _sidebar_selectbox(at, "Data source").set_value("binance").run()
-
-    picker = _sidebar_multiselect(at, "Symbols")
-    assert _MARKET_CALENDAR_NOTE not in picker.proto.help
-
-    benchmark = _sidebar_selectbox(at, "Benchmark symbol")
-    assert _MARKET_CALENDAR_NOTE not in benchmark.proto.help
-
-
-def test_csv_source_keeps_the_free_text_symbols_field() -> None:
+def test_csv_symbols_field_is_free_text_not_a_dropdown() -> None:
+    """CSV symbols are entered as free text (a local filename), unlike the
+    always-visible Yahoo/Binance pickers, which are dropdowns over a
+    preloaded universe."""
     at = AppTest.from_file(APP_PATH, default_timeout=60)
     at.run()
 
     assert any(
-        field.label == "Symbols (comma-separated)" for field in at.sidebar.text_input
+        field.label == "CSV symbols (comma-separated)"
+        for field in at.sidebar.text_input
     )
-    assert not any(ms.label == "Symbols" for ms in at.sidebar.multiselect)
+    assert not any(ms.key == "csv_symbols" for ms in at.sidebar.multiselect)
 
 
 def test_binance_symbols_picker_is_an_instant_dropdown_over_the_full_universe(
@@ -210,13 +165,14 @@ def test_binance_symbols_picker_is_an_instant_dropdown_over_the_full_universe(
 
     at = AppTest.from_file(APP_PATH, default_timeout=60)
     at.run()
-    _sidebar_selectbox(at, "Data source").set_value("binance").run()
 
     assert not at.exception
     assert not any(field.label == "Search" for field in at.sidebar.text_input)
-    picker = _sidebar_multiselect(at, "Symbols")
+    picker = _sidebar_multiselect_by_key(at, "binance_symbols")
     assert picker.options == ["BTCUSDT — BTC/USDT", "ETHUSDT — ETH/USDT"]
-    assert picker.value == ["BTCUSDT — BTC/USDT", "ETHUSDT — ETH/USDT"]
+    # Empty by default: a non-empty default would immediately conflict with
+    # CSV's own bundled-demo default (see `_combine_instrument_picks`).
+    assert picker.value == []
 
     # Selecting from the already-loaded list makes no further fetch.
     picker.set_value(["ETHUSDT — ETH/USDT"]).run()
@@ -233,24 +189,20 @@ def test_yahoo_symbols_picker_is_an_instant_dropdown_over_the_bundled_universe()
     instead of a live call."""
     at = AppTest.from_file(APP_PATH, default_timeout=60)
     at.run()
-    _sidebar_selectbox(at, "Data source").set_value("yahoo").run()
 
     assert not at.exception
     assert not any(field.label == "Search" for field in at.sidebar.text_input)
-    picker = _sidebar_multiselect(at, "Symbols")
+    picker = _sidebar_multiselect_by_key(at, "yahoo_symbols")
     # The bundled S&P 500 + ETF + global-company list, not just a handful.
     assert len(picker.options) > 650
     assert "AAPL — Apple Inc." in picker.options
     assert "MSFT — Microsoft" in picker.options
-    assert set(picker.value) == {
-        "SPY — SPDR S&P 500 ETF Trust",
-        "QQQ — Invesco QQQ Trust (Nasdaq-100)",
-        "TLT — iShares 20+ Year Treasury Bond ETF",
-        "GLD — SPDR Gold Shares",
-    }
+    # Empty by default: a non-empty default would immediately conflict with
+    # CSV's own bundled-demo default (see `_combine_instrument_picks`).
+    assert picker.value == []
 
     # Picking from the already-loaded list is a plain client-side selection.
-    picker.set_value([*picker.value, "AAPL — Apple Inc."]).run()
+    picker.set_value(["AAPL — Apple Inc."]).run()
     assert not at.exception
     assert "AAPL — Apple Inc." in picker.value
 
@@ -260,9 +212,8 @@ def test_yahoo_symbols_picker_includes_major_non_us_companies() -> None:
     findable — the bundled list isn't limited to US large caps."""
     at = AppTest.from_file(APP_PATH, default_timeout=60)
     at.run()
-    _sidebar_selectbox(at, "Data source").set_value("yahoo").run()
 
-    picker = _sidebar_multiselect(at, "Symbols")
+    picker = _sidebar_multiselect_by_key(at, "yahoo_symbols")
     assert any(option.startswith("BMW.DE") for option in picker.options)
 
 
@@ -272,9 +223,8 @@ def test_yahoo_symbols_picker_accepts_a_symbol_outside_the_bundled_list() -> Non
     symbol not in it can still be typed and added directly."""
     at = AppTest.from_file(APP_PATH, default_timeout=60)
     at.run()
-    _sidebar_selectbox(at, "Data source").set_value("yahoo").run()
 
-    picker = _sidebar_multiselect(at, "Symbols")
+    picker = _sidebar_multiselect_by_key(at, "yahoo_symbols")
     assert picker.proto.accept_new_options is True
     assert not any(o.startswith("NOVN.SW") for o in picker.options)
 
@@ -293,15 +243,12 @@ def test_yahoo_shows_a_note_that_suggestions_are_not_exhaustive() -> None:
     dedicating always-visible space to."""
     at = AppTest.from_file(APP_PATH, default_timeout=60)
     at.run()
-    _sidebar_selectbox(at, "Data source").set_value("yahoo").run()
 
     assert not any(
         "Not every symbol is suggested" in c.value for c in at.sidebar.caption
     )
-    picker = _sidebar_multiselect(at, "Symbols")
+    picker = _sidebar_multiselect_by_key(at, "yahoo_symbols")
     assert "Not every symbol is suggested" in picker.proto.help
-    benchmark = _sidebar_selectbox(at, "Benchmark symbol")
-    assert "Not every symbol is suggested" in benchmark.proto.help
 
 
 def test_binance_shows_no_incomplete_suggestions_note(
@@ -322,28 +269,12 @@ def test_binance_shows_no_incomplete_suggestions_note(
 
     at = AppTest.from_file(APP_PATH, default_timeout=60)
     at.run()
-    _sidebar_selectbox(at, "Data source").set_value("binance").run()
 
     assert not any(
         "Not every symbol is suggested" in c.value for c in at.sidebar.caption
     )
-    picker = _sidebar_multiselect(at, "Symbols")
+    picker = _sidebar_multiselect_by_key(at, "binance_symbols")
     assert "Not every symbol is suggested" not in picker.proto.help
-    benchmark = _sidebar_selectbox(at, "Benchmark symbol")
-    assert "Not every symbol is suggested" not in benchmark.proto.help
-
-
-def test_yahoo_benchmark_symbol_accepts_new_options() -> None:
-    """AppTest can't simulate typing a brand-new selectbox value (it looks
-    the value up by index into the fixed options list, which a freshly
-    typed value isn't part of), so this only checks the widget is
-    configured to accept one — verified end-to-end manually instead."""
-    at = AppTest.from_file(APP_PATH, default_timeout=60)
-    at.run()
-    _sidebar_selectbox(at, "Data source").set_value("yahoo").run()
-
-    benchmark = _sidebar_selectbox(at, "Benchmark symbol")
-    assert benchmark.proto.accept_new_options is True
 
 
 def test_binance_symbols_picker_rejects_symbols_outside_the_universe() -> None:
@@ -351,58 +282,9 @@ def test_binance_symbols_picker_rejects_symbols_outside_the_universe() -> None:
     there is no free-typing escape hatch for it."""
     at = AppTest.from_file(APP_PATH, default_timeout=60)
     at.run()
-    _sidebar_selectbox(at, "Data source").set_value("binance").run()
 
-    picker = _sidebar_multiselect(at, "Symbols")
+    picker = _sidebar_multiselect_by_key(at, "binance_symbols")
     assert picker.proto.accept_new_options is False
-
-
-def test_csv_benchmark_symbol_stays_free_text() -> None:
-    at = AppTest.from_file(APP_PATH, default_timeout=60)
-    at.run()
-
-    assert any(field.label == "Benchmark symbol" for field in at.sidebar.text_input)
-    assert not any(sb.label == "Benchmark symbol" for sb in at.sidebar.selectbox)
-
-
-def test_binance_benchmark_symbol_is_a_dropdown_over_the_same_universe(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    from quantlab.data.base import SymbolSuggestion
-    from quantlab.data.binance import BinanceDataSource
-
-    monkeypatch.setattr(
-        BinanceDataSource,
-        "list_trading_symbols",
-        lambda self: [
-            SymbolSuggestion(symbol="BTCUSDT", description="BTC/USDT"),
-            SymbolSuggestion(symbol="ETHUSDT", description="ETH/USDT"),
-        ],
-    )
-    st.cache_data.clear()  # avoid a real universe cached by an earlier test/run
-
-    at = AppTest.from_file(APP_PATH, default_timeout=60)
-    at.run()
-    _sidebar_selectbox(at, "Data source").set_value("binance").run()
-
-    assert not at.exception
-    benchmark = _sidebar_selectbox(at, "Benchmark symbol")
-    assert benchmark.options == ["BTCUSDT — BTC/USDT", "ETHUSDT — ETH/USDT"]
-    assert benchmark.value == "BTCUSDT — BTC/USDT"
-
-
-def test_yahoo_benchmark_symbol_offers_the_full_bundled_universe() -> None:
-    """The benchmark dropdown isn't limited to the 4 starter symbols — it
-    shares the same bundled S&P 500 + ETF list as the Symbols picker."""
-    at = AppTest.from_file(APP_PATH, default_timeout=60)
-    at.run()
-    _sidebar_selectbox(at, "Data source").set_value("yahoo").run()
-
-    assert not at.exception
-    benchmark = _sidebar_selectbox(at, "Benchmark symbol")
-    assert len(benchmark.options) > 500
-    assert "AAPL — Apple Inc." in benchmark.options
-    assert benchmark.value == "SPY — SPDR S&P 500 ETF Trust"
 
 
 def test_monthly_return_pivot_preserves_a_month_without_observations() -> None:
@@ -444,8 +326,10 @@ def test_metric_cards_use_a_four_column_grid_and_explain_cost_units() -> None:
 
     render_metric_cards(fake, result)
 
-    # Eight cards over 4 columns wrap into two visual rows of four, matching
-    # the platform's default two-row metric layout.
+    # 4 columns: eight cards divide evenly into two full, aligned rows --
+    # any count that doesn't evenly divide 8 leaves a ragged last row (e.g.
+    # 3 columns strands "Total costs"/"Number of trades" alone on a
+    # half-empty row, visually detached from the grid above).
     assert fake.columns_requested == 4
     assert len(fake.metrics) == 8
     costs = next(metric for metric in fake.metrics if metric[0] == "Total costs")
@@ -499,7 +383,7 @@ def test_pairs_trading_symbol_inputs_render_without_crash() -> None:
     at.run()
     assert not at.exception
 
-    _sidebar_text_input(at, "Symbols (comma-separated)").set_value("AAA, BBB").run()
+    _sidebar_text_input(at, "CSV symbols (comma-separated)").set_value("AAA, BBB").run()
     _sidebar_selectbox(at, "Strategy").set_value("pairs_trading").run()
     assert not at.exception
 
@@ -538,12 +422,25 @@ def test_bundled_demo_csvs_require_an_explicit_dashboard_opt_in() -> None:
     assert at.session_state["result"].config.data.use_bundled_demo_data is True
 
 
-def test_bundled_demo_toggle_is_hidden_for_non_csv_sources() -> None:
+def test_bundled_demo_toggle_visible_only_while_a_csv_instrument_exists() -> None:
+    """Shown whenever any instrument-table row's Source is "csv" — not
+    gated by a "Data source" selectbox, since all three pickers are always
+    visible now."""
     at = AppTest.from_file(APP_PATH, default_timeout=60)
     at.run()
 
-    _sidebar_selectbox(at, "Data source").set_value("yahoo").run()
+    # CSV's own default population (SPY, QQQ, TLT, GLD) means the toggle is
+    # visible out of the box.
+    assert any(
+        toggle.label == "Allow bundled synthetic demo data"
+        for toggle in at.sidebar.toggle
+    )
 
+    _sidebar_text_input(at, "CSV symbols (comma-separated)").set_value("").run()
+    yahoo_ms = _sidebar_multiselect_by_key(at, "yahoo_symbols")
+    yahoo_ms.set_value([yahoo_ms.options[0]]).run()
+
+    assert not at.exception
     assert not any(
         toggle.label == "Allow bundled synthetic demo data"
         for toggle in at.sidebar.toggle
@@ -577,7 +474,9 @@ def test_reversion_exit_slider_stays_strictly_below_entry(
     at = AppTest.from_file(APP_PATH, default_timeout=60)
     at.run()
     if strategy_name == "pairs_trading":
-        _sidebar_text_input(at, "Symbols (comma-separated)").set_value("AAA, BBB").run()
+        _sidebar_text_input(at, "CSV symbols (comma-separated)").set_value(
+            "AAA, BBB"
+        ).run()
     _sidebar_selectbox(at, "Strategy").set_value(strategy_name).run()
 
     entry = next(
@@ -610,7 +509,7 @@ def test_holdout_controls_do_not_claim_automatic_tuning() -> None:
 def test_pairs_trading_with_fewer_than_two_symbols_shows_error_not_crash() -> None:
     at = AppTest.from_file(APP_PATH, default_timeout=60)
     at.run()
-    _sidebar_text_input(at, "Symbols (comma-separated)").set_value("AAA").run()
+    _sidebar_text_input(at, "CSV symbols (comma-separated)").set_value("AAA").run()
     _sidebar_selectbox(at, "Strategy").set_value("pairs_trading").run()
     assert not at.exception
     assert any("at least two symbols" in e.value for e in at.sidebar.error)
@@ -619,7 +518,7 @@ def test_pairs_trading_with_fewer_than_two_symbols_shows_error_not_crash() -> No
 def test_pairs_trading_requires_two_distinct_symbols() -> None:
     at = AppTest.from_file(APP_PATH, default_timeout=60)
     at.run()
-    _sidebar_text_input(at, "Symbols (comma-separated)").set_value("AAA, AAA").run()
+    _sidebar_text_input(at, "CSV symbols (comma-separated)").set_value("AAA, AAA").run()
     _sidebar_selectbox(at, "Strategy").set_value("pairs_trading").run()
 
     assert not at.exception
@@ -642,13 +541,19 @@ def test_dashboard_can_disable_volatility_targeting_and_set_risk_free_rate() -> 
 
 
 def test_failed_backtest_invalidates_previous_result() -> None:
+    """Dropping to one CSV symbol while pairs_trading is still selected
+    leaves `strategy_parameters` without symbol_a/symbol_b, which
+    ExperimentConfig rejects — a config-validation failure, not an empty
+    universe (which the Run button now disables outright, so it can no
+    longer be used to reach this path)."""
     at = AppTest.from_file(APP_PATH, default_timeout=60)
     at.run()
     _configure_offline_pairs_trade(at)
     at.sidebar.button[0].click().run()
     assert "result" in at.session_state
 
-    _sidebar_text_input(at, "Symbols (comma-separated)").set_value("").run()
+    _sidebar_text_input(at, "CSV symbols (comma-separated)").set_value("SPY").run()
+    assert at.sidebar.button[0].proto.disabled is False
     at.sidebar.button[0].click().run()
 
     assert not at.exception
@@ -696,7 +601,7 @@ def test_robustness_tab_shows_holdout_table_when_enabled() -> None:
     assert robustness_tab.label == "Robustness"
     assert len(robustness_tab.dataframe) == 1
     table = robustness_tab.dataframe[0].value
-    assert list(table["Block"]) == ["Train", "Validation", "Test (out-of-sample)"]
+    assert list(table["Block"]) == ["Train", "Validation", "Test"]
     column_config = json.loads(robustness_tab.dataframe[0].proto.columns)
     assert column_config["CAGR"]["type_config"]["format"] == "percent"
     assert column_config["Max Drawdown"]["type_config"]["format"] == "percent"
@@ -762,8 +667,7 @@ def test_stale_result_warning_shown_after_sidebar_change() -> None:
 def test_frequency_mismatch_shown_as_prominent_error_not_small_caption() -> None:
     at = AppTest.from_file(APP_PATH, default_timeout=60)
     at.run()
-    _sidebar_selectbox(at, "Data source").set_value("csv").run()
-    _sidebar_text_input(at, "Symbols (comma-separated)").set_value("SPY, QQQ").run()
+    _sidebar_text_input(at, "CSV symbols (comma-separated)").set_value("SPY, QQQ").run()
     _sidebar_date_input(at, "End date").set_value(datetime.date(2019, 6, 1)).run()
     _sidebar_selectbox(at, "Frequency").set_value("1h").run()
     at.sidebar.button[0].click().run()
@@ -956,8 +860,7 @@ def test_advanced_portfolio_constraints_hidden_for_pairs_trading() -> None:
 def test_advanced_portfolio_constraints_are_accepted_by_the_config() -> None:
     at = AppTest.from_file(APP_PATH, default_timeout=60)
     at.run()
-    _sidebar_selectbox(at, "Data source").set_value("csv").run()
-    _sidebar_text_input(at, "Symbols (comma-separated)").set_value(
+    _sidebar_text_input(at, "CSV symbols (comma-separated)").set_value(
         "SPY, QQQ, TLT, GLD"
     ).run()
     _sidebar_date_input(at, "End date").set_value(datetime.date(2019, 6, 1)).run()
@@ -983,7 +886,6 @@ def test_advanced_portfolio_constraints_are_accepted_by_the_config() -> None:
 def test_gross_vs_net_section_renders_with_real_values() -> None:
     at = AppTest.from_file(APP_PATH, default_timeout=60)
     at.run()
-    _sidebar_selectbox(at, "Data source").set_value("csv").run()
     _sidebar_date_input(at, "End date").set_value(datetime.date(2019, 6, 1)).run()
     at.sidebar.button[0].click().run()
 
@@ -1035,6 +937,8 @@ def test_gross_vs_net_comparison_uses_a_five_column_grid() -> None:
 
     render_gross_net_comparison(fake, result)
 
+    # 5 columns: exactly one card per column, one full row -- no ragged
+    # remainder the way a count that doesn't evenly divide 5 would leave.
     assert fake.columns_requested == 5
     values = {label: value for label, value, _ in fake.metrics}
     assert values["Net total return"] == "5.00%"
@@ -1156,8 +1060,7 @@ def test_walk_forward_mode_still_warns_when_no_fold_fits() -> None:
     at = AppTest.from_file(APP_PATH, default_timeout=60)
     at.run()
     _switch_to_walk_forward_mode(at)
-    _sidebar_selectbox(at, "Data source").set_value("csv").run()
-    _sidebar_text_input(at, "Symbols (comma-separated)").set_value("SPY, QQQ").run()
+    _sidebar_text_input(at, "CSV symbols (comma-separated)").set_value("SPY, QQQ").run()
     _sidebar_date_input(at, "End date").set_value(datetime.date(2019, 6, 1)).run()
     _sidebar_number_input(at, "Train window (periods)").set_value(10_000).run()
 
@@ -1244,8 +1147,7 @@ def test_walk_forward_no_fitting_fold_shows_error_not_crash() -> None:
     at = AppTest.from_file(APP_PATH, default_timeout=60)
     at.run()
     _switch_to_walk_forward_mode(at)
-    _sidebar_selectbox(at, "Data source").set_value("csv").run()
-    _sidebar_text_input(at, "Symbols (comma-separated)").set_value("SPY, QQQ").run()
+    _sidebar_text_input(at, "CSV symbols (comma-separated)").set_value("SPY, QQQ").run()
     _sidebar_date_input(at, "End date").set_value(datetime.date(2019, 6, 1)).run()
     _sidebar_number_input(at, "Train window (periods)").set_value(10_000).run()
     at.sidebar.button[0].click().run()
@@ -1275,8 +1177,7 @@ def test_switching_to_backtest_mode_does_not_affect_a_stored_walk_forward_result
 
 def _configure_offline_mean_reversion(at: AppTest) -> AppTest:
     """A strategy with real grid-eligible parameters, for sensitivity tests."""
-    _sidebar_selectbox(at, "Data source").set_value("csv").run()
-    _sidebar_text_input(at, "Symbols (comma-separated)").set_value("SPY, QQQ").run()
+    _sidebar_text_input(at, "CSV symbols (comma-separated)").set_value("SPY, QQQ").run()
     _sidebar_date_input(at, "End date").set_value(datetime.date(2019, 6, 1)).run()
     _sidebar_selectbox(at, "Strategy").set_value("mean_reversion").run()
     return at
@@ -1498,3 +1399,291 @@ def test_backtest_run_all_robustness_tests_populates_every_technique() -> None:
     assert not at.exception
     for key in ("stress_tests", "bootstrap_summary", "permutation_test", "sensitivity"):
         assert key in at.session_state, f"{key} was not populated by Run all"
+
+
+# --------------------------------------------------------------------------- #
+# Multi-instrument sidebar (Phase C): conflict detection, provenance-based
+# source, mixed-calendar handling, frequency-compatibility filtering, and the
+# rewritten benchmark lock-on-overlap behaviour.
+# --------------------------------------------------------------------------- #
+
+
+def test_conflicting_symbol_across_pickers_blocks_submission_with_error() -> None:
+    """Picking the same symbol from two pickers makes its source/calendar
+    ambiguous — never silently deduplicated (see `_combine_instrument_picks`
+    in app.py)."""
+    at = AppTest.from_file(APP_PATH, default_timeout=60)
+    at.run()
+    assert at.sidebar.button[0].proto.disabled is False
+
+    yahoo_ms = _sidebar_multiselect_by_key(at, "yahoo_symbols")
+    # SPY is already in CSV's default population (SPY, QQQ, TLT, GLD).
+    yahoo_ms.set_value(["SPY — SPDR S&P 500 ETF Trust"]).run()
+
+    assert not at.exception
+    assert any("ambiguous" in e.value and "SPY" in e.value for e in at.sidebar.error)
+    assert at.sidebar.button[0].proto.disabled is True
+
+
+def test_instrument_source_comes_from_picker_provenance_not_a_heuristic(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The instrument table's Source column defaults to the picker a symbol
+    was actually picked from (see `_combine_instrument_picks`'s docstring in
+    app.py), never a symbol-shape heuristic. Checked against the *built
+    config* returned by `build_config_from_inputs`, not just the sidebar's
+    own table, so this exercises the real
+    sidebar -> `_collect_inputs` -> `build_config_from_inputs` pipeline.
+
+    `run_dashboard_backtest` is monkeypatched to capture the config and
+    raise immediately (before any data loading happens), so this stays
+    fully offline — real Binance OHLCV data is never fetched, only its
+    (also monkeypatched) symbol-suggestion list."""
+    import quantlab.dashboard.state as state_module
+    from quantlab.config import DataSourceName
+    from quantlab.data.base import SymbolSuggestion
+    from quantlab.data.binance import BinanceDataSource
+
+    monkeypatch.setattr(
+        BinanceDataSource,
+        "list_trading_symbols",
+        lambda self: [SymbolSuggestion(symbol="BTCUSDT", description="BTC/USDT")],
+    )
+    st.cache_data.clear()  # avoid a real universe cached by an earlier test/run
+
+    captured: dict[str, Any] = {}
+
+    def fake_run_dashboard_backtest(config: Any) -> Any:
+        captured["config"] = config
+        raise RuntimeError("stop before real data loading")
+
+    monkeypatch.setattr(
+        state_module, "run_dashboard_backtest", fake_run_dashboard_backtest
+    )
+
+    at = AppTest.from_file(APP_PATH, default_timeout=60)
+    at.run()
+    _sidebar_text_input(at, "CSV symbols (comma-separated)").set_value("").run()
+    binance_ms = _sidebar_multiselect_by_key(at, "binance_symbols")
+    binance_ms.set_value([binance_ms.options[0]]).run()
+    assert at.sidebar.button[0].proto.disabled is False
+    at.sidebar.button[0].click().run()
+
+    assert "config" in captured
+    instruments = captured["config"].data.instruments
+    assert len(instruments) == 1
+    assert instruments[0].symbol == "BTCUSDT"
+    assert instruments[0].source is DataSourceName.BINANCE
+    assert instruments[0].calendar == "24/7"
+
+
+def test_frequency_options_reflect_selected_sources(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The Frequency dropdown offers exactly
+    `compatible_frequencies_for_sources()`'s answer for the currently
+    selected instruments' sources — computed here directly rather than
+    hardcoded, so this test can't silently drift from the real
+    frequency-compatibility intersection logic in config.py."""
+    from quantlab.config import DataSourceName, compatible_frequencies_for_sources
+    from quantlab.data.base import SymbolSuggestion
+    from quantlab.data.binance import BinanceDataSource
+
+    monkeypatch.setattr(
+        BinanceDataSource,
+        "list_trading_symbols",
+        lambda self: [SymbolSuggestion(symbol="BTCUSDT", description="BTC/USDT")],
+    )
+    st.cache_data.clear()  # avoid a real universe cached by an earlier test/run
+
+    at = AppTest.from_file(APP_PATH, default_timeout=60)
+    at.run()
+    freq = next(sb for sb in at.sidebar.selectbox if sb.label == "Frequency")
+    expected_csv_only = sorted(
+        f.value for f in compatible_frequencies_for_sources({DataSourceName.CSV})
+    )
+    assert freq.options == expected_csv_only
+
+    binance_ms = _sidebar_multiselect_by_key(at, "binance_symbols")
+    binance_ms.set_value([binance_ms.options[0]]).run()
+
+    freq = next(sb for sb in at.sidebar.selectbox if sb.label == "Frequency")
+    # '1h' is additionally excluded here: adding BTCUSDT mixes calendars
+    # (CSV's default population is XNYS, BTCUSDT is 24/7), and verified
+    # closures only work at daily frequency -- see
+    # test_mixed_calendar_universe_excludes_intraday_frequency below for a
+    # dedicated check of that exclusion.
+    expected_mixed = sorted(
+        f.value
+        for f in compatible_frequencies_for_sources(
+            {DataSourceName.CSV, DataSourceName.BINANCE}
+        )
+        if f.value != "1h"
+    )
+    assert freq.options == expected_mixed
+    assert freq.options != expected_csv_only
+
+
+def test_mixed_calendar_warning_and_periods_per_year_field_appear_together(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No real Binance/Yahoo network access is available in CI (every other
+    test in this file that runs an actual backtest stays on CSV data for
+    exactly that reason), so this only exercises the sidebar's reaction to a
+    mixed-calendar universe — warning plus field appearing together, and the
+    Run button staying enabled — not a full multi-source backtest run."""
+    from quantlab.data.base import SymbolSuggestion
+    from quantlab.data.binance import BinanceDataSource
+
+    monkeypatch.setattr(
+        BinanceDataSource,
+        "list_trading_symbols",
+        lambda self: [SymbolSuggestion(symbol="BTCUSDT", description="BTC/USDT")],
+    )
+    st.cache_data.clear()  # avoid a real universe cached by an earlier test/run
+
+    at = AppTest.from_file(APP_PATH, default_timeout=60)
+    at.run()
+    # CSV's default population is all XNYS, so no mixed-calendar warning yet.
+    assert not any(
+        "Instruments span more than one calendar" in w.value for w in at.sidebar.warning
+    )
+    assert not any(
+        f.label == "Periods per year (annualisation factor)"
+        for f in at.sidebar.number_input
+    )
+
+    binance_ms = _sidebar_multiselect_by_key(at, "binance_symbols")
+    binance_ms.set_value([binance_ms.options[0]]).run()
+
+    assert not at.exception
+    assert any(
+        "Instruments span more than one calendar" in w.value for w in at.sidebar.warning
+    )
+    periods_field = next(
+        f
+        for f in at.sidebar.number_input
+        if f.label == "Periods per year (annualisation factor)"
+    )
+    # Defaults to 365, not 252: the mix includes a 24/7 instrument (BTCUSDT),
+    # so the business-day equity convention would understate its real
+    # trading frequency.
+    assert periods_field.value == 365
+    assert at.sidebar.button[0].proto.disabled is False
+
+
+def test_mixed_calendar_universe_excludes_intraday_frequency(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """'1h' must not be offered for a mixed-calendar universe: verified
+    closures only work at daily frequency, so ExperimentConfig itself would
+    reject it -- the picker must never offer something the config would
+    then refuse (same principle as source-compatibility filtering)."""
+    from quantlab.data.base import SymbolSuggestion
+    from quantlab.data.binance import BinanceDataSource
+
+    monkeypatch.setattr(
+        BinanceDataSource,
+        "list_trading_symbols",
+        lambda self: [SymbolSuggestion(symbol="BTCUSDT", description="BTC/USDT")],
+    )
+    st.cache_data.clear()  # avoid a real universe cached by an earlier test/run
+
+    at = AppTest.from_file(APP_PATH, default_timeout=60)
+    at.run()
+    freq = next(sb for sb in at.sidebar.selectbox if sb.label == "Frequency")
+    assert "1h" in freq.options  # CSV's default population is all XNYS
+
+    binance_ms = _sidebar_multiselect_by_key(at, "binance_symbols")
+    binance_ms.set_value([binance_ms.options[0]]).run()
+
+    freq = next(sb for sb in at.sidebar.selectbox if sb.label == "Frequency")
+    assert "1h" not in freq.options
+    assert any(
+        "'1h' is unavailable for a mixed-calendar universe" in c.value
+        for c in at.sidebar.caption
+    )
+
+
+def test_periods_per_year_value_flows_into_the_built_config(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Complements the sidebar-only check above: an explicit
+    "Periods per year" value, entered while the universe spans more than
+    one calendar, actually reaches `BacktestConfig.periods_per_year` via
+    `_collect_inputs` / `build_config_from_inputs`. `run_dashboard_backtest`
+    is monkeypatched to capture the config before any data loading, keeping
+    this offline."""
+    import quantlab.dashboard.state as state_module
+    from quantlab.data.base import SymbolSuggestion
+    from quantlab.data.binance import BinanceDataSource
+
+    monkeypatch.setattr(
+        BinanceDataSource,
+        "list_trading_symbols",
+        lambda self: [SymbolSuggestion(symbol="BTCUSDT", description="BTC/USDT")],
+    )
+    st.cache_data.clear()  # avoid a real universe cached by an earlier test/run
+
+    captured: dict[str, Any] = {}
+
+    def fake_run_dashboard_backtest(config: Any) -> Any:
+        captured["config"] = config
+        raise RuntimeError("stop before real data loading")
+
+    monkeypatch.setattr(
+        state_module, "run_dashboard_backtest", fake_run_dashboard_backtest
+    )
+
+    at = AppTest.from_file(APP_PATH, default_timeout=60)
+    at.run()
+    binance_ms = _sidebar_multiselect_by_key(at, "binance_symbols")
+    binance_ms.set_value([binance_ms.options[0]]).run()
+    periods_field = next(
+        f
+        for f in at.sidebar.number_input
+        if f.label == "Periods per year (annualisation factor)"
+    )
+    periods_field.set_value(365).run()
+    at.sidebar.button[0].click().run()
+
+    assert "config" in captured
+    assert captured["config"].backtest.periods_per_year == 365
+
+
+def test_benchmark_symbol_matching_an_instrument_locks_its_source_and_calendar() -> (
+    None
+):
+    at = AppTest.from_file(APP_PATH, default_timeout=60)
+    at.run()
+
+    # SPY is already a tradable instrument via CSV's default population.
+    benchmark = _sidebar_text_input(at, "Benchmark symbol")
+    assert benchmark.value == "SPY"
+    assert any(
+        "SPY is already a tradable instrument" in c.value
+        and "source (csv)" in c.value
+        and "calendar (XNYS)" in c.value
+        for c in at.sidebar.caption
+    )
+    assert not any(sb.label == "Benchmark source" for sb in at.sidebar.selectbox)
+    assert not any(f.label == "Benchmark calendar" for f in at.sidebar.text_input)
+
+
+def test_benchmark_symbol_not_matching_any_instrument_shows_source_and_calendar() -> (
+    None
+):
+    at = AppTest.from_file(APP_PATH, default_timeout=60)
+    at.run()
+    _sidebar_text_input(at, "Benchmark symbol").set_value("NOTINLIST").run()
+
+    assert not any(
+        "is already a tradable instrument" in c.value for c in at.sidebar.caption
+    )
+    source = next(sb for sb in at.sidebar.selectbox if sb.label == "Benchmark source")
+    assert source.key == "benchmark_source_select"
+    assert source.options == ["yahoo", "binance", "csv"]
+    assert source.value == "csv"  # detect_source() can't guess a shape-less string
+    calendar = next(f for f in at.sidebar.text_input if f.label == "Benchmark calendar")
+    assert calendar.key == "benchmark_calendar_input"
+    assert calendar.value == "XNYS"

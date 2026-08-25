@@ -43,11 +43,9 @@ def test_walk_forward_parameter_grid_is_validated_at_config_load() -> None:
     base: dict[str, Any] = {
         "experiment_name": "yaml_grid",
         "data": {
-            "source": "csv",
-            "symbols": ["AAA"],
+            "instruments": [{"symbol": "AAA", "source": "csv", "calendar": "XNYS"}],
             "start_date": "2020-01-01",
             "end_date": "2022-01-01",
-            "market_calendar": "XNYS",
         },
         "strategy": {
             "name": "mean_reversion",
@@ -84,11 +82,9 @@ def _robustness_base_dict(**robustness_overrides: Any) -> dict[str, Any]:
     return {
         "experiment_name": "robustness_cfg",
         "data": {
-            "source": "csv",
-            "symbols": ["AAA"],
+            "instruments": [{"symbol": "AAA", "source": "csv", "calendar": "XNYS"}],
             "start_date": "2020-01-01",
             "end_date": "2022-01-01",
-            "market_calendar": "XNYS",
         },
         "strategy": {
             "name": "mean_reversion",
@@ -103,11 +99,9 @@ def test_robustness_config_defaults_to_everything_disabled() -> None:
         {
             "experiment_name": "no_robustness_block",
             "data": {
-                "source": "csv",
-                "symbols": ["AAA"],
+                "instruments": [{"symbol": "AAA", "source": "csv", "calendar": "XNYS"}],
                 "start_date": "2020-01-01",
                 "end_date": "2022-01-01",
-                "market_calendar": "XNYS",
             },
             "strategy": {
                 "name": "mean_reversion",
@@ -223,6 +217,66 @@ def test_robustness_sensitivity_parameters_accepts_two_valid_keys() -> None:
     }
 
 
+def test_robustness_sensitivity_enabled_requires_parameters() -> None:
+    """Unlike validation.parameter_grid, sensitivity has no meaningful
+    default -- enabling it without naming the x/y axes must fail at config
+    load, not silently run nothing (or fail later, confusingly, only once
+    the sweep itself is attempted)."""
+    with pytest.raises(InvalidConfigurationError, match="parameters is not set"):
+        ExperimentConfig.from_dict(_robustness_base_dict(sensitivity={"enabled": True}))
+
+
+def test_robustness_sensitivity_disabled_still_allows_missing_parameters() -> None:
+    """The requirement above is specifically about `enabled` -- a disabled
+    (default) sensitivity block must still accept `parameters: None`."""
+    config = ExperimentConfig.from_dict(
+        _robustness_base_dict(sensitivity={"enabled": False})
+    )
+    assert config.robustness.sensitivity.parameters is None
+
+
+def test_robustness_sensitivity_parameters_rejects_an_invalid_candidate_value() -> None:
+    """A known, sweepable parameter name doesn't mean every candidate value
+    is valid for this strategy -- mean_reversion's lookback_period must be
+    >= 1, so `[0]` must be rejected at config load the same way
+    validation.parameter_grid already rejects an invalid grid value,
+    rather than only failing once the sensitivity sweep actually runs."""
+    with pytest.raises(InvalidConfigurationError, match="lookback_period"):
+        ExperimentConfig.from_dict(
+            _robustness_base_dict(
+                sensitivity={
+                    "enabled": True,
+                    "parameters": {
+                        "lookback_period": [0],
+                        "entry_zscore": [1.0, 2.0],
+                    },
+                }
+            )
+        )
+
+
+def test_robustness_sensitivity_parameters_rejects_an_invalid_value_combination() -> (
+    None
+):
+    """Each individual value can be independently valid while the
+    *combination* across the two axes still isn't -- this must be checked
+    against the strategy's own combined-parameter validator, not just each
+    axis's values in isolation."""
+    with pytest.raises(InvalidConfigurationError, match="exit_zscore"):
+        ExperimentConfig.from_dict(
+            _robustness_base_dict(
+                sensitivity={
+                    "enabled": True,
+                    "parameters": {
+                        # mean_reversion requires exit_zscore < entry_zscore.
+                        "entry_zscore": [1.0],
+                        "exit_zscore": [2.0],
+                    },
+                }
+            )
+        )
+
+
 def test_flat_accessors(sample_config: ExperimentConfig) -> None:
     """The flat view must mirror the nested config."""
     assert sample_config.data_source == "csv"
@@ -249,11 +303,12 @@ def test_alternative_benchmark_kinds(kind: str, expected_label: str) -> None:
         {
             "experiment_name": "benchmark_kind",
             "data": {
-                "source": "csv",
-                "symbols": ["AAA", "BBB"],
+                "instruments": [
+                    {"symbol": "AAA", "source": "csv", "calendar": "XNYS"},
+                    {"symbol": "BBB", "source": "csv", "calendar": "XNYS"},
+                ],
                 "start_date": "2024-01-01",
                 "end_date": "2024-02-01",
-                "market_calendar": "XNYS",
             },
             "strategy": {"name": "buy_and_hold"},
             "backtest": {"benchmark_kind": kind},
@@ -265,21 +320,25 @@ def test_alternative_benchmark_kinds(kind: str, expected_label: str) -> None:
 
 
 def test_non_symbol_benchmark_rejects_benchmark_symbol() -> None:
-    with pytest.raises(InvalidConfigurationError, match="benchmark_symbol"):
+    with pytest.raises(InvalidConfigurationError, match="benchmark is only valid"):
         ExperimentConfig.from_dict(
             {
                 "experiment_name": "benchmark_kind",
                 "data": {
-                    "source": "csv",
-                    "symbols": ["AAA"],
+                    "instruments": [
+                        {"symbol": "AAA", "source": "csv", "calendar": "XNYS"}
+                    ],
                     "start_date": "2024-01-01",
                     "end_date": "2024-02-01",
-                    "market_calendar": "XNYS",
                 },
                 "strategy": {"name": "buy_and_hold"},
                 "backtest": {
                     "benchmark_kind": "cash",
-                    "benchmark_symbol": "SPY",
+                    "benchmark": {
+                        "symbol": "SPY",
+                        "source": "csv",
+                        "calendar": "XNYS",
+                    },
                 },
             }
         )
@@ -290,15 +349,36 @@ def test_symbols_are_normalised() -> None:
         {
             "experiment_name": "x",
             "data": {
-                "symbols": [" spy ", "spy", "QQQ", "qqq"],
+                "instruments": [
+                    {"symbol": " spy ", "source": "yahoo", "calendar": "XNYS"},
+                    {"symbol": "QQQ", "source": "yahoo", "calendar": "XNYS"},
+                ],
                 "start_date": "2020-01-01",
                 "end_date": "2021-01-01",
             },
             "strategy": {"name": "buy_and_hold"},
         }
     )
-    # Deduped, uppercased, order preserved.
+    # Stripped and uppercased.
     assert cfg.symbols == ["SPY", "QQQ"]
+
+
+def test_duplicate_symbol_across_instruments_is_rejected() -> None:
+    with pytest.raises(InvalidConfigurationError, match="Duplicate symbol"):
+        ExperimentConfig.from_dict(
+            {
+                "experiment_name": "x",
+                "data": {
+                    "instruments": [
+                        {"symbol": "SPY", "source": "yahoo", "calendar": "XNYS"},
+                        {"symbol": "spy", "source": "yahoo", "calendar": "XNYS"},
+                    ],
+                    "start_date": "2020-01-01",
+                    "end_date": "2021-01-01",
+                },
+                "strategy": {"name": "buy_and_hold"},
+            }
+        )
 
 
 def test_missing_value_policy_enum() -> None:
@@ -306,7 +386,9 @@ def test_missing_value_policy_enum() -> None:
         {
             "experiment_name": "x",
             "data": {
-                "symbols": ["SPY"],
+                "instruments": [
+                    {"symbol": "SPY", "source": "yahoo", "calendar": "XNYS"}
+                ],
                 "start_date": "2020-01-01",
                 "end_date": "2021-01-01",
                 "missing_value_policy": "forward_fill",
@@ -326,7 +408,9 @@ def test_invalid_forward_fill_limit_is_rejected(value: object) -> None:
             {
                 "experiment_name": "x",
                 "data": {
-                    "symbols": ["SPY"],
+                    "instruments": [
+                        {"symbol": "SPY", "source": "yahoo", "calendar": "XNYS"}
+                    ],
                     "start_date": "2020-01-01",
                     "end_date": "2021-01-01",
                     "missing_value_policy": "forward_fill",
@@ -343,7 +427,9 @@ def test_non_default_forward_fill_limit_requires_forward_fill_policy() -> None:
             {
                 "experiment_name": "x",
                 "data": {
-                    "symbols": ["SPY"],
+                    "instruments": [
+                        {"symbol": "SPY", "source": "yahoo", "calendar": "XNYS"}
+                    ],
                     "start_date": "2020-01-01",
                     "end_date": "2021-01-01",
                     "missing_value_policy": "drop",
@@ -360,7 +446,9 @@ def test_end_before_start_is_rejected() -> None:
             {
                 "experiment_name": "x",
                 "data": {
-                    "symbols": ["SPY"],
+                    "instruments": [
+                        {"symbol": "SPY", "source": "yahoo", "calendar": "XNYS"}
+                    ],
                     "start_date": "2021-01-01",
                     "end_date": "2020-01-01",
                 },
@@ -375,12 +463,10 @@ def test_same_day_intraday_experiment_is_allowed() -> None:
         {
             "experiment_name": "same_day",
             "data": {
-                "source": "csv",
-                "symbols": ["SPY"],
+                "instruments": [{"symbol": "SPY", "source": "csv", "calendar": "XNYS"}],
                 "start_date": "2024-01-02",
                 "end_date": "2024-01-02",
                 "frequency": "1h",
-                "market_calendar": "XNYS",
             },
             "strategy": {"name": "buy_and_hold"},
         }
@@ -394,7 +480,9 @@ def test_same_day_non_intraday_experiment_is_rejected() -> None:
             {
                 "experiment_name": "same_day_daily",
                 "data": {
-                    "symbols": ["SPY"],
+                    "instruments": [
+                        {"symbol": "SPY", "source": "yahoo", "calendar": "XNYS"}
+                    ],
                     "start_date": "2024-01-02",
                     "end_date": "2024-01-02",
                     "frequency": "1d",
@@ -411,7 +499,9 @@ def test_unknown_key_is_rejected() -> None:
             {
                 "experiment_name": "x",
                 "data": {
-                    "symbols": ["SPY"],
+                    "instruments": [
+                        {"symbol": "SPY", "source": "yahoo", "calendar": "XNYS"}
+                    ],
                     "start_date": "2020-01-01",
                     "end_date": "2021-01-01",
                     "typo_field": 123,
@@ -495,7 +585,9 @@ def test_periods_per_year_from_frequency() -> None:
         {
             "experiment_name": "x",
             "data": {
-                "symbols": ["BTCUSDT"],
+                "instruments": [
+                    {"symbol": "BTCUSDT", "source": "binance", "calendar": "24/7"}
+                ],
                 "start_date": "2020-01-01",
                 "end_date": "2021-01-01",
                 "frequency": "1d",
@@ -505,6 +597,42 @@ def test_periods_per_year_from_frequency() -> None:
         }
     )
     assert cfg.periods_per_year == 365
+
+
+def test_periods_per_year_derived_from_uniform_calendar_without_override() -> None:
+    cfg = ExperimentConfig.from_dict(
+        {
+            "experiment_name": "x",
+            "data": {
+                "instruments": [
+                    {"symbol": "BTCUSDT", "source": "binance", "calendar": "24/7"}
+                ],
+                "start_date": "2020-01-01",
+                "end_date": "2021-01-01",
+                "frequency": "1d",
+            },
+            "strategy": {"name": "buy_and_hold"},
+        }
+    )
+    assert cfg.periods_per_year == 365
+
+
+def test_mixed_calendars_require_explicit_periods_per_year() -> None:
+    with pytest.raises(InvalidConfigurationError, match="Mixed market calendars"):
+        ExperimentConfig.from_dict(
+            {
+                "experiment_name": "x",
+                "data": {
+                    "instruments": [
+                        {"symbol": "AAPL", "source": "yahoo", "calendar": "XNYS"},
+                        {"symbol": "BTCUSDT", "source": "binance", "calendar": "24/7"},
+                    ],
+                    "start_date": "2020-01-01",
+                    "end_date": "2021-01-01",
+                },
+                "strategy": {"name": "buy_and_hold"},
+            }
+        )
 
 
 def test_yaml_roundtrip(sample_config: ExperimentConfig, tmp_path: Path) -> None:

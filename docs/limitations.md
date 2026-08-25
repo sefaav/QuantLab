@@ -15,12 +15,47 @@ result.
   them implicitly assume today's constituents existed throughout the period,
   which can overstate results.
 - **Single venue** for crypto data (Binance): no consolidated tape.
-- **One market calendar per experiment**: Yahoo experiments must choose either
-  the XNYS approximation (for US-listed equities and ETFs) or the 24/7 calendar
-  (for continuously traded instruments such as crypto). Binance uses 24/7.
-  Futures, foreign exchanges and instruments with other trading schedules are
-  not modelled accurately by either choice, and mixed-calendar universes are
-  not supported.
+- **Per-instrument calendars are an approximation, not a live feed**: each
+  instrument declares its own source and calendar (any name recognised by
+  `pandas_market_calendars`, or `24/7`), and a mixed-calendar portfolio (e.g.
+  US equities alongside crypto) is supported at daily frequency — closed
+  sessions are detected per symbol, valued at the last known price with zero
+  return and zero volume, and never traded. Weekly/monthly bucket settlement
+  and Yahoo's daily timestamps resolve against each instrument's own
+  calendar rather than a UTC-midnight approximation — but weekly/monthly
+  **rebalancing** only does so when every instrument in the portfolio shares
+  one calendar; a genuinely mixed-calendar portfolio (e.g. equities
+  alongside crypto) still buckets rebalance dates against the raw UTC
+  boundary, the same documented approximation used elsewhere for a
+  mixed-calendar universe. This coverage is deliberately narrower than "fully
+  supported" for two reasons: it does not extend to every calendar detail
+  (e.g. an official intraday session break, like XHKG's lunch recess, is
+  handled for hourly cache-coverage and gap-detection checks but not modelled
+  anywhere else), and it has not been exercised against every calendar
+  `pandas_market_calendars` recognises — only the ones this project's own
+  test suite covers (XNYS, XHKG, XASX, XSAU, 24/7). But the calendar is
+  still a static,
+  best-effort schedule (holidays, weekends), not a real-time venue-status
+  feed, so an unscheduled closure (an exchange halt, an outage) is not
+  detected as a closure and instead falls under the ordinary
+  `missing_value_policy` handling for gaps. Intraday (`1h`) frequency does
+  not support mixed calendars at all yet and is rejected at config load —
+  verified-closure handling only operates at daily frequency.
+- **Rolling-window features are diluted in a mixed-calendar universe**: a
+  verified closure's synthetic bar is exactly flat (zero return, zero
+  volume), but momentum lookbacks, volatility windows, ADV windows and
+  technical indicators all still count it as one more *period* — for a
+  session-bound instrument sharing a combined timeline with an always-open
+  one (e.g. equities alongside crypto), a "252-period" window therefore spans
+  *more* than 252 real trading sessions, and the flat bars pull volatility/ADV
+  estimates down. QuantLab warns about this at config load
+  (`DataConfig._warn_if_mixed_calendars_dilute_windowed_features`) but does
+  not correct it: doing so properly would mean computing every instrument's
+  features on its own native calendar before aligning signals, a
+  substantially larger redesign than today's shared-timeline architecture.
+  Prefer a single shared calendar per experiment when window-based estimates
+  need to be precise; treat mixed-calendar results as directionally
+  informative rather than exact until this is addressed.
 
 ## Execution
 
@@ -49,13 +84,24 @@ result.
 - **Historical results are not predictive**. Positive backtests, walk-forward,
   bootstrap and stress-test outcomes describe the past under stated
   assumptions; they do not guarantee future performance.
-- **Long calculations are not checkpointed**: interrupting walk-forward,
-  sensitivity, bootstrap, permutation or stress analysis requires restarting
-  that calculation. Downloaded market data remain reusable through the cache.
-- **Interface scope differs**: the dashboard currently exposes holdout and
-  stress analysis, while walk-forward, sensitivity, bootstrap and permutation
-  are available through the CLI, notebooks or Python API as documented in the
-  validation guide.
+- **Checkpointing covers fold-level progress, not every stage**: the CLI's
+  `walk-forward`, `stress-test` and `sensitivity` commands persist progress
+  after each completed fold, scenario block or grid cell (never a partially
+  computed one) so an interrupted run resumes instead of restarting from
+  scratch, gated on the run's config/data/code/dependency provenance still
+  matching. Checkpoint files are pickle and trusted-local-file-only (see
+  `quantlab.validation.checkpoint`) — never point one at a file from an
+  untrusted source. Downloaded market data remain separately reusable
+  through the cache regardless.
+- **Interface scope**: the dashboard's Backtest mode covers a plain backtest,
+  chronological holdout, bootstrap, permutation test and sensitivity;
+  Walk-forward mode covers walk-forward validation itself plus its own
+  walk-forward-OOS-aware stress tests and sensitivity, and also exposes
+  bootstrap and permutation test — mode-agnostic techniques that resample
+  already-realised returns rather than re-running selection, so the same
+  functions apply directly to the walk-forward OOS series. The Python API and
+  notebooks expose the same underlying functions directly for anything the
+  dashboard doesn't surface.
 
 ## Reproducibility
 

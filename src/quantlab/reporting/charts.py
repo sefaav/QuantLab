@@ -174,38 +174,23 @@ def monthly_returns_heatmap(result: BacktestResult) -> Figure:
     return fig
 
 
-#: Columns `run_parameter_sensitivity`/`run_walk_forward_parameter_sensitivity`
-#: always emit alongside the two swept-parameter columns — whatever is left
-#: over identifies those two parameter names without the caller having to
-#: pass them separately.
-_SENSITIVITY_METRIC_COLUMNS = frozenset(
-    {"sharpe", "cagr", "max_drawdown", "turnover", "num_trades", "status", "error"}
-)
-
-
 def sensitivity_heatmap_chart(
     sensitivity: pd.DataFrame, metric: str = "sharpe"
 ) -> Figure:
     """Plot a 2-parameter sensitivity sweep as a metric heatmap.
 
-    Infers which two columns are the swept parameters from whatever is left
-    after excluding `_SENSITIVITY_METRIC_COLUMNS`, mirroring the dashboard's
-    interactive Plotly heatmap (`components.render_sensitivity_heatmap`) in
-    a static form for the HTML report.
+    Infers which two columns are the swept parameters directly from
+    `sensitivity` itself (see `infer_sensitivity_parameter_columns`),
+    mirroring the dashboard's interactive Plotly heatmap
+    (`components.render_sensitivity_heatmap`) in a static form for the HTML
+    report.
     """
-    from quantlab.validation.parameter_sensitivity import sensitivity_heatmap_data
+    from quantlab.validation.parameter_sensitivity import (
+        infer_sensitivity_parameter_columns,
+        sensitivity_heatmap_data,
+    )
 
-    parameter_columns = [
-        column
-        for column in sensitivity.columns
-        if column not in _SENSITIVITY_METRIC_COLUMNS
-    ]
-    if len(parameter_columns) != 2:
-        raise ValueError(
-            "sensitivity must have exactly two swept-parameter columns; found "
-            f"{parameter_columns}."
-        )
-    parameter_x, parameter_y = parameter_columns
+    parameter_x, parameter_y = infer_sensitivity_parameter_columns(sensitivity)
     pivot = sensitivity_heatmap_data(sensitivity, parameter_x, parameter_y, metric)
 
     fig, ax = _new_figure((7, max(2.5, 0.5 * len(pivot.index) + 1)))

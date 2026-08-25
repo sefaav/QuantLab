@@ -29,14 +29,14 @@ def test_parquet_roundtrip(tmp_path: Path) -> None:
 def test_symbol_cache_merge_and_cover(tmp_path: Path) -> None:
     storage = ParquetStorage(cache_dir=tmp_path / "cache", metadata_dir=tmp_path / "md")
     early = make_ohlcv("AAA", np.linspace(100, 105, 6), start="2020-01-01")
-    storage.write_symbol(early, "yahoo", "AAA", "1d")
+    storage.write_symbol(early, "yahoo", "AAA", "1d", calendar="XNYS")
     assert storage.cache_covers(
-        "yahoo", "AAA", "1d", date(2020, 1, 1), date(2020, 1, 3)
+        "yahoo", "AAA", "1d", date(2020, 1, 1), date(2020, 1, 3), calendar="XNYS"
     )
     # A later slice is merged in without duplicating timestamps.
     later = make_ohlcv("AAA", np.linspace(106, 112, 7), start="2020-01-09")
-    storage.write_symbol(later, "yahoo", "AAA", "1d")
-    merged = storage.read_symbol("yahoo", "AAA", "1d")
+    storage.write_symbol(later, "yahoo", "AAA", "1d", calendar="XNYS")
+    merged = storage.read_symbol("yahoo", "AAA", "1d", calendar="XNYS")
     assert merged is not None
     assert not merged.duplicated(subset=[TIMESTAMP]).any()
 
@@ -71,12 +71,13 @@ def test_csv_source_loader(tmp_path: Path) -> None:
         {
             "experiment_name": "csv_test",
             "data": {
-                "source": "csv",
-                "symbols": ["AAA", "BBB"],
+                "instruments": [
+                    {"symbol": "AAA", "source": "csv", "calendar": "XNYS"},
+                    {"symbol": "BBB", "source": "csv", "calendar": "XNYS"},
+                ],
                 "start_date": "2020-01-01",
                 "end_date": "2020-02-15",
                 "missing_value_policy": "drop",
-                "market_calendar": "XNYS",
             },
             "strategy": {"name": "buy_and_hold"},
         }

@@ -30,11 +30,6 @@ from quantlab.data.base import (
     SymbolSuggestion,
     ensure_canonical_schema,
 )
-from quantlab.data.calendar import (
-    daily_equity_bucket_settlement,
-    monthly_bucket_settlement,
-    weekly_bucket_settlement,
-)
 from quantlab.exceptions import DataDownloadError
 from quantlab.logging_config import get_logger
 
@@ -42,13 +37,6 @@ logger = get_logger(__name__)
 
 #: Map QuantLab frequency strings to yfinance ``interval`` values.
 _INTERVAL = {"1d": "1d", "1h": "1h", "1w": "1wk", "1mo": "1mo"}
-
-#: Fixed bucket lengths; monthly settlement uses calendar arithmetic.
-_INTERVAL_TIMEDELTA: dict[str, pd.Timedelta] = {
-    "1d": pd.Timedelta(days=1),
-    "1h": pd.Timedelta(hours=1),
-    "1wk": pd.Timedelta(weeks=1),
-}
 
 #: Yahoo's unofficial, public, unauthenticated symbol-search endpoint. Used
 #: only for dashboard autocomplete, not for downloading price data.
@@ -160,7 +148,7 @@ class YahooFinanceDataSource(MarketDataSource):
         end: date,
         frequency: str = "1d",
         *,
-        is_247_market: bool = False,
+        calendar: str = "XNYS",
     ) -> pd.DataFrame:
         """Download and normalise data for ``symbols``.
 
@@ -169,7 +157,19 @@ class YahooFinanceDataSource(MarketDataSource):
             start: Inclusive start date.
             end: Inclusive end date.
             frequency: One of ``1d``, ``1h``, ``1w``, ``1mo``.
-            is_247_market: Use continuous UTC settlement instead of XNYS.
+            calendar: Accepted for interface parity with other sources but
+                unused: the returned frame is never filtered by settlement
+                here. Two experiments can request the same Yahoo symbol under
+                different calendars, and the download cache (keyed only by
+                source/symbol/frequency, with no calendar component) must
+                stay identical either way — settlement-dependent filtering
+                (which bars are still forming, and which fall within the
+                requested end date) is applied only after any cache read/
+                write, by :class:`~quantlab.data.loader.DataLoader` (see
+                :meth:`~quantlab.data.storage.ParquetStorage.write_symbol`'s
+                own docstring). Compare
+                :class:`~quantlab.data.binance.BinanceDataSource`, which
+                likewise accepts but ignores ``calendar``.
 
         Returns:
             Canonical long OHLCV frame for all successfully downloaded symbols.
@@ -190,8 +190,8 @@ class YahooFinanceDataSource(MarketDataSource):
             raise DataDownloadError("Yahoo start and end must be date values.")
         if start > end:
             raise DataDownloadError("Yahoo start must be on or before end.")
-        if not isinstance(is_247_market, bool):
-            raise DataDownloadError("is_247_market must be a boolean.")
+        if not isinstance(calendar, str) or not calendar.strip():
+            raise DataDownloadError("calendar must be a non-empty string.")
 
         if not isinstance(frequency, str):
             raise DataDownloadError("Yahoo frequency must be a string.")
@@ -202,15 +202,11 @@ class YahooFinanceDataSource(MarketDataSource):
                 f"Supported: {sorted(_INTERVAL)}."
             )
 
-        # Use one cutoff instant for every symbol in this request.
-        now = pd.Timestamp.now(tz="UTC").tz_localize(None)
         frames: list[pd.DataFrame] = []
         failures: dict[str, str] = {}
         for symbol in normalised_symbols:
             try:
-                frames.append(
-                    self._download_one(symbol, start, end, interval, now, is_247_market)
-                )
+                frames.append(self._download_one(symbol, start, end, interval))
             except DataDownloadError as exc:
                 logger.error("Giving up on %s: %s", symbol, exc)
                 failures[symbol] = str(exc)
@@ -233,8 +229,6 @@ class YahooFinanceDataSource(MarketDataSource):
         start: date,
         end: date,
         interval: str,
-        now: pd.Timestamp,
-        is_247_market: bool = False,
     ) -> pd.DataFrame:
         """Download a single symbol with retries and normalise it."""
         try:
@@ -272,19 +266,11 @@ class YahooFinanceDataSource(MarketDataSource):
                     last_error = DataDownloadError(f"Empty response for {symbol}.")
                 else:
                     try:
-                        normalised = self._normalise(
-                            raw, symbol, interval, now, end, is_247_market
-                        )
+                        return self._normalise(raw, symbol, interval)
                     except Exception as exc:
                         raise DataDownloadError(
                             f"Yahoo returned an invalid schema for {symbol}: {exc}"
                         ) from exc
-                    if normalised.empty:
-                        raise DataDownloadError(
-                            f"Yahoo returned data for {symbol}, but every bar was "
-                            "still forming or settled after the requested end."
-                        )
-                    return normalised
             if attempt < self.max_retries:
                 time.sleep(self.retry_backoff_seconds * attempt)
         raise DataDownloadError(
@@ -297,14 +283,20 @@ class YahooFinanceDataSource(MarketDataSource):
         raw: pd.DataFrame,
         symbol: str,
         interval: str,
-        now: pd.Timestamp,
-        end: date,
-        is_247_market: bool = False,
     ) -> pd.DataFrame:
         """Convert one Yahoo frame to canonical OHLCV.
 
-        Bars are retained only after their XNYS or 24/7 settlement boundary
-        and only when that boundary is inside the requested inclusive range.
+        Returns every row Yahoo provided, including a bar for a still-forming
+        session -- settlement-dependent filtering (which bars are still
+        forming, and which fall within the requested end date) is applied
+        only after any cache read/write, by
+        :class:`~quantlab.data.loader.DataLoader`. Baking a settlement
+        opinion in here, before the frame is ever cached, would make the
+        cache's on-disk content depend on which calendar the first caller to
+        fill it happened to request, even though the cache key (source/
+        symbol/frequency) carries no calendar component -- see
+        :meth:`~quantlab.data.storage.ParquetStorage.write_symbol`'s own
+        docstring for the invariant this preserves.
         """
         df = raw.copy()
         # Flatten a possible MultiIndex column (field, ticker) → field.
@@ -325,10 +317,26 @@ class YahooFinanceDataSource(MarketDataSource):
                 "Returns may omit distributions or split adjustments.",
                 symbol,
             )
+        if interval in {"1d", "1wk", "1mo"}:
+            # A calendar-date granularity (daily/weekly/monthly) has no
+            # meaningful time-of-day -- the timestamp represents a *local*
+            # trading date, not a specific UTC instant. Converting through
+            # UTC first (as the intraday branch below correctly does) would
+            # shift that date for any exchange ahead of UTC (e.g. XASX
+            # +10/+11, XHKG +8): a tz-aware Yahoo response of, say, Monday
+            # 00:00 AEDT becomes Sunday 13:00 UTC, silently turning a
+            # Monday session into "Sunday". Stripping the timezone directly
+            # keeps the local wall-clock date unchanged; a no-op when Yahoo
+            # already returns naive daily timestamps.
+            bar_timestamps = pd.to_datetime(df[ts_col]).dt.tz_localize(None)
+        else:
+            # Intraday: the timestamp is a genuine instant, so the UTC
+            # conversion below is correct and required (see
+            # test_yahoo_intraday_timezone_converted_to_utc_not_stripped_naively).
+            bar_timestamps = pd.to_datetime(df[ts_col], utc=True).dt.tz_localize(None)
         out = pd.DataFrame(
             {
-                # Convert aware timestamps to UTC before removing the timezone.
-                TIMESTAMP: pd.to_datetime(df[ts_col], utc=True).dt.tz_localize(None),
+                TIMESTAMP: bar_timestamps,
                 SYMBOL: symbol.upper(),
                 OPEN: pd.to_numeric(df["Open"], errors="coerce"),
                 HIGH: pd.to_numeric(df["High"], errors="coerce"),
@@ -343,35 +351,4 @@ class YahooFinanceDataSource(MarketDataSource):
             timestamps = pd.DatetimeIndex(out[TIMESTAMP])
             if timestamps.hasnans:
                 raise ValueError("Yahoo returned a missing or invalid timestamp.")
-            if interval == "1mo":
-                bar_end = pd.DatetimeIndex(
-                    [
-                        monthly_bucket_settlement(
-                            timestamp, is_247_market=is_247_market
-                        )
-                        for timestamp in timestamps
-                    ]
-                )
-            elif interval == "1wk":
-                bar_end = pd.DatetimeIndex(
-                    [
-                        weekly_bucket_settlement(timestamp, is_247_market=is_247_market)
-                        for timestamp in timestamps
-                    ]
-                )
-            elif interval == "1d" and not is_247_market:
-                bar_end = pd.DatetimeIndex(
-                    [
-                        daily_equity_bucket_settlement(timestamp)
-                        for timestamp in timestamps
-                    ]
-                )
-            else:
-                bar_end = timestamps + _INTERVAL_TIMEDELTA.get(
-                    interval, pd.Timedelta(0)
-                )
-            end_boundary = pd.Timestamp(end) + pd.Timedelta(days=1)
-            out = out[(bar_end <= now) & (bar_end <= end_boundary)].reset_index(
-                drop=True
-            )
         return out

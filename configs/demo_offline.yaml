@@ -4,18 +4,24 @@
 experiment_name: demo_offline_momentum
 
 data:
-  source: csv
-  symbols:
-    - SPY
-    - QQQ
-    - TLT
-    - GLD
+  # The synthetic symbols model US equity ETFs.
+  instruments:
+    - symbol: SPY
+      source: csv
+      calendar: XNYS
+    - symbol: QQQ
+      source: csv
+      calendar: XNYS
+    - symbol: TLT
+      source: csv
+      calendar: XNYS
+    - symbol: GLD
+      source: csv
+      calendar: XNYS
   start_date: "2019-01-01"
   end_date: "2023-10-30"
   frequency: "1d"
   missing_value_policy: "drop"
-  # The synthetic symbols model US equity ETFs.
-  market_calendar: XNYS
   # Allow the installed package to use its bundled synthetic demo files.
   use_bundled_demo_data: true
 
@@ -46,7 +52,10 @@ execution:
 
 backtest:
   initial_capital: 100000
-  benchmark_symbol: SPY
+  benchmark:
+    symbol: SPY
+    source: csv
+    calendar: XNYS
   risk_free_rate: 0.02
   periods_per_year: 252
 

@@ -287,6 +287,12 @@ def _run_active_validation(
                 f"windows (train={train_window}, validation={validation_window}, "
                 f"test={test_window})."
             )
+        # WalkForwardValidator.run() has no data_quality_report parameter of
+        # its own, so the saved OOS result would otherwise never carry the
+        # data-quality warnings a plain backtest attaches below -- attach it
+        # here instead, so a walk-forward report can surface the same
+        # gap/frequency-mismatch evidence a plain backtest's report would.
+        wf.oos_result.metadata["data_quality"] = report.to_dict()
         return wf.oos_result, wf
 
     from quantlab.backtesting.runner import run_backtest_from_config
@@ -318,9 +324,14 @@ def _attach_walk_forward_evidence(
         return
     validation_artifacts.update(_walk_forward_validation_artifacts(wf))
     robustness_extra["walk_forward"] = wf.summary_table()
-    result.metadata["walk_forward_oos_metrics"] = wf.oos_metrics(
-        result.config.periods_per_year, result.config.risk_free_rate
-    )
+    # `result` (and its already-complete `.metrics`, computed via the same
+    # full trade-log/benchmark/metrics pipeline as any BacktestResult) *is*
+    # `wf.oos_result` at every caller of this function -- reuse it rather
+    # than wf.oos_metrics()'s separate M.compute_metrics(oos_returns,
+    # oos_equity) recomputation, which only has the stitched return/equity
+    # series to work from and so omits benchmark comparisons, gross/net,
+    # turnover and every other metric the full pipeline already derived.
+    result.metadata["walk_forward_oos_metrics"] = dict(result.metrics)
 
 
 def _compute_stress_tests(
@@ -384,6 +395,14 @@ def _compute_bootstrap(
         initial_capital=cfg.initial_capital,
         risk_free_rate=cfg.risk_free_rate,
     )
+    # Record what was actually used, not just what the YAML says -- a CLI
+    # override (--n-iterations/--block-size) would otherwise leave the saved
+    # metadata silently describing a different run than the one that
+    # actually produced these numbers.
+    result.metadata["bootstrap_run_params"] = {
+        "n_iterations": effective_n_iterations,
+        "block_size": effective_block_size,
+    }
     return boot.summary()
 
 
@@ -401,13 +420,19 @@ def _compute_permutation_test(
         if n_iterations is not None
         else cfg.robustness.permutation_test.n_iterations
     )
-    return monte_carlo_permutation(
+    outcome = monte_carlo_permutation(
         result.returns,
         n_iterations=effective_n_iterations,
         seed=cfg.random_seed,
         periods_per_year=cfg.periods_per_year,
         risk_free_rate=cfg.risk_free_rate,
     )
+    # See _compute_bootstrap: record the effective (possibly CLI-overridden)
+    # parameter, not just the YAML default.
+    result.metadata["permutation_test_run_params"] = {
+        "n_iterations": effective_n_iterations,
+    }
+    return outcome
 
 
 def _resolve_sensitivity_axes(
@@ -628,7 +653,7 @@ def walk_forward(
         from quantlab.backtesting.runner import run_backtest_from_config
         from quantlab.data.loader import DataLoader
         from quantlab.validation.checkpoint import clear_checkpoint
-        from quantlab.validation.robustness import run_stress_tests
+        from quantlab.validation.robustness import stress_test_checkpoint_paths
         from quantlab.validation.walk_forward import (
             WalkForwardValidator,
             resolve_walk_forward_windows,
@@ -639,7 +664,8 @@ def walk_forward(
         stress_checkpoint = out / ".checkpoint_stress_test.pkl"
         if fresh:
             clear_checkpoint(wf_checkpoint)
-            clear_checkpoint(stress_checkpoint)
+            for path in stress_test_checkpoint_paths(stress_checkpoint):
+                clear_checkpoint(path)
 
         _echo_step("Loading and validating data")
         data, report = DataLoader().load(cfg)
@@ -682,16 +708,37 @@ def walk_forward(
             )
 
         _echo_step("Running stress tests")
-        stress = run_stress_tests(
+        # Walk-forward-OOS-aware, matching the dedicated `stress-test` command
+        # and the dashboard for this same config -- never a plain full-sample
+        # re-run of the scenarios, which would silently mix a different
+        # validation methodology into the same "walk_forward" evidence bundle
+        # (see _compute_stress_tests). wf.folds non-empty is not itself a
+        # guarantee wf.oos_result exists (see its docstring: None only when
+        # no fold produced any OOS weights) -- run_walk_forward_stress_tests
+        # requires it, so fall back to the full-sample scenarios in that
+        # edge case rather than fail the whole command, the same graceful
+        # degradation the OOS-metrics fallback just below already applies.
+        stress = _compute_stress_tests(
             data,
             cfg,
+            wf if wf.oos_result is not None else None,
             on_progress=_make_cli_progress_callback("Stress tests"),
             checkpoint_path=stress_checkpoint,
         )
 
         # Attach OOS metrics to a fresh full-sample result before saving one bundle.
         result = run_backtest_from_config(data, cfg, data_quality_report=report)
-        oos = wf.oos_metrics(cfg.periods_per_year, cfg.risk_free_rate)
+        # Reuse wf.oos_result.metrics (built via the same full trade-log/
+        # benchmark/metrics pipeline as `result` itself) rather than
+        # wf.oos_metrics()'s separate, less complete M.compute_metrics(
+        # oos_returns, oos_equity) recomputation -- `wf.folds` non-empty
+        # (checked above) is not itself a guarantee oos_result exists (see
+        # its docstring), so still fall back for that edge case.
+        oos = (
+            dict(wf.oos_result.metrics)
+            if wf.oos_result is not None
+            else wf.oos_metrics(cfg.periods_per_year, cfg.risk_free_rate)
+        )
         result.metadata["walk_forward_oos_metrics"] = oos
         result.metadata["walk_forward_parameter_grid"] = grid
         result.metadata["walk_forward_windows"] = {
@@ -756,13 +803,15 @@ def stress_test(
         cfg = _load_config(_resolve_config_path(config, shipped_config))
         from quantlab.data.loader import DataLoader
         from quantlab.validation.checkpoint import clear_checkpoint
+        from quantlab.validation.robustness import stress_test_checkpoint_paths
 
         out = GENERATED_REPORTS_DIR / cfg.experiment_name
         wf_checkpoint = out / ".checkpoint_walk_forward.pkl"
         stress_checkpoint = out / ".checkpoint_stress_test.pkl"
         if fresh:
             clear_checkpoint(wf_checkpoint)
-            clear_checkpoint(stress_checkpoint)
+            for path in stress_test_checkpoint_paths(stress_checkpoint):
+                clear_checkpoint(path)
 
         _echo_step("Loading and validating data")
         data, report = DataLoader().load(cfg)
@@ -811,11 +860,13 @@ def bootstrap(
     n_iterations: int | None = typer.Option(
         None,
         "--n-iterations",
+        min=1,
         help="Override robustness.bootstrap.n_iterations from the config.",
     ),
     block_size: int | None = typer.Option(
         None,
         "--block-size",
+        min=1,
         help="Override robustness.bootstrap.block_size from the config.",
     ),
     fresh: bool = typer.Option(
@@ -880,6 +931,7 @@ def permutation_test(
     n_iterations: int | None = typer.Option(
         None,
         "--n-iterations",
+        min=1,
         help="Override robustness.permutation_test.n_iterations from the config.",
     ),
     fresh: bool = typer.Option(
@@ -1007,6 +1059,16 @@ def sensitivity(
             checkpoint_path=sensitivity_checkpoint,
         )
 
+        # Record the axes actually used, not just that a sweep ran -- these
+        # may have come from a CLI override rather than
+        # robustness.sensitivity.parameters in the saved config.yaml.
+        result.metadata["sensitivity_run_params"] = {
+            "parameter_x": x_name,
+            "values_x": x_values,
+            "parameter_y": y_name,
+            "values_y": y_values,
+        }
+
         validation_artifacts: dict[str, Any] = {"sensitivity.csv": sens}
         robustness_extra: dict[str, Any] = {"sensitivity": sens}
         _attach_walk_forward_evidence(
@@ -1053,6 +1115,7 @@ def robustness(
         cfg = _load_config(_resolve_config_path(config, shipped_config))
         from quantlab.data.loader import DataLoader
         from quantlab.validation.checkpoint import clear_checkpoint
+        from quantlab.validation.robustness import stress_test_checkpoint_paths
 
         out = GENERATED_REPORTS_DIR / cfg.experiment_name
         wf_checkpoint = out / ".checkpoint_walk_forward.pkl"
@@ -1060,7 +1123,8 @@ def robustness(
         sensitivity_checkpoint = out / ".checkpoint_sensitivity.pkl"
         if fresh:
             clear_checkpoint(wf_checkpoint)
-            clear_checkpoint(stress_checkpoint)
+            for path in stress_test_checkpoint_paths(stress_checkpoint):
+                clear_checkpoint(path)
             clear_checkpoint(sensitivity_checkpoint)
 
         _echo_step("Loading and validating data")

@@ -12,7 +12,7 @@ import pandas as pd
 
 from quantlab.backtesting.runner import run_backtest_from_config
 from quantlab.config import ExperimentConfig
-from quantlab.constants import SYMBOL
+from quantlab.constants import SYMBOL, TIMESTAMP
 from quantlab.exceptions import QuantLabError
 from quantlab.logging_config import get_logger
 from quantlab.risk import metrics as M
@@ -76,6 +76,95 @@ def _failed_row(name: str, error: QuantLabError) -> dict[str, object]:
     }
 
 
+_STRESS_METRIC_COLUMNS = ("total_return", "cagr", "sharpe", "max_drawdown")
+
+
+def _stress_row_is_consistent(row: dict[str, object]) -> bool:
+    """Return whether a checkpointed row's status, metrics and error agree.
+
+    Mirrors the two shapes ``_metrics_row``/``_failed_row`` actually
+    produce: ``status == "ok"`` means every metric is a finite number and
+    ``error`` is ``None``; ``status == "failed"`` means every metric is NaN
+    and ``error`` is a real (non-empty) message. A checkpoint claiming
+    success while carrying NaN metrics, or failure while carrying finite
+    ones and no error, is corrupted regardless of whether its schema and
+    scenario name already checked out.
+    """
+    status = row.get("status")
+    error = row.get("error")
+    metric_values = [row.get(name) for name in _STRESS_METRIC_COLUMNS]
+    if status == "ok":
+        if error is not None:
+            return False
+        return all(
+            isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and math.isfinite(value)
+            for value in metric_values
+        )
+    if status == "failed":
+        if not (isinstance(error, str) and error):
+            return False
+        return all(
+            isinstance(value, float) and math.isnan(value) for value in metric_values
+        )
+    return False
+
+
+def _baseline_returns_is_valid(
+    baseline: object,
+    data: pd.DataFrame,
+    baseline_row: dict[str, object] | None,
+    periods_per_year: int,
+    risk_free_rate: float,
+) -> bool:
+    """Return whether a checkpointed ``baseline_returns`` is trustworthy.
+
+    A bare ``isinstance(baseline, pd.Series)`` check would accept an empty
+    series, one full of NaN/inf, one indexed in 1900, or one that
+    contradicts the "baseline" row already saved alongside it -- and
+    "best 10 days removed" (see ``remove_best_days`` below) operates on
+    this Series directly, not on the metrics row, so a corrupted series
+    reaches a real computation even when the row itself looks fine. Checked
+    here: non-empty, genuinely numeric, entirely finite; a strictly
+    increasing, duplicate-free datetime index; that index falling within
+    ``data``'s own date coverage (a stray 1900 date can't belong to this
+    run); and, once a "baseline" row exists to compare against, that
+    recomputing its metrics from this exact series reproduces it exactly --
+    the row and the series must describe the same backtest, not two
+    independently-forged values that happen to both look plausible alone.
+    Wrapped in a blanket try/except since every input here is untrusted
+    checkpoint content, by definition capable of raising in ways no
+    isinstance check anticipates (e.g. an index type that can't convert to
+    datetimes at all).
+    """
+    try:
+        if not isinstance(baseline, pd.Series) or baseline.empty:
+            return False
+        if not pd.api.types.is_numeric_dtype(baseline.dtype):
+            return False
+        values = baseline.to_numpy(dtype=float)
+        if not np.isfinite(values).all():
+            return False
+        index = pd.DatetimeIndex(baseline.index)
+        if not index.is_monotonic_increasing or index.has_duplicates:
+            return False
+        data_timestamps = pd.to_datetime(data[TIMESTAMP])
+        if index.min() < data_timestamps.min() or index.max() > data_timestamps.max():
+            return False
+        if baseline_row is not None:
+            recomputed = _metrics_row(
+                "baseline", baseline, periods_per_year, risk_free_rate
+            )
+            if any(
+                recomputed[key] != baseline_row[key] for key in _STRESS_METRIC_COLUMNS
+            ):
+                return False
+        return True
+    except Exception:
+        return False
+
+
 def run_stress_tests(
     data: pd.DataFrame,
     config: ExperimentConfig,
@@ -115,17 +204,68 @@ def run_stress_tests(
     # checkpointed state too, or resuming past "baseline" would lose it.
     baseline_returns: pd.Series | None = None
     provenance: dict[str, Any] | None = None
+    completed_scenarios = 0
+
+    # The exact scenario name each row must have, in order -- fixed by this
+    # function's own scenario sequence below, independent of `progress`
+    # (which only ever names a prefix of it: a config with two symbols or
+    # fewer never reaches "reduced universe", and neither does an in-progress
+    # resume).
+    _scenario_names_in_order = [
+        "baseline",
+        "commission x2",
+        "commission x5",
+        "slippage x2",
+        "execution delay +1",
+        "best 10 days removed",
+        "reduced universe",
+    ]
+
+    def _validate_stress_state(state: Any, progress: int) -> bool:
+        # One row per scenario, in lockstep with `progress` -- so an exact
+        # length match (not just an upper bound) is meaningful here, and so
+        # is each row's schema, scenario name/order, and internal
+        # status/metrics/error consistency: a structurally-plausible but
+        # incoherent checkpoint (wrong row count, malformed rows, rows all
+        # named "baseline", or a row claiming success while carrying NaN
+        # metrics) must never be resumed from -- it would silently skip or
+        # duplicate real scenarios, corrupt the table, or crash "best 10
+        # days removed", which needs baseline_returns specifically, not just
+        # its metrics row.
+        if not (0 <= progress <= total_scenarios and isinstance(state, tuple)):
+            return False
+        if len(state) != 2:
+            return False
+        rows, baseline = state
+        if not isinstance(rows, list) or len(rows) != progress:
+            return False
+        if not all(
+            isinstance(row, dict) and row.keys() == set(_STRESS_COLUMNS) for row in rows
+        ):
+            return False
+        expected_names = _scenario_names_in_order[:progress]
+        if [row["scenario"] for row in rows] != expected_names:
+            return False
+        if not all(_stress_row_is_consistent(row) for row in rows):
+            return False
+        if progress >= 1:
+            return _baseline_returns_is_valid(
+                baseline, data, rows[0], periods_per_year, risk_free_rate
+            )
+        return baseline is None
+
     if checkpoint_path is not None:
         provenance = compute_provenance(config, data)
-        checkpoint_state = load_checkpoint(checkpoint_path, provenance)
-        if checkpoint_state is not None:
-            rows, baseline_returns = checkpoint_state
+        checkpoint_result = load_checkpoint(
+            checkpoint_path, provenance, validate=_validate_stress_state
+        )
+        if checkpoint_result is not None:
+            (rows, baseline_returns), completed_scenarios = checkpoint_result
             logger.info(
                 "Resuming stress tests from checkpoint: %d/%d scenarios already done.",
-                len(rows),
+                completed_scenarios,
                 total_scenarios,
             )
-    completed_scenarios = len(rows)
 
     def _checkpoint() -> None:
         if checkpoint_path is not None and provenance is not None:
@@ -198,7 +338,14 @@ def run_stress_tests(
 
     if reduced_universe and completed_scenarios < 7:
         reduced_symbols = config.symbols[:-1]
-        data_config = config.data.revalidated_copy(update={"symbols": reduced_symbols})
+        reduced_instruments = [
+            instrument
+            for instrument in config.data.instruments
+            if instrument.symbol in reduced_symbols
+        ]
+        data_config = config.data.revalidated_copy(
+            update={"instruments": reduced_instruments}
+        )
         reduced_config = config.revalidated_copy(update={"data": data_config})
         required_symbols = set(reduced_symbols)
         if config.benchmark_symbol is not None:
@@ -226,6 +373,24 @@ def run_stress_tests(
     if checkpoint_path is not None:
         clear_checkpoint(checkpoint_path)
     return pd.DataFrame(rows, columns=_STRESS_COLUMNS)
+
+
+def stress_test_checkpoint_paths(checkpoint_path: Path) -> tuple[Path, ...]:
+    """Return every on-disk checkpoint file a stress-test run can create.
+
+    ``run_walk_forward_stress_tests`` writes a second, nested file for its
+    weight-cache build (see its own docstring) alongside the main
+    scenario-block checkpoint at ``checkpoint_path`` -- a caller discarding
+    "all saved progress" (the CLI's ``--fresh``) must clear every one of
+    these, not just the main file, or the nested cache can silently survive
+    and be reused on the next run. The single source of truth for this
+    derivation, reused by :func:`run_walk_forward_stress_tests` itself so
+    the two can never drift apart.
+    """
+    return (
+        checkpoint_path,
+        checkpoint_path.with_name(checkpoint_path.stem + "_cache.pkl"),
+    )
 
 
 def run_walk_forward_stress_tests(
@@ -305,11 +470,84 @@ def run_walk_forward_stress_tests(
             "wf_baseline has no OOS result — no fold fit its windows, so "
             "there is nothing to stress-test against."
         )
+    # wf_baseline must actually describe `data`/`config` -- otherwise every
+    # scenario below (built from `config`, some sharing wf_baseline's own
+    # cached weights via rescore_with_costs) would silently perturb a
+    # baseline that doesn't correspond to this run at all.
+    baseline_config = wf_baseline.oos_result.config
+    if baseline_config.model_dump(mode="json") != config.model_dump(mode="json"):
+        raise ValueError(
+            "wf_baseline was not built from `config`: its own attached "
+            "config differs from the config passed to this call."
+        )
+    # Required, not merely checked-when-present: a baseline with no recorded
+    # data_hash at all is not "unverifiable, proceed anyway" -- it is
+    # exactly the case this check exists to catch, so it must refuse the
+    # same as a genuine mismatch would.
+    baseline_data_hash = wf_baseline.oos_result.metadata.get("data_hash")
+    if baseline_data_hash is None:
+        raise ValueError(
+            "wf_baseline was not built from `data`: its own metadata has no "
+            "recorded data_hash, so it cannot be verified against this "
+            "call's data."
+        )
+    from quantlab.data.storage import ParquetStorage
+
+    if baseline_data_hash != ParquetStorage.hash_frame(data):
+        raise ValueError(
+            "wf_baseline was not built from `data`: its own recorded "
+            "data_hash differs from this data's hash."
+        )
     periods_per_year = positive_int(config.periods_per_year, name="periods_per_year")
     risk_free_rate = finite_real(config.risk_free_rate, name="risk_free_rate")
     train_window, validation_window, test_window = resolve_walk_forward_windows(config)
     expanding = config.validation.expanding
     grid = parameter_grid_for_config(config)
+
+    # `config`'s own equality with `baseline_config` (checked above) does
+    # NOT by itself guarantee these were the grid/windows/expanding
+    # actually used to build `wf_baseline`: a caller can build it with an
+    # explicit grid/windows that diverge from what `config` alone would
+    # derive (WalkForwardValidator.run() accepts them as independent
+    # arguments, not solely inferred from config). Every scenario below
+    # reuses this recomputed grid/windows, including via wf_baseline's own
+    # cached candidate weights (rescore_with_costs) -- comparing a baseline
+    # built under one methodology against scenarios re-derived under a
+    # silently different one would be methodologically incoherent, so this
+    # must be verified explicitly rather than assumed from config alone.
+    baseline_windows = wf_baseline.oos_result.metadata.get("walk_forward_windows")
+    expected_windows = {
+        "train_window": train_window,
+        "validation_window": validation_window,
+        "test_window": test_window,
+        "expanding": expanding,
+    }
+    if baseline_windows != expected_windows:
+        raise ValueError(
+            "wf_baseline was not built with this call's own train/"
+            "validation/test windows or expanding setting: its own recorded "
+            f"walk_forward_windows {baseline_windows!r} does not match "
+            f"{expected_windows!r} derived from `config`."
+        )
+    baseline_grid = wf_baseline.oos_result.metadata.get("walk_forward_parameter_grid")
+    if baseline_grid != grid:
+        raise ValueError(
+            "wf_baseline was not built with this call's own parameter grid: "
+            f"its own recorded walk_forward_parameter_grid {baseline_grid!r} "
+            f"does not match {grid!r} derived from `config`."
+        )
+    # The "execution delay +1" scenario below is only meaningful relative to
+    # a zero-delay baseline; a baseline already run with a non-zero delay
+    # would need "+1" to mean "one more than the baseline's own", not a
+    # hardcoded absolute 1.
+    baseline_delay = wf_baseline.oos_result.metadata.get("walk_forward_execution_delay")
+    if baseline_delay != 0:
+        raise ValueError(
+            "wf_baseline was not built with execution_delay=0: its own "
+            f"recorded walk_forward_execution_delay is {baseline_delay!r}, "
+            "so this call's 'execution delay +1' scenario cannot be "
+            "compared against it."
+        )
 
     def _run_walk_forward(
         scenario_config: ExperimentConfig,
@@ -354,21 +592,88 @@ def run_walk_forward_stress_tests(
     rows: list[dict[str, object]] = []
     provenance: dict[str, Any] | None = None
     cache_checkpoint_path: Path | None = None
+    completed_blocks = 0
+    total_blocks = 4 + (1 if reduced_universe else 0)
+
+    def _expected_block_row_count(progress: int) -> int:
+        """Return exactly how many rows each block count has appended.
+
+        Block 1 ("baseline") appends 1 row; block 2 appends one row per
+        cost-only scenario (``len(cost_scenarios)`` = 3: commission x2,
+        commission x5, slippage x2); blocks 3-5 ("execution delay +1",
+        "best 10 days removed", "reduced universe") each append exactly 1.
+        Not a simple linear formula in ``progress`` alone, but still fully
+        determined by it -- there is no ambiguity to fall back to a mere
+        upper bound for.
+        """
+        if progress <= 0:
+            return 0
+        if progress == 1:
+            return 1
+        if progress == 2:
+            return 1 + len(cost_scenarios)
+        return 1 + len(cost_scenarios) + (progress - 2)
+
+    # The exact scenario name each row must have, in order -- not just how
+    # many rows there should be. Fixed by the block structure above:
+    # baseline, then the 3 cost-only rescores (in `cost_scenarios`' own
+    # order), then execution delay, best-10-days, and (if applicable)
+    # reduced universe.
+    _scenario_names_in_order = [
+        "baseline",
+        *cost_scenarios.keys(),
+        "execution delay +1",
+        "best 10 days removed",
+        "reduced universe",
+    ]
+
+    def _validate_block_state(state: Any, progress: int) -> bool:
+        # A structurally-plausible-but-incoherent checkpoint (e.g.
+        # progress=5 with zero rows, four rows all named "baseline", or a
+        # row claiming success while carrying NaN metrics) must never be
+        # resumed from -- it would silently skip every remaining block,
+        # corrupt the table with duplicated/misnamed scenarios, or return a
+        # result as if the whole run had succeeded when a scenario actually
+        # failed. Row count is exactly determined by progress (see
+        # _expected_block_row_count), so an exact match -- not just an
+        # upper bound -- is meaningful here, and so is each row's own
+        # scenario name and order, schema, and status/metrics/error
+        # consistency (a malformed row would otherwise only surface later,
+        # as a confusing KeyError deep in table assembly).
+        if not (0 <= progress <= total_blocks and isinstance(state, list)):
+            return False
+        expected_row_count = _expected_block_row_count(progress)
+        if len(state) != expected_row_count:
+            return False
+        if not all(
+            isinstance(row, dict) and row.keys() == set(_STRESS_COLUMNS)
+            for row in state
+        ):
+            return False
+        expected_names = _scenario_names_in_order[:expected_row_count]
+        if [row["scenario"] for row in state] != expected_names:
+            return False
+        return all(_stress_row_is_consistent(row) for row in state)
+
     if checkpoint_path is not None:
         provenance = compute_provenance(config, data)
-        cache_checkpoint_path = checkpoint_path.with_name(
-            checkpoint_path.stem + "_cache.pkl"
+        cache_checkpoint_path = stress_test_checkpoint_paths(checkpoint_path)[1]
+        checkpoint_result = load_checkpoint(
+            checkpoint_path, provenance, validate=_validate_block_state
         )
-        checkpoint_state = load_checkpoint(checkpoint_path, provenance)
-        if checkpoint_state is not None:
-            rows = checkpoint_state
+        if checkpoint_result is not None:
+            # `progress` (block count) is loaded as-saved, never re-derived
+            # from `len(rows)`: block 2 alone appends one row per cost
+            # scenario, so row count and block count diverge -- deriving
+            # "how many blocks are done" from len(rows) would misjudge that
+            # and silently skip the blocks after it on resume.
+            rows, completed_blocks = checkpoint_result
             logger.info(
                 "Resuming walk-forward stress tests from checkpoint: %d/%d "
                 "scenario blocks already done.",
-                len(rows),
-                4 + (1 if reduced_universe else 0),
+                completed_blocks,
+                total_blocks,
             )
-    completed_blocks = len(rows)
     # Units already behind us for on_progress purposes, seeded from however
     # many blocks a resume already found done — block 1 (baseline) isn't
     # itself counted in total_units (see its definition above), only 2-5 are.
@@ -480,7 +785,14 @@ def run_walk_forward_stress_tests(
 
     if reduced_universe and completed_blocks < 5:
         reduced_symbols = config.symbols[:-1]
-        data_config = config.data.revalidated_copy(update={"symbols": reduced_symbols})
+        reduced_instruments = [
+            instrument
+            for instrument in config.data.instruments
+            if instrument.symbol in reduced_symbols
+        ]
+        data_config = config.data.revalidated_copy(
+            update={"instruments": reduced_instruments}
+        )
         reduced_config = config.revalidated_copy(update={"data": data_config})
         required_symbols = set(reduced_symbols)
         if config.benchmark_symbol is not None:

@@ -34,9 +34,9 @@ def _config(
         {
             "experiment_name": "reporting_hardening",
             "data": {
-                "source": "csv",
-                "market_calendar": "XNYS",
-                "symbols": ["AAA"],
+                "instruments": [
+                    {"symbol": "AAA", "source": "csv", "calendar": "XNYS"},
+                ],
                 "start_date": "2019-01-01",
                 "end_date": "2021-12-31",
                 "use_bundled_demo_data": demo_fallback,
@@ -275,6 +275,61 @@ def test_html_report_shows_chart_placeholders() -> None:
     rendered = _result().to_html(figures={})
     assert "Chart unavailable:" in rendered
     assert "Full-sample headline metrics" in rendered
+
+
+def test_html_report_footer_claims_reproducibility_when_config_matches() -> None:
+    """A run built entirely through the config-driven factory (the ordinary
+    CLI/dashboard path) always has config_yaml_reflects_strategy/allocator
+    True, so its footer may state the bundle is reproducible from
+    config.yaml."""
+    rendered = _result().to_html(figures={})
+    assert "reproducible from config.yaml" in rendered
+
+
+def test_html_report_footer_is_conditional_when_config_does_not_reflect_the_run() -> (
+    None
+):
+    """A direct-API run (docs/api.md) whose actual strategy object diverges
+    from config.yaml must not have its report footer unconditionally claim
+    the bundle is reproducible from config.yaml (see
+    BacktestEngine._build_metadata's config_yaml_reflects_strategy)."""
+    from quantlab.backtesting.engine import BacktestEngine
+    from quantlab.execution.execution_model import ExecutionModel
+    from quantlab.portfolio.allocator import EqualWeightAllocator
+    from quantlab.strategies.mean_reversion import MeanReversionStrategy
+
+    data = make_ohlcv(
+        "AAA",
+        geometric_series(180, mu=0.0004, sigma=0.01, s0=100.0, seed=7),
+        start="2020-01-01",
+    )
+    cfg = ExperimentConfig.from_dict(
+        {
+            "experiment_name": "footer_mismatch",
+            "data": {
+                "instruments": [{"symbol": "AAA", "source": "csv", "calendar": "XNYS"}],
+                "start_date": "2020-01-01",
+                "end_date": "2020-06-30",
+            },
+            "strategy": {
+                "name": "mean_reversion",
+                "parameters": {"lookback_period": 252},
+            },
+            "portfolio": {"allocator": "equal_weight"},
+            "backtest": {"initial_capital": 100_000},
+        }
+    )
+    result = BacktestEngine().run(
+        data,
+        MeanReversionStrategy(lookback_period=10),
+        EqualWeightAllocator(),
+        ExecutionModel.from_config(cfg.execution),
+        cfg,
+    )
+    assert result.metadata["config_yaml_reflects_strategy"] is False
+    rendered = result.to_html(figures={})
+    assert "reproducible from config.yaml given the same code" not in rendered
+    assert "config.yaml in this bundle may not exactly reflect" in rendered
 
 
 def test_data_quality_section_includes_counts_without_warnings() -> None:

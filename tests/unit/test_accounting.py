@@ -152,3 +152,38 @@ def test_asset_returns_must_cover_held_weight_axes() -> None:
 
     with pytest.raises(BacktestError, match="must cover every"):
         run_accounting(held, asset_returns, _zero_cost_model(), 100_000.0)
+
+
+def test_tradable_tolerates_a_differently_ordered_frame() -> None:
+    """`tradable`'s column order need not match `held_weights`' own order --
+    only the *set* of dates and symbols must agree."""
+    idx = pd.date_range("2024-01-05", periods=3, freq="D")
+    held = pd.DataFrame({"AAA": [0.5, 0.5, 0.5], "BBB": [0.5, 0.5, 0.5]}, index=idx)
+    asset_returns = pd.DataFrame(
+        {"AAA": [0.0, 0.01, -0.01], "BBB": [0.0, 0.02, 0.01]}, index=idx
+    )
+    # Same labels as `held`, deliberately reversed column order.
+    tradable = pd.DataFrame(
+        {"BBB": [True, True, True], "AAA": [True, True, True]}, index=idx
+    )
+
+    result = run_accounting(held, asset_returns, _zero_cost_model(), 100_000.0)
+    result_with_mask = run_accounting(
+        held, asset_returns, _zero_cost_model(), 100_000.0, tradable=tradable
+    )
+    pd.testing.assert_series_equal(result.net_returns, result_with_mask.net_returns)
+
+
+def test_tradable_must_cover_the_same_set_of_symbols_as_held_weights() -> None:
+    """A genuine set mismatch (not just reordering) must still raise --
+    silently defaulting an unrecognized symbol to "tradable" could let it
+    trade on a date it should have stayed closed."""
+    idx = pd.date_range("2024-01-05", periods=2, freq="D")
+    held = pd.DataFrame({"AAA": [0.5, 0.5], "BBB": [0.5, 0.5]}, index=idx)
+    asset_returns = pd.DataFrame({"AAA": [0.0, 0.01], "BBB": [0.0, 0.02]}, index=idx)
+    tradable = pd.DataFrame({"AAA": [True, True]}, index=idx)  # missing BBB
+
+    with pytest.raises(BacktestError, match="dates and symbols"):
+        run_accounting(
+            held, asset_returns, _zero_cost_model(), 100_000.0, tradable=tradable
+        )

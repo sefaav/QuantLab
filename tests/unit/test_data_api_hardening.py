@@ -12,6 +12,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 import pytest
+from tests.regression_helpers import _UniformCalendar
 
 from quantlab.config import ExperimentConfig
 from quantlab.constants import (
@@ -80,11 +81,26 @@ def test_universe_csv_rejects_empty_file(tmp_path: Any) -> None:
 @pytest.mark.parametrize(
     ("kwargs", "message"),
     [
-        ({"max_gap_periods": 0}, "max_gap_periods"),
-        ({"max_gap_periods": True}, "max_gap_periods"),
-        ({"min_coverage_rows": -1}, "min_coverage_rows"),
-        ({"expected_frequency": "typo"}, "expected_frequency"),
-        ({"is_247_market": 1}, "is_247_market"),
+        (
+            {"max_gap_periods": 0, "symbol_calendars": _UniformCalendar("XNYS")},
+            "max_gap_periods",
+        ),
+        (
+            {"max_gap_periods": True, "symbol_calendars": _UniformCalendar("XNYS")},
+            "max_gap_periods",
+        ),
+        (
+            {"min_coverage_rows": -1, "symbol_calendars": _UniformCalendar("XNYS")},
+            "min_coverage_rows",
+        ),
+        (
+            {
+                "expected_frequency": "typo",
+                "symbol_calendars": _UniformCalendar("XNYS"),
+            },
+            "expected_frequency",
+        ),
+        ({"symbol_calendars": "not_a_mapping"}, "symbol_calendars"),
     ],
 )
 def test_validator_rejects_invalid_constructor_arguments(
@@ -103,7 +119,9 @@ def test_validator_uses_xnys_session_for_weekend_end() -> None:
             )
         )
     report = DataValidator(
-        expected_frequency="1h", min_coverage_rows=1, is_247_market=False
+        expected_frequency="1h",
+        min_coverage_rows=1,
+        symbol_calendars=_UniformCalendar("XNYS"),
     ).validate(
         _ohlcv(pd.DatetimeIndex(timestamps), symbol="SPY"),
         start=date(2024, 1, 1),
@@ -115,7 +133,9 @@ def test_validator_uses_xnys_session_for_weekend_end() -> None:
 def test_validator_counts_each_ohlc_inconsistent_row_once() -> None:
     frame = _ohlcv(pd.DatetimeIndex(["2024-01-02"]))
     frame.loc[0, [OPEN, HIGH, LOW, CLOSE]] = [10.0, 5.0, 15.0, 10.0]
-    report = DataValidator(min_coverage_rows=1).validate(frame)
+    report = DataValidator(
+        min_coverage_rows=1, symbol_calendars=_UniformCalendar("XNYS")
+    ).validate(frame)
     assert report.invalid_price_count == 1
     assert "1 OHLC-inconsistent rows" in report.warnings[0]
 
@@ -125,12 +145,16 @@ def test_validator_rejects_non_numeric_canonical_value_cleanly() -> None:
     frame[OPEN] = frame[OPEN].astype(object)
     frame.loc[0, OPEN] = "not-a-price"
     with pytest.raises(DataValidationError, match="non-numeric"):
-        DataValidator(min_coverage_rows=1).validate(frame)
+        DataValidator(
+            min_coverage_rows=1, symbol_calendars=_UniformCalendar("XNYS")
+        ).validate(frame)
 
 
 def test_validator_rejects_missing_canonical_columns() -> None:
     with pytest.raises(DataValidationError, match="canonical columns"):
-        DataValidator().validate(pd.DataFrame({TIMESTAMP: ["2024-01-01"]}))
+        DataValidator(symbol_calendars=_UniformCalendar("XNYS")).validate(
+            pd.DataFrame({TIMESTAMP: ["2024-01-01"]})
+        )
 
 
 def test_missing_period_keeps_symbol_and_serialises_dates() -> None:
@@ -138,7 +162,9 @@ def test_missing_period_keeps_symbol_and_serialises_dates() -> None:
         ["2024-01-01 00:00", "2024-01-01 01:00", "2024-01-01 03:00"]
     )
     report = DataValidator(
-        expected_frequency="1h", min_coverage_rows=1, is_247_market=True
+        expected_frequency="1h",
+        min_coverage_rows=1,
+        symbol_calendars=_UniformCalendar("24/7"),
     ).validate(_ohlcv(timestamps, symbol="BTCUSDT"))
     assert len(report.missing_periods) == 1
     period = report.missing_periods[0]
@@ -149,19 +175,27 @@ def test_missing_period_keeps_symbol_and_serialises_dates() -> None:
 def test_declared_frequency_drives_gap_detection() -> None:
     timestamps = pd.date_range("2024-01-01", periods=4, freq="2h")
     report = DataValidator(
-        expected_frequency="1h", min_coverage_rows=1, is_247_market=True
+        expected_frequency="1h",
+        min_coverage_rows=1,
+        symbol_calendars=_UniformCalendar("24/7"),
     ).validate(_ohlcv(timestamps, symbol="BTCUSDT"))
     assert len(report.missing_periods) == 3
 
 
 def test_daily_equity_gap_counts_xnys_sessions() -> None:
     tolerated = DataValidator(
-        expected_frequency="1d", max_gap_periods=5, min_coverage_rows=1
+        expected_frequency="1d",
+        max_gap_periods=5,
+        min_coverage_rows=1,
+        symbol_calendars=_UniformCalendar("XNYS"),
     ).validate(_ohlcv(pd.DatetimeIndex(["2024-01-05", "2024-01-12"])))
     assert tolerated.missing_periods == []
 
     flagged = DataValidator(
-        expected_frequency="1d", max_gap_periods=5, min_coverage_rows=1
+        expected_frequency="1d",
+        max_gap_periods=5,
+        min_coverage_rows=1,
+        symbol_calendars=_UniformCalendar("XNYS"),
     ).validate(_ohlcv(pd.DatetimeIndex(["2024-01-05", "2024-01-16"])))
     assert len(flagged.missing_periods) == 1
 
@@ -184,19 +218,19 @@ def test_yahoo_rejects_invalid_retry_parameters(
 
 
 @pytest.mark.parametrize(
-    ("symbols", "start", "end", "frequency", "is_247_market", "message"),
+    ("symbols", "start", "end", "frequency", "calendar", "message"),
     [
-        ([], date(2024, 1, 1), date(2024, 1, 2), "1d", False, "at least one symbol"),
-        ([""], date(2024, 1, 1), date(2024, 1, 2), "1d", False, "non-empty string"),
+        ([], date(2024, 1, 1), date(2024, 1, 2), "1d", "XNYS", "at least one symbol"),
+        ([""], date(2024, 1, 1), date(2024, 1, 2), "1d", "XNYS", "non-empty string"),
         (
             ["SPY"],
             date(2024, 1, 2),
             date(2024, 1, 1),
             "1d",
-            False,
+            "XNYS",
             "on or before end",
         ),
-        (["SPY"], date(2024, 1, 1), date(2024, 1, 2), "1d", 1, "boolean"),
+        (["SPY"], date(2024, 1, 1), date(2024, 1, 2), "1d", 1, "non-empty string"),
     ],
 )
 def test_yahoo_validates_direct_download_arguments(
@@ -204,7 +238,7 @@ def test_yahoo_validates_direct_download_arguments(
     start: date,
     end: date,
     frequency: str,
-    is_247_market: object,
+    calendar: object,
     message: str,
 ) -> None:
     with pytest.raises(DataDownloadError, match=message):
@@ -213,7 +247,7 @@ def test_yahoo_validates_direct_download_arguments(
             start,
             end,
             frequency,
-            is_247_market=is_247_market,  # type: ignore[arg-type]
+            calendar=calendar,  # type: ignore[arg-type]
         )
 
 
@@ -259,29 +293,25 @@ def test_yahoo_logs_adjusted_close_fallback(caplog: pytest.LogCaptureFixture) ->
         }
     ).set_index("Date")
     with caplog.at_level(logging.WARNING):
-        out = YahooFinanceDataSource._normalise(
-            raw,
-            "SPY",
-            "1d",
-            pd.Timestamp("2024-01-03 22:00"),
-            date(2024, 1, 2),
-        )
+        out = YahooFinanceDataSource._normalise(raw, "SPY", "1d")
     assert out[ADJUSTED_CLOSE].iloc[0] == out[CLOSE].iloc[0]
     assert "has no adjusted close" in caplog.text
 
 
 def test_yahoo_config_can_select_continuous_calendar() -> None:
+    from quantlab.data.calendar import is_247
+
     config = ExperimentConfig.from_dict(
         {
             "experiment_name": "yahoo_crypto",
             "data": {
-                "source": "yahoo",
-                "symbols": ["BTC-USD"],
+                "instruments": [
+                    {"symbol": "BTC-USD", "source": "yahoo", "calendar": "24/7"}
+                ],
                 "start_date": "2024-01-01",
                 "end_date": "2024-02-01",
-                "market_calendar": "24/7",
             },
             "strategy": {"name": "buy_and_hold"},
         }
     )
-    assert config.data.is_247_market is True
+    assert is_247(config.data.instruments[0].calendar) is True

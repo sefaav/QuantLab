@@ -12,6 +12,7 @@ API keys and other sensitive values are never included in log messages.
 from __future__ import annotations
 
 import logging
+import sys
 import warnings
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -25,6 +26,34 @@ _DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
 _CONFIGURED = False
 
 
+class _CurrentStderrHandler(logging.StreamHandler):
+    """A console handler that always writes to the *current* ``sys.stderr``.
+
+    A plain ``StreamHandler()`` snapshots ``sys.stderr`` once at
+    construction time. ``configure_logging`` only ever builds this handler
+    once per process (see ``_CONFIGURED``), so anything that later replaces
+    ``sys.stderr`` and closes the old one -- pytest captures a fresh proxy
+    per test and tears down the previous one -- would leave this
+    long-lived handler holding a dead reference, raising "I/O operation on
+    closed file" the next time anything logs. Resolving the stream fresh on
+    every emit avoids that regardless of how many times the process's
+    ``sys.stderr`` gets swapped out underneath it.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+
+    @property
+    def stream(self) -> object:
+        return sys.stderr
+
+    @stream.setter
+    def stream(self, value: object) -> None:
+        # logging.Handler.__init__ assigns self.stream = stream once;
+        # silently ignored so the getter above always wins.
+        pass
+
+
 def configure_logging(
     level: int | str = logging.INFO,
     *,
@@ -33,10 +62,20 @@ def configure_logging(
 ) -> logging.Logger:
     """Configure and return the package-level ``quantlab`` logger.
 
+    Only the *first* call in a process actually builds handlers -- every
+    later call is a no-op except for adjusting ``level``, which always takes
+    effect. A ``log_file``/``console`` value passed to a second or later call
+    is silently ignored; whichever values the first call in the process used
+    remain in effect for its whole lifetime. Call this once, as early as
+    possible, with the settings you actually want.
+
     Args:
         level: Logging level for the package logger (name or numeric value).
-        log_file: Preferred log file. Defaults to ``logs/quantlab.log``.
-        console: Whether to also emit records to stderr.
+            Applied on every call, even after the first.
+        log_file: Preferred log file. Defaults to ``logs/quantlab.log``. Only
+            honoured on the first call in the process.
+        console: Whether to also emit records to stderr. Only honoured on
+            the first call in the process.
 
     Returns:
         The configured package logger. Child loggers are obtained with
@@ -54,7 +93,7 @@ def configure_logging(
     formatter = logging.Formatter(_DEFAULT_FORMAT, datefmt=_DATE_FORMAT)
 
     if console:
-        console_handler = logging.StreamHandler()
+        console_handler = _CurrentStderrHandler()
         console_handler.setFormatter(formatter)
         logger.addHandler(console_handler)
 

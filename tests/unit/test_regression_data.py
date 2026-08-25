@@ -25,6 +25,7 @@ from tests.regression_helpers import (
     _ohlcv_at,
     _ohlcv_frame,
     _try_strategy,
+    _UniformCalendar,
     _wf_experiment_config,
     _write_daily_cache,
     _write_ohlcv_csv,
@@ -45,9 +46,9 @@ def test_adv_only_uses_volume_known_through_prior_day() -> None:
         {
             "experiment_name": "adv_causality",
             "data": {
-                "source": "csv",
-                "market_calendar": "XNYS",
-                "symbols": ["AAA"],
+                "instruments": [
+                    {"symbol": "AAA", "source": "csv", "calendar": "XNYS"},
+                ],
                 "start_date": "2020-01-01",
                 "end_date": "2020-01-20",
             },
@@ -129,12 +130,10 @@ def test_adv_window_uses_calendar_days_not_bars() -> None:
         {
             "experiment_name": "adv_bars_vs_days",
             "data": {
-                "source": "csv",
-                "symbols": ["BTC"],
+                "instruments": [{"symbol": "BTC", "source": "csv", "calendar": "24/7"}],
                 "start_date": "2020-01-01",
                 "end_date": "2020-03-01",
                 "frequency": "1h",
-                "market_calendar": "24/7",
             },
             "strategy": {"name": "buy_and_hold"},
             "execution": {
@@ -144,7 +143,9 @@ def test_adv_window_uses_calendar_days_not_bars() -> None:
             },
         }
     )
-    assert cfg.data.is_247_market
+    from quantlab.data.calendar import is_247
+
+    assert is_247(cfg.data.instruments[0].calendar)
     model = build_execution_from_config(cfg, frame)
     assert isinstance(model.slippage, VolumeBasedSlippageModel)
     adv = model.slippage.average_daily_volume
@@ -167,9 +168,9 @@ def test_adv_window_unchanged_for_daily_bar_configs() -> None:
         {
             "experiment_name": "adv_daily_unchanged",
             "data": {
-                "source": "csv",
-                "market_calendar": "XNYS",
-                "symbols": ["AAA"],
+                "instruments": [
+                    {"symbol": "AAA", "source": "csv", "calendar": "XNYS"},
+                ],
                 "start_date": "2020-01-01",
                 "end_date": "2020-03-01",
             },
@@ -181,7 +182,9 @@ def test_adv_window_unchanged_for_daily_bar_configs() -> None:
             },
         }
     )
-    assert not cfg.data.is_247_market
+    from quantlab.data.calendar import is_247
+
+    assert not is_247(cfg.data.instruments[0].calendar)
     model = build_execution_from_config(cfg, frame)
     assert isinstance(model.slippage, VolumeBasedSlippageModel)
     adv = model.slippage.average_daily_volume
@@ -221,9 +224,9 @@ def test_adv_uses_unadjusted_price_for_historical_dollar_volume() -> None:
         {
             "experiment_name": "adv_raw_price",
             "data": {
-                "source": "csv",
-                "market_calendar": "XNYS",
-                "symbols": ["AAA"],
+                "instruments": [
+                    {"symbol": "AAA", "source": "csv", "calendar": "XNYS"},
+                ],
                 "start_date": "2020-01-01",
                 "end_date": "2020-01-03",
             },
@@ -250,9 +253,9 @@ def test_adv_bar_scaling_ignores_metrics_annualisation_override() -> None:
         {
             "experiment_name": "adv_physical_frequency",
             "data": {
-                "source": "csv",
-                "market_calendar": "XNYS",
-                "symbols": ["AAA"],
+                "instruments": [
+                    {"symbol": "AAA", "source": "csv", "calendar": "XNYS"},
+                ],
                 "start_date": "2020-01-01",
                 "end_date": "2020-01-03",
                 "frequency": "1d",
@@ -292,9 +295,9 @@ def test_adv_window_scales_down_for_weekly_bars() -> None:
         {
             "experiment_name": "adv_weekly",
             "data": {
-                "source": "csv",
-                "market_calendar": "XNYS",
-                "symbols": ["AAA"],
+                "instruments": [
+                    {"symbol": "AAA", "source": "csv", "calendar": "XNYS"},
+                ],
                 "start_date": "2020-01-01",
                 "end_date": "2021-06-01",
                 "frequency": "1w",
@@ -329,8 +332,13 @@ def test_unknown_data_source_rejected_at_config_load() -> None:
             {
                 "experiment_name": "x",
                 "data": {
-                    "source": "not_a_real_source",
-                    "symbols": ["A"],
+                    "instruments": [
+                        {
+                            "symbol": "A",
+                            "source": "not_a_real_source",
+                            "calendar": "XNYS",
+                        }
+                    ],
                     "start_date": "2020-01-01",
                     "end_date": "2021-01-01",
                 },
@@ -366,9 +374,10 @@ def test_frequency_mismatch_is_flagged_as_a_data_warning() -> None:
     )
 
     inputs = {
-        "source": "csv",
-        "market_calendar": "XNYS",
-        "symbols": ["SPY", "QQQ"],
+        "instruments": [
+            {"symbol": "SPY", "source": "csv", "calendar": "XNYS"},
+            {"symbol": "QQQ", "source": "csv", "calendar": "XNYS"},
+        ],
         "start_date": "2019-01-01",
         "end_date": "2019-06-01",
         "frequency": "1h",
@@ -377,7 +386,7 @@ def test_frequency_mismatch_is_flagged_as_a_data_warning() -> None:
         "allocator": "equal_weight",
         "rebalance_frequency": "monthly",
         "initial_capital": 100_000.0,
-        "benchmark_symbol": None,
+        "benchmark": None,
         "commission_bps": 2.0,
         "spread_bps": 3.0,
         "slippage_bps": 2.0,
@@ -392,8 +401,9 @@ def test_binance_hourly_annualises_with_24_7_market_factor() -> None:
         {
             "experiment_name": "x",
             "data": {
-                "source": "binance",
-                "symbols": ["BTCUSDT"],
+                "instruments": [
+                    {"symbol": "BTCUSDT", "source": "binance", "calendar": "24/7"},
+                ],
                 "start_date": "2020-01-01",
                 "end_date": "2021-01-01",
                 "frequency": "1h",
@@ -409,8 +419,9 @@ def test_yahoo_hourly_annualisation_unchanged() -> None:
         {
             "experiment_name": "x",
             "data": {
-                "source": "yahoo",
-                "symbols": ["SPY"],
+                "instruments": [
+                    {"symbol": "SPY", "source": "yahoo", "calendar": "XNYS"},
+                ],
                 "start_date": "2020-01-01",
                 "end_date": "2021-01-01",
                 "frequency": "1h",
@@ -427,8 +438,9 @@ def test_binance_monthly_frequency_rejected() -> None:
             {
                 "experiment_name": "x",
                 "data": {
-                    "source": "binance",
-                    "symbols": ["BTCUSDT"],
+                    "instruments": [
+                        {"symbol": "BTCUSDT", "source": "binance", "calendar": "24/7"},
+                    ],
                     "start_date": "2020-01-01",
                     "end_date": "2021-01-01",
                     "frequency": "1mo",
@@ -438,13 +450,60 @@ def test_binance_monthly_frequency_rejected() -> None:
         )
 
 
+def test_binance_download_rejects_a_none_symbol() -> None:
+    """Binance's own download() must validate its arguments as rigorously as
+    Yahoo's does -- a None/blank symbol must be a clear error, not an
+    internal AttributeError or a wasted request to the provider."""
+    from quantlab.data.binance import BinanceDataSource
+    from quantlab.exceptions import DataDownloadError
+
+    with pytest.raises(DataDownloadError, match="non-empty string"):
+        BinanceDataSource().download(
+            [None],  # type: ignore[list-item]
+            date(2020, 1, 1),
+            date(2020, 1, 31),
+        )
+
+
+def test_binance_download_rejects_no_symbols() -> None:
+    from quantlab.data.binance import BinanceDataSource
+    from quantlab.exceptions import DataDownloadError
+
+    with pytest.raises(DataDownloadError, match="at least one symbol"):
+        BinanceDataSource().download([], date(2020, 1, 1), date(2020, 1, 31))
+
+
+def test_binance_download_rejects_start_after_end() -> None:
+    from quantlab.data.binance import BinanceDataSource
+    from quantlab.exceptions import DataDownloadError
+
+    with pytest.raises(DataDownloadError, match="on or before end"):
+        BinanceDataSource().download(["BTCUSDT"], date(2020, 2, 1), date(2020, 1, 1))
+
+
+def test_binance_download_rejects_string_dates() -> None:
+    """A caller passing ISO date strings instead of `date` objects must get
+    a clear error, not silently query the provider with the wrong type."""
+    from quantlab.data.binance import BinanceDataSource
+    from quantlab.exceptions import DataDownloadError
+
+    with pytest.raises(DataDownloadError, match="must be date values"):
+        BinanceDataSource().download(
+            ["BTCUSDT"],
+            "2020-01-01",  # type: ignore[arg-type]
+            "2020-01-31",  # type: ignore[arg-type]
+        )
+
+
 def test_pairs_trading_same_symbol_rejected() -> None:
     with pytest.raises(InvalidConfigurationError):
         ExperimentConfig.from_dict(
             {
                 "experiment_name": "x",
                 "data": {
-                    "symbols": ["AAA"],
+                    "instruments": [
+                        {"symbol": "AAA", "source": "yahoo", "calendar": "XNYS"},
+                    ],
                     "start_date": "2020-01-01",
                     "end_date": "2021-01-01",
                 },
@@ -462,9 +521,9 @@ def test_csv_source_with_unknown_frequency_rejected() -> None:
             {
                 "experiment_name": "x",
                 "data": {
-                    "source": "csv",
-                    "market_calendar": "XNYS",
-                    "symbols": ["A"],
+                    "instruments": [
+                        {"symbol": "A", "source": "csv", "calendar": "XNYS"},
+                    ],
                     "start_date": "2020-01-01",
                     "end_date": "2021-01-01",
                     "frequency": "typo",
@@ -483,9 +542,11 @@ def test_frequency_mismatch_flagged_even_on_short_history() -> None:
     frame = make_ohlcv(
         "AAA", [100.0 + i for i in range(10)], start="2020-01-01", freq="D"
     )
-    report = DataValidator(expected_frequency="1h", min_coverage_rows=30).validate(
-        frame
-    )
+    report = DataValidator(
+        expected_frequency="1h",
+        min_coverage_rows=30,
+        symbol_calendars=_UniformCalendar("XNYS"),
+    ).validate(frame)
     assert any("does not match the declared frequency" in w for w in report.warnings)
 
 
@@ -511,7 +572,9 @@ def test_intraday_equity_session_boundaries_not_flagged_as_gaps() -> None:
         }
     )
     report = DataValidator(
-        expected_frequency="1h", min_coverage_rows=5, is_247_market=False
+        expected_frequency="1h",
+        min_coverage_rows=5,
+        symbol_calendars=_UniformCalendar("XNYS"),
     ).validate(frame)
     assert not any("abnormal gap" in w for w in report.warnings)
 
@@ -540,7 +603,9 @@ def test_intraday_equity_mid_session_gap_still_flagged() -> None:
         }
     )
     report = DataValidator(
-        expected_frequency="1h", min_coverage_rows=5, is_247_market=False
+        expected_frequency="1h",
+        min_coverage_rows=5,
+        symbol_calendars=_UniformCalendar("XNYS"),
     ).validate(frame)
     assert any("abnormal gap" in w for w in report.warnings)
     assert len(report.missing_periods) == 1
@@ -571,7 +636,9 @@ def test_intraday_crypto_genuine_gap_still_flagged() -> None:
         }
     )
     report = DataValidator(
-        expected_frequency="1h", min_coverage_rows=5, is_247_market=True
+        expected_frequency="1h",
+        min_coverage_rows=5,
+        symbol_calendars=_UniformCalendar("24/7"),
     ).validate(frame)
     assert any("abnormal gap" in w for w in report.warnings)
 
@@ -602,7 +669,9 @@ def test_gap_detection_flags_missing_whole_business_day() -> None:
         }
     )
     report = DataValidator(
-        expected_frequency="1h", min_coverage_rows=5, is_247_market=False
+        expected_frequency="1h",
+        min_coverage_rows=5,
+        symbol_calendars=_UniformCalendar("XNYS"),
     ).validate(frame)
     assert any("abnormal gap" in w for w in report.warnings)
 
@@ -631,7 +700,9 @@ def test_gap_detection_tolerates_us_holiday_long_weekend() -> None:
         }
     )
     report = DataValidator(
-        expected_frequency="1h", min_coverage_rows=5, is_247_market=False
+        expected_frequency="1h",
+        min_coverage_rows=5,
+        symbol_calendars=_UniformCalendar("XNYS"),
     ).validate(frame)
     assert not any("abnormal gap" in w for w in report.warnings)
 
@@ -645,7 +716,9 @@ def test_gap_detection_flags_missing_columbus_day_session() -> None:
         if d != pd.Timestamp("2020-10-12")
     ]
     report = DataValidator(
-        expected_frequency="1h", min_coverage_rows=5, is_247_market=False
+        expected_frequency="1h",
+        min_coverage_rows=5,
+        symbol_calendars=_UniformCalendar("XNYS"),
     ).validate(_hourly_frame(sessions))
     assert any("abnormal gap" in w for w in report.warnings)
 
@@ -658,7 +731,9 @@ def test_gap_detection_tolerates_good_friday_closure() -> None:
 
     sessions = [pd.Timestamp("2020-04-09"), pd.Timestamp("2020-04-13")]
     report = DataValidator(
-        expected_frequency="1h", min_coverage_rows=5, is_247_market=False
+        expected_frequency="1h",
+        min_coverage_rows=5,
+        symbol_calendars=_UniformCalendar("XNYS"),
     ).validate(_hourly_frame(sessions))
     assert not any("abnormal gap" in w for w in report.warnings)
 
@@ -668,7 +743,9 @@ def test_gap_detection_flags_bars_trimmed_from_session_end() -> None:
 
     sessions = list(pd.bdate_range("2020-01-06", periods=6))
     report = DataValidator(
-        expected_frequency="1h", min_coverage_rows=5, is_247_market=False
+        expected_frequency="1h",
+        min_coverage_rows=5,
+        symbol_calendars=_UniformCalendar("XNYS"),
     ).validate(_hourly_frame(sessions, remove={2: {1, 2, 3, 4, 5, 6}}))
     assert any("abnormal gap" in w for w in report.warnings)
 
@@ -701,7 +778,9 @@ def test_gap_detection_tail_truncation_detected_with_only_two_sessions() -> None
         }
     )
     report = DataValidator(
-        expected_frequency="1h", min_coverage_rows=5, is_247_market=False
+        expected_frequency="1h",
+        min_coverage_rows=5,
+        symbol_calendars=_UniformCalendar("XNYS"),
     ).validate(frame)
     assert any("abnormal gap" in w for w in report.warnings)
 
@@ -732,7 +811,9 @@ def test_gap_detection_head_truncation_detected_with_only_two_sessions() -> None
         }
     )
     report = DataValidator(
-        expected_frequency="1h", min_coverage_rows=5, is_247_market=False
+        expected_frequency="1h",
+        min_coverage_rows=5,
+        symbol_calendars=_UniformCalendar("XNYS"),
     ).validate(frame)
     assert any("abnormal gap" in w for w in report.warnings)
 
@@ -754,7 +835,10 @@ def test_pairs_trading_symbol_not_in_universe_rejected_at_config_load() -> None:
             {
                 "experiment_name": "x",
                 "data": {
-                    "symbols": ["AAA", "BBB"],
+                    "instruments": [
+                        {"symbol": "AAA", "source": "yahoo", "calendar": "XNYS"},
+                        {"symbol": "BBB", "source": "yahoo", "calendar": "XNYS"},
+                    ],
                     "start_date": "2020-01-01",
                     "end_date": "2021-01-01",
                 },
@@ -774,7 +858,10 @@ def test_pairs_trading_symbol_in_universe_after_normalization_accepted() -> None
         {
             "experiment_name": "x",
             "data": {
-                "symbols": ["AAA", "BBB"],
+                "instruments": [
+                    {"symbol": "AAA", "source": "yahoo", "calendar": "XNYS"},
+                    {"symbol": "BBB", "source": "yahoo", "calendar": "XNYS"},
+                ],
                 "start_date": "2020-01-01",
                 "end_date": "2021-01-01",
             },
@@ -823,7 +910,9 @@ def test_exact_match_still_clean() -> None:
 
     frame = _hourly_symbol_frame("1D", 40, "AAA")
     report = DataValidator(
-        expected_frequency="1d", min_coverage_rows=5, is_247_market=False
+        expected_frequency="1d",
+        min_coverage_rows=5,
+        symbol_calendars=_UniformCalendar("XNYS"),
     ).validate(frame)
     assert not any(
         "does not match the declared frequency" in w for w in report.warnings
@@ -848,9 +937,9 @@ def test_partial_coverage_of_requested_range_flagged() -> None:
             "volume": 1000.0,
         }
     )
-    report = DataValidator(min_coverage_rows=5).validate(
-        frame, start=date(2020, 1, 1), end=date(2020, 4, 30)
-    )
+    report = DataValidator(
+        min_coverage_rows=5, symbol_calendars=_UniformCalendar("XNYS")
+    ).validate(frame, start=date(2020, 1, 1), end=date(2020, 4, 30))
     assert any(
         "data starts" in w and "after the requested start" in w for w in report.warnings
     )
@@ -877,33 +966,39 @@ def test_gap_detected_even_below_min_coverage_rows() -> None:
             "volume": 1000.0,
         }
     )
-    report = DataValidator(min_coverage_rows=30, is_247_market=True).validate(frame)
+    report = DataValidator(
+        min_coverage_rows=30, symbol_calendars=_UniformCalendar("24/7")
+    ).validate(frame)
     assert any("Short coverage" in w for w in report.warnings)
     assert any("abnormal gap" in w for w in report.warnings)
     assert len(report.missing_periods) == 1
 
 
-def test_csv_source_requires_explicit_market_calendar() -> None:
-    from quantlab.exceptions import InvalidConfigurationError
-
-    with pytest.raises(InvalidConfigurationError, match="market_calendar"):
+def test_instrument_requires_explicit_calendar() -> None:
+    """Every instrument requires an explicit calendar, whatever its source —
+    there is no per-source default to fall back to."""
+    with pytest.raises(InvalidConfigurationError, match="calendar"):
         _market_calendar_config()
 
 
 def test_csv_bitcoin_can_declare_crypto_via_explicit_field() -> None:
-    """Declaring `market_calendar: 24/7` on a csv source yields 24/7
+    """Declaring `calendar: 24/7` on a csv instrument yields 24/7
     (8760/year for 1h bars) annualization."""
-    cfg = _market_calendar_config(market_calendar="24/7")
-    assert cfg.data.is_247_market is True
+    from quantlab.data.calendar import is_247
+
+    cfg = _market_calendar_config(calendar="24/7")
+    assert is_247(cfg.data.instruments[0].calendar) is True
     assert cfg.periods_per_year == 24 * 365
 
 
 def test_csv_source_can_declare_xnys_explicitly() -> None:
-    """Declaring `market_calendar: XNYS` on a csv source yields equity
+    """Declaring `calendar: XNYS` on a csv instrument yields equity
     (252 * 7 = 1764/year for `_market_calendar_config`'s 1h bars)
     annualization, not 24/7."""
-    cfg = _market_calendar_config(market_calendar="XNYS")
-    assert cfg.data.is_247_market is False
+    from quantlab.data.calendar import is_247
+
+    cfg = _market_calendar_config(calendar="XNYS")
+    assert is_247(cfg.data.instruments[0].calendar) is False
     assert cfg.periods_per_year == 252 * 7
 
 
@@ -911,18 +1006,22 @@ def test_binance_cannot_be_overridden_back_to_equity() -> None:
     from quantlab.exceptions import InvalidConfigurationError
 
     with pytest.raises(InvalidConfigurationError, match="not permitted"):
-        _market_calendar_config(source="binance", market_calendar="XNYS")
+        _market_calendar_config(source="binance", calendar="XNYS")
 
 
 def test_yahoo_can_select_24_7_calendar() -> None:
     """Yahoo serves continuous instruments as well as XNYS securities."""
-    cfg = _market_calendar_config(source="yahoo", market_calendar="24/7")
-    assert cfg.data.is_247_market is True
+    from quantlab.data.calendar import is_247
+
+    cfg = _market_calendar_config(source="yahoo", calendar="24/7")
+    assert is_247(cfg.data.instruments[0].calendar) is True
     assert cfg.periods_per_year == 365 * 24
 
 
 def test_shipped_configs_have_the_expected_calendar() -> None:
     import pathlib
+
+    from quantlab.data.calendar import is_247, uniform_calendar
 
     configs_dir = pathlib.Path(__file__).resolve().parents[2] / "configs"
     expected = {
@@ -933,9 +1032,11 @@ def test_shipped_configs_have_the_expected_calendar() -> None:
         "momentum_sp500.yaml": (False, 252),
         "pairs_trading.yaml": (False, 252),
     }
-    for name, (is_247, ppy) in expected.items():
+    for name, (is_247_expected, ppy) in expected.items():
         cfg = ExperimentConfig.from_yaml(configs_dir / name)
-        assert cfg.data.is_247_market is is_247, name
+        calendar = uniform_calendar(i.calendar for i in cfg.data.instruments)
+        assert calendar is not None, name
+        assert is_247(calendar) is is_247_expected, name
         assert cfg.periods_per_year == ppy, name
 
 
@@ -1114,6 +1215,51 @@ def test_csv_loader_falls_back_to_bundled_demo_data(
     assert sorted(bundled["close"].tolist()) == [100.0, 999.0]
 
 
+def test_loader_report_records_whether_bundled_demo_data_was_actually_used(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`use_bundled_demo_data=True` only *enables* the fallback -- it says
+    nothing about whether local files were actually missing this run. The
+    report must record whether the fallback genuinely triggered, not just
+    whether it was allowed to."""
+    import quantlab.data.loader as loader_mod
+    from quantlab.data.loader import DataLoader
+
+    demo_dir = tmp_path / "demo_data"
+    demo_dir.mkdir()
+    make_ohlcv("SPY", [100.0] * 200, start="2020-01-01").to_csv(
+        demo_dir / "SPY.csv", index=False
+    )
+    monkeypatch.setattr(loader_mod, "DEMO_DATA_DIR", demo_dir)
+
+    cfg = ExperimentConfig.from_dict(
+        {
+            "experiment_name": "bundled_demo_used_repro",
+            "data": {
+                "instruments": [{"symbol": "SPY", "source": "csv", "calendar": "XNYS"}],
+                "start_date": "2020-01-01",
+                "end_date": "2020-06-01",
+                "use_bundled_demo_data": True,
+            },
+            "strategy": {"name": "buy_and_hold"},
+        }
+    )
+
+    empty_raw_dir = tmp_path / "empty_raw"
+    empty_raw_dir.mkdir()
+    _, report_used = DataLoader(raw_dir=empty_raw_dir).load(cfg)
+    assert report_used.bundled_demo_data_used is True
+    assert report_used.to_dict()["bundled_demo_data_used"] is True
+
+    real_raw_dir = tmp_path / "real_raw"
+    real_raw_dir.mkdir()
+    make_ohlcv("SPY", [100.0] * 200, start="2020-01-01").to_csv(
+        real_raw_dir / "SPY.csv", index=False
+    )
+    _, report_unused = DataLoader(raw_dir=real_raw_dir).load(cfg)
+    assert report_unused.bundled_demo_data_used is False
+
+
 def test_csv_loader_does_not_silently_substitute_demo_data_by_default(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1137,11 +1283,14 @@ def test_csv_loader_does_not_silently_substitute_demo_data_by_default(
 
 def test_use_bundled_demo_data_rejected_with_a_non_csv_source() -> None:
     for source in ("yahoo", "binance"):
+        symbol = "BTCUSDT" if source == "binance" else "SPY"
+        calendar = "24/7" if source == "binance" else "XNYS"
         payload = {
             "experiment_name": "test",
             "data": {
-                "source": source,
-                "symbols": ["BTCUSDT"] if source == "binance" else ["SPY"],
+                "instruments": [
+                    {"symbol": symbol, "source": source, "calendar": calendar}
+                ],
                 "start_date": "2020-01-01",
                 "end_date": "2020-06-01",
                 "use_bundled_demo_data": True,
@@ -1167,7 +1316,7 @@ def test_source_hash_is_platform_independent_and_reuses_cache(
     )
 
     first = engine._source_hash()
-    fingerprint_after_first_call = engine._source_hash_fingerprint
+    fingerprint_after_first_call = engine._source_hash_cache["source"][0]
     assert fingerprint_after_first_call is not None
     assert all("\\" not in rel for rel, _mtime in fingerprint_after_first_call)
 
@@ -1175,16 +1324,19 @@ def test_source_hash_is_platform_independent_and_reuses_cache(
     # value rather than re-reading and re-hashing every file's bytes again.
     second = engine._source_hash()
     assert second == first
-    assert engine._source_hash_fingerprint == fingerprint_after_first_call
+    assert engine._source_hash_cache["source"][0] == fingerprint_after_first_call
 
 
 def test_source_hash_ignores_dashboard_and_cli_edits(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """No notebook cell and no computational backtest path imports the
-    dashboard or the CLI entry point, so editing either must not change the
-    hash -- otherwise unrelated dashboard/CLI edits force spurious notebook
-    rebuilds and spuriously invalidate walk-forward artifact reuse."""
+    dashboard or the CLI entry point, so editing either must not change
+    `_source_hash()` (`code_hash`) -- otherwise unrelated dashboard/CLI
+    edits would force spurious notebook rebuilds. Saved-bundle reuse uses
+    the separate, wider `_generator_hash()` instead (see
+    test_generator_hash_is_sensitive_to_cli_edits_but_not_dashboard_edits),
+    precisely because CLI orchestration changes DO need to invalidate that."""
     import shutil
 
     from quantlab.backtesting import engine
@@ -1207,7 +1359,7 @@ def test_source_hash_ignores_dashboard_and_cli_edits(
         (fake_root / "cli.py").read_text(encoding="utf-8") + "\n# edited\n",
         encoding="utf-8",
     )
-    monkeypatch.setattr(engine, "_source_hash_computed_at", None)
+    monkeypatch.delitem(engine._source_hash_cache, "source", raising=False)
     assert engine._source_hash() == original
 
     # A module actually on the computational path must still be caught.
@@ -1215,8 +1367,46 @@ def test_source_hash_ignores_dashboard_and_cli_edits(
         (fake_root / "constants.py").read_text(encoding="utf-8") + "\n# edited\n",
         encoding="utf-8",
     )
-    monkeypatch.setattr(engine, "_source_hash_computed_at", None)
+    monkeypatch.delitem(engine._source_hash_cache, "source", raising=False)
     assert engine._source_hash() != original
+
+
+def test_generator_hash_is_sensitive_to_cli_edits_but_not_dashboard_edits(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`_generator_hash()` gates reuse of a *saved bundle* (walk-forward and
+    robustness CSVs, checkpoints) -- unlike `_source_hash()`/`code_hash`, it
+    must catch a change to `cli.py`'s own orchestration of how that bundle
+    gets assembled or reused, since an unchanged computational hash alone
+    does not guarantee an unchanged bundle. The dashboard is still excluded
+    from both: no saved bundle depends on it either."""
+    import shutil
+
+    from quantlab.backtesting import engine
+
+    real_root = Path(engine.__file__).resolve().parents[1]
+    fake_root = tmp_path / "quantlab"
+    shutil.copytree(real_root, fake_root)
+    monkeypatch.setattr(
+        engine, "__file__", str(fake_root / "backtesting" / "engine.py")
+    )
+
+    original = engine._generator_hash()
+
+    (fake_root / "dashboard" / "app.py").write_text(
+        (fake_root / "dashboard" / "app.py").read_text(encoding="utf-8")
+        + "\n# edited\n",
+        encoding="utf-8",
+    )
+    monkeypatch.delitem(engine._source_hash_cache, "generator", raising=False)
+    assert engine._generator_hash() == original
+
+    (fake_root / "cli.py").write_text(
+        (fake_root / "cli.py").read_text(encoding="utf-8") + "\n# edited\n",
+        encoding="utf-8",
+    )
+    monkeypatch.delitem(engine._source_hash_cache, "generator", raising=False)
+    assert engine._generator_hash() != original
 
 
 def test_robustness_placeholder_does_not_overclaim_cli_coverage() -> None:
@@ -1247,16 +1437,16 @@ def test_cache_covers_tolerates_a_weekend_end_date(tmp_path: Path) -> None:
             "volume": 100.0,
         }
     )
-    storage.write_symbol(data, "yahoo", "AAA", "1d")
+    storage.write_symbol(data, "yahoo", "AAA", "1d", calendar="XNYS")
 
     # End date is a Sunday two days after the last cached (Friday) bar.
     assert storage.cache_covers(
-        "yahoo", "AAA", "1d", date(2023, 1, 2), date(2024, 1, 7)
+        "yahoo", "AAA", "1d", date(2023, 1, 2), date(2024, 1, 7), calendar="XNYS"
     )
     # A genuinely stale cache (far beyond any reasonable non-trading gap)
     # must still be reported as not covering.
     assert not storage.cache_covers(
-        "yahoo", "AAA", "1d", date(2023, 1, 2), date(2024, 2, 1)
+        "yahoo", "AAA", "1d", date(2023, 1, 2), date(2024, 2, 1), calendar="XNYS"
     )
 
 
@@ -1279,12 +1469,12 @@ def test_cache_covers_tolerates_a_weekend_start_date(tmp_path: Path) -> None:
             "volume": 100.0,
         }
     )
-    storage.write_symbol(data, "yahoo", "AAA", "1d")
+    storage.write_symbol(data, "yahoo", "AAA", "1d", calendar="XNYS")
 
     # Requested start (Sunday 2023-01-01) is one day before the first cached
     # (Monday) bar.
     assert storage.cache_covers(
-        "yahoo", "AAA", "1d", date(2023, 1, 1), date(2024, 1, 5)
+        "yahoo", "AAA", "1d", date(2023, 1, 1), date(2024, 1, 5), calendar="XNYS"
     )
 
 
@@ -1330,7 +1520,7 @@ def test_save_persists_warnings_into_metadata_json(tmp_path: Path) -> None:
 def test_symbol_path_traversal_rejected() -> None:
     payload = _base_config_dict()
     payload["data"] = dict(payload["data"])
-    payload["data"]["symbols"] = ["../../etc/passwd"]
+    payload["data"]["instruments"][0]["symbol"] = "../../etc/passwd"
     with pytest.raises(InvalidConfigurationError, match="Invalid symbol"):
         ExperimentConfig.from_dict(payload)
 
@@ -1339,7 +1529,7 @@ def test_symbol_validation_accepts_real_yahoo_ticker_conventions() -> None:
     for symbol in ["^GSPC", "^DJI", "^VIX", "EURUSD=X", "GC=F", "ES=F"]:
         payload = _base_config_dict()
         payload["data"] = dict(payload["data"])
-        payload["data"]["symbols"] = [symbol]
+        payload["data"]["instruments"][0]["symbol"] = symbol
         cfg = ExperimentConfig.from_dict(payload)
         assert cfg.symbols == [symbol]
 
@@ -1347,7 +1537,7 @@ def test_symbol_validation_accepts_real_yahoo_ticker_conventions() -> None:
     # newly-allowed characters.
     payload = _base_config_dict()
     payload["data"] = dict(payload["data"])
-    payload["data"]["symbols"] = ["^../../etc/passwd"]
+    payload["data"]["instruments"][0]["symbol"] = "^../../etc/passwd"
     with pytest.raises(InvalidConfigurationError, match="Invalid symbol"):
         ExperimentConfig.from_dict(payload)
 
@@ -1366,14 +1556,14 @@ def test_symbol_rejects_windows_reserved_device_names() -> None:
     ]:
         payload = _base_config_dict()
         payload["data"] = dict(payload["data"])
-        payload["data"]["symbols"] = [bad]
+        payload["data"]["instruments"][0]["symbol"] = bad
         with pytest.raises(InvalidConfigurationError, match="reserved device name"):
             ExperimentConfig.from_dict(payload)
 
     for ok in ["COM0", "LPT0", "CONSOLE", "NULL", "SPY", "AAPL"]:
         payload = _base_config_dict()
         payload["data"] = dict(payload["data"])
-        payload["data"]["symbols"] = [ok]
+        payload["data"]["instruments"][0]["symbol"] = ok
         cfg = ExperimentConfig.from_dict(payload)
         assert cfg.symbols == [ok]
 
@@ -1382,30 +1572,34 @@ def test_symbol_rejects_a_trailing_dot_or_space() -> None:
     for bad in ["FOO.", "FOO..", "SPY.", "AAPL.CSV."]:
         payload = _base_config_dict()
         payload["data"] = dict(payload["data"])
-        payload["data"]["symbols"] = [bad]
+        payload["data"]["instruments"][0]["symbol"] = bad
         with pytest.raises(InvalidConfigurationError, match="must not end with"):
             ExperimentConfig.from_dict(payload)
 
     # Sanity: an ordinary name containing internal dots remains accepted.
     payload = _base_config_dict()
     payload["data"] = dict(payload["data"])
-    payload["data"]["symbols"] = ["BRK.B"]
+    payload["data"]["instruments"][0]["symbol"] = "BRK.B"
     cfg = ExperimentConfig.from_dict(payload)
     assert cfg.symbols == ["BRK.B"]
 
 
 def test_benchmark_symbol_path_traversal_rejected() -> None:
     payload = _base_config_dict()
-    payload["backtest"] = {"benchmark_symbol": "../outside"}
-    with pytest.raises(InvalidConfigurationError, match="benchmark_symbol"):
+    payload["backtest"] = {
+        "benchmark": {"symbol": "../outside", "source": "csv", "calendar": "XNYS"}
+    }
+    with pytest.raises(InvalidConfigurationError, match="Invalid symbol"):
         ExperimentConfig.from_dict(payload)
 
 
 def test_benchmark_symbol_normalized_like_data_symbols() -> None:
     payload = _base_config_dict()
-    payload["backtest"] = {"benchmark_symbol": " spy "}
+    payload["backtest"] = {
+        "benchmark": {"symbol": " spy ", "source": "csv", "calendar": "XNYS"}
+    }
     cfg = ExperimentConfig.from_dict(payload)
-    assert cfg.backtest.benchmark_symbol == "SPY"
+    assert cfg.benchmark_symbol == "SPY"
 
 
 def test_data_hash_covers_benchmark_symbol_too() -> None:
@@ -1420,16 +1614,18 @@ def test_data_hash_covers_benchmark_symbol_too() -> None:
         {
             "experiment_name": "test",
             "data": {
-                "source": "csv",
-                "market_calendar": "XNYS",
-                "symbols": ["A"],
+                "instruments": [
+                    {"symbol": "A", "source": "csv", "calendar": "XNYS"},
+                ],
                 "start_date": "2020-01-01",
                 "end_date": "2020-06-01",
             },
             "strategy": {"name": "buy_and_hold", "parameters": {}},
             "portfolio": {"allocator": "equal_weight"},
             "execution": {},
-            "backtest": {"benchmark_symbol": "BENCH"},
+            "backtest": {
+                "benchmark": {"symbol": "BENCH", "source": "csv", "calendar": "XNYS"}
+            },
             "validation": {"method": "holdout"},
             "reproducibility": {"random_seed": 42},
         }
@@ -1468,11 +1664,11 @@ def test_cache_covers_hourly_survives_a_weekend_with_calendar_tolerance(
             "volume": 100.0,
         }
     )
-    storage.write_symbol(data, "yahoo", "AAA", "1h")
+    storage.write_symbol(data, "yahoo", "AAA", "1h", calendar="XNYS")
 
     # ~57 hours between the last (Friday) bar and Sunday.
     assert storage.cache_covers(
-        "yahoo", "AAA", "1h", date(2024, 1, 1), date(2024, 1, 7)
+        "yahoo", "AAA", "1h", date(2024, 1, 1), date(2024, 1, 7), calendar="XNYS"
     )
 
 
@@ -1497,16 +1693,16 @@ def test_cache_covers_equity_hourly_rejects_a_sparse_cache_gap(
             "volume": 100.0,
         }
     )
-    storage.write_symbol(data, "yahoo", "AAA", "1h", is_247_market=False)
+    storage.write_symbol(data, "yahoo", "AAA", "1h", calendar="XNYS")
 
     assert not storage.cache_covers(
-        "yahoo", "AAA", "1h", date(2024, 1, 4), date(2024, 1, 5), is_247_market=False
+        "yahoo", "AAA", "1h", date(2024, 1, 4), date(2024, 1, 5), calendar="XNYS"
     )
     # Sanity: a request entirely inside a real weekend (no trading day at
     # all in range) must not be rejected just for lacking a bar that could
     # never exist.
     assert storage.cache_covers(
-        "yahoo", "AAA", "1h", date(2024, 1, 6), date(2024, 1, 7), is_247_market=False
+        "yahoo", "AAA", "1h", date(2024, 1, 6), date(2024, 1, 7), calendar="XNYS"
     )
 
 
@@ -1524,11 +1720,11 @@ def test_cache_covers_equity_hourly_detects_an_internal_missing_hour(
             day_hours = day_hours[day_hours.hour != 12]  # drop noon internally
         hours.extend(day_hours)
     storage.write_symbol(
-        _make_hourly_frame(hours), "yahoo", "AAA", "1h", is_247_market=False
+        _make_hourly_frame(hours), "yahoo", "AAA", "1h", calendar="XNYS"
     )
 
     assert not storage.cache_covers(
-        "yahoo", "AAA", "1h", date(2024, 1, 2), date(2024, 1, 12), is_247_market=False
+        "yahoo", "AAA", "1h", date(2024, 1, 2), date(2024, 1, 12), calendar="XNYS"
     )
 
 
@@ -1545,11 +1741,11 @@ def test_cache_covers_equity_hourly_detects_an_entire_missing_session(
             continue  # entire session missing
         hours.extend(pd.date_range(d.replace(hour=9), d.replace(hour=15), freq="h"))
     storage.write_symbol(
-        _make_hourly_frame(hours), "yahoo", "AAA", "1h", is_247_market=False
+        _make_hourly_frame(hours), "yahoo", "AAA", "1h", calendar="XNYS"
     )
 
     assert not storage.cache_covers(
-        "yahoo", "AAA", "1h", date(2024, 1, 2), date(2024, 1, 12), is_247_market=False
+        "yahoo", "AAA", "1h", date(2024, 1, 2), date(2024, 1, 12), calendar="XNYS"
     )
 
 
@@ -1564,18 +1760,142 @@ def test_cache_covers_equity_hourly_complete_cache_still_passes(
     for d in bdays:
         hours.extend(pd.date_range(d.replace(hour=9), d.replace(hour=15), freq="h"))
     storage.write_symbol(
-        _make_hourly_frame(hours), "yahoo", "AAA", "1h", is_247_market=False
+        _make_hourly_frame(hours), "yahoo", "AAA", "1h", calendar="XNYS"
     )
 
     assert storage.cache_covers(
-        "yahoo", "AAA", "1h", date(2024, 1, 2), date(2024, 1, 12), is_247_market=False
+        "yahoo", "AAA", "1h", date(2024, 1, 2), date(2024, 1, 12), calendar="XNYS"
     )
     # A single-day request landing exactly on the cache's own extent must
     # also still pass (and must still be able to detect a gap, see the two
     # tests above, which both use single- and multi-day ranges).
     assert storage.cache_covers(
-        "yahoo", "AAA", "1h", date(2024, 1, 2), date(2024, 1, 2), is_247_market=False
+        "yahoo", "AAA", "1h", date(2024, 1, 2), date(2024, 1, 2), calendar="XNYS"
     )
+
+
+def test_cache_covers_equity_hourly_handles_a_session_crossing_utc_midnight(
+    tmp_path: Path,
+) -> None:
+    """XASX (UTC+10/+11) sessions open ~23:00 UTC the day *before* their own
+    labeled session date and close ~05:00 UTC on it. Grouping cache
+    coverage by naive UTC calendar day would split one real session's bars
+    across two different "days", undercounting each and wrongly declaring a
+    complete cache incomplete."""
+    from quantlab.data.calendar import sessions
+    from quantlab.data.storage import ParquetStorage
+
+    storage = ParquetStorage(cache_dir=tmp_path / "cache", metadata_dir=tmp_path / "md")
+    schedule = sessions("XASX", pd.Timestamp("2024-01-08"), pd.Timestamp("2024-01-10"))
+    hours: list[pd.Timestamp] = []
+    for _, row in schedule.iterrows():
+        hours.extend(
+            pd.date_range(row["market_open"], row["market_close"], freq="h")[:-1]
+        )
+    storage.write_symbol(
+        _make_hourly_frame(hours), "yahoo", "AAA", "1h", calendar="XASX"
+    )
+
+    assert storage.cache_covers(
+        "yahoo", "AAA", "1h", date(2024, 1, 8), date(2024, 1, 10), calendar="XASX"
+    )
+
+
+def test_cache_covers_equity_hourly_tolerates_xhkg_lunch_break(
+    tmp_path: Path,
+) -> None:
+    """XHKG has an official intraday break (lunch recess): a real provider
+    legitimately has no bars during it. Treating a session as one
+    continuous [open, close) block would count the break as "expected"
+    and wrongly declare a genuinely complete cache incomplete -- but a
+    real internal gap (unrelated to the break) must still be caught."""
+    from quantlab.data.calendar import sessions
+    from quantlab.data.storage import ParquetStorage
+
+    schedule = sessions("XHKG", pd.Timestamp("2024-01-08"), pd.Timestamp("2024-01-08"))
+    row = schedule.iloc[0]
+    hours = list(
+        pd.date_range(
+            row["market_open"], row["break_start"], freq="h", inclusive="left"
+        )
+    ) + list(
+        pd.date_range(row["break_end"], row["market_close"], freq="h", inclusive="left")
+    )
+
+    complete = ParquetStorage(cache_dir=tmp_path / "c1", metadata_dir=tmp_path / "m1")
+    complete.write_symbol(
+        _make_hourly_frame(hours), "yahoo", "AAA", "1h", calendar="XHKG"
+    )
+    assert complete.cache_covers(
+        "yahoo", "AAA", "1h", date(2024, 1, 8), date(2024, 1, 8), calendar="XHKG"
+    )
+
+    gapped_hours = hours[:-1]  # drop the last real bar -- a genuine gap
+    gapped = ParquetStorage(cache_dir=tmp_path / "c2", metadata_dir=tmp_path / "m2")
+    gapped.write_symbol(
+        _make_hourly_frame(gapped_hours), "yahoo", "AAA", "1h", calendar="XHKG"
+    )
+    assert not gapped.cache_covers(
+        "yahoo", "AAA", "1h", date(2024, 1, 8), date(2024, 1, 8), calendar="XHKG"
+    )
+
+
+def test_validator_does_not_flag_xhkg_lunch_break_as_an_abnormal_gap() -> None:
+    """The same break-awareness must apply to DataValidator's own gap and
+    frequency-matching checks, not just the storage cache-coverage check."""
+    from quantlab.data.calendar import sessions
+    from quantlab.data.validator import DataValidator
+
+    schedule = sessions("XHKG", pd.Timestamp("2024-01-08"), pd.Timestamp("2024-02-20"))
+    rows: list[pd.Timestamp] = []
+    for _, row in schedule.iterrows():
+        starts = pd.date_range(
+            row["market_open"], row["market_close"], freq="1h", inclusive="left"
+        )
+        starts = starts[(starts < row["break_start"]) | (starts >= row["break_end"])]
+        rows.extend(starts)
+
+    df = pd.DataFrame(
+        {
+            "timestamp": rows,
+            "symbol": "AAA",
+            "open": 1.0,
+            "high": 1.0,
+            "low": 1.0,
+            "close": 1.0,
+            "adjusted_close": 1.0,
+            "volume": 100.0,
+        }
+    )
+    report = DataValidator(
+        expected_frequency="1h", symbol_calendars={"AAA": "XHKG"}
+    ).validate(df, strict=False)
+    assert not any("abnormal gap" in w for w in report.warnings)
+    assert not any("matching fraction" in w or "matching" in w for w in report.warnings)
+
+    # A genuine, break-unrelated gap (a whole missing session) must still
+    # be caught.
+    rows_missing_session = [
+        ts
+        for ts in rows
+        if ts.normalize() != pd.Timestamp(str(schedule.index[15])).normalize()
+    ]
+    df_missing = pd.DataFrame(
+        {
+            "timestamp": rows_missing_session,
+            "symbol": "AAA",
+            "open": 1.0,
+            "high": 1.0,
+            "low": 1.0,
+            "close": 1.0,
+            "adjusted_close": 1.0,
+            "volume": 100.0,
+        }
+    )
+    report_missing = DataValidator(
+        expected_frequency="1h", symbol_calendars={"AAA": "XHKG"}
+    ).validate(df_missing, strict=False)
+    assert any("abnormal gap" in w for w in report_missing.warnings)
 
 
 def test_cache_covers_weekly_does_not_over_tolerate_real_staleness(
@@ -1597,10 +1917,10 @@ def test_cache_covers_weekly_does_not_over_tolerate_real_staleness(
             "volume": 100.0,
         }
     )
-    storage.write_symbol(data, "yahoo", "AAA", "1w")
+    storage.write_symbol(data, "yahoo", "AAA", "1w", calendar="XNYS")
 
     assert not storage.cache_covers(
-        "yahoo", "AAA", "1w", date(2024, 1, 1), date(2024, 1, 29)
+        "yahoo", "AAA", "1w", date(2024, 1, 1), date(2024, 1, 29), calendar="XNYS"
     )
 
 
@@ -1623,7 +1943,7 @@ def test_cache_covers_247_market_does_not_mask_missing_crypto_days(
             "volume": 100.0,
         }
     )
-    storage.write_symbol(data, "binance", "BTCUSDT", "1h")
+    storage.write_symbol(data, "binance", "BTCUSDT", "1h", calendar="24/7")
 
     # A genuine 72-hour gap must be caught for a 24/7 market...
     assert not storage.cache_covers(
@@ -1632,7 +1952,7 @@ def test_cache_covers_247_market_does_not_mask_missing_crypto_days(
         "1h",
         date(2023, 12, 29),
         date(2024, 1, 4),
-        is_247_market=True,
+        calendar="24/7",
     )
     # The same cache also misses genuine XNYS sessions through January 4;
     # exact session coverage must reject it instead of spending weekend slack.
@@ -1642,7 +1962,7 @@ def test_cache_covers_247_market_does_not_mask_missing_crypto_days(
         "1h",
         date(2023, 12, 29),
         date(2024, 1, 4),
-        is_247_market=False,
+        calendar="XNYS",
     )
     # A tiny, realistic posting lag (a few hours before the *end* of the
     # requested day, not its start — `end` is inclusive of its whole
@@ -1653,22 +1973,24 @@ def test_cache_covers_247_market_does_not_mask_missing_crypto_days(
         "1h",
         date(2023, 12, 29),
         date(2023, 12, 31),
-        is_247_market=True,
+        calendar="24/7",
     )
 
 
-def test_dataloader_threads_is_247_market_into_cache_covers() -> None:
-    """`DataLoader._download_symbol` must pass the config's resolved
-    `is_247_market` flag through to `cache_covers`, not rely on its
-    (equity-biased) default."""
+def test_dataloader_threads_calendar_into_cache_covers() -> None:
+    """`DataLoader._download_symbol` must pass the instrument's own resolved
+    `calendar` through to `cache_covers`, not rely on its (equity-biased)
+    default."""
     from quantlab.config import ExperimentConfig
+    from quantlab.data.calendar import is_247
 
     cfg = ExperimentConfig.from_dict(
         {
             "experiment_name": "test",
             "data": {
-                "source": "binance",
-                "symbols": ["BTCUSDT"],
+                "instruments": [
+                    {"symbol": "BTCUSDT", "source": "binance", "calendar": "24/7"},
+                ],
                 "start_date": "2020-01-01",
                 "end_date": "2020-06-01",
                 "frequency": "1d",
@@ -1681,7 +2003,7 @@ def test_dataloader_threads_is_247_market_into_cache_covers() -> None:
             "reproducibility": {"random_seed": 42},
         }
     )
-    assert cfg.data.is_247_market is True
+    assert is_247(cfg.data.instruments[0].calendar) is True
 
 
 def test_cache_covers_end_boundary_matches_loaders_inclusive_day(
@@ -1703,7 +2025,7 @@ def test_cache_covers_end_boundary_matches_loaders_inclusive_day(
             "volume": 100.0,
         }
     )
-    storage.write_symbol(data, "binance", "BTCUSDT", "1h")
+    storage.write_symbol(data, "binance", "BTCUSDT", "1h", calendar="24/7")
 
     # Cache stops Jan 2 23:00; the entire 24 bars of Jan 3 are missing.
     assert not storage.cache_covers(
@@ -1712,7 +2034,7 @@ def test_cache_covers_end_boundary_matches_loaders_inclusive_day(
         "1h",
         date(2024, 1, 1),
         date(2024, 1, 3),
-        is_247_market=True,
+        calendar="24/7",
     )
     # But it does genuinely cover through Jan 2 itself.
     assert storage.cache_covers(
@@ -1721,7 +2043,7 @@ def test_cache_covers_end_boundary_matches_loaders_inclusive_day(
         "1h",
         date(2024, 1, 1),
         date(2024, 1, 2),
-        is_247_market=True,
+        calendar="24/7",
     )
 
 
@@ -1745,7 +2067,7 @@ def test_cache_covers_equity_does_not_skip_a_real_weekday_gap(
             "volume": 100.0,
         }
     )
-    storage.write_symbol(data, "yahoo", "SPY", "1d")
+    storage.write_symbol(data, "yahoo", "SPY", "1d", calendar="XNYS")
 
     # Request through the following Tuesday: Monday + Tuesday sessions are
     # genuinely missing from the cache.
@@ -1755,7 +2077,7 @@ def test_cache_covers_equity_does_not_skip_a_real_weekday_gap(
         "1d",
         date(2023, 1, 2),
         date(2024, 1, 9),
-        is_247_market=False,
+        calendar="XNYS",
     )
     # Request through the weekend itself (Sunday): nothing more could
     # possibly exist, so this must still be tolerated.
@@ -1765,7 +2087,7 @@ def test_cache_covers_equity_does_not_skip_a_real_weekday_gap(
         "1d",
         date(2023, 1, 2),
         date(2024, 1, 7),
-        is_247_market=False,
+        calendar="XNYS",
     )
 
 
@@ -1783,7 +2105,7 @@ def test_cache_covers_complete_daily_cache_is_not_declared_incomplete(
         "1d",
         date(2024, 1, 1),
         date(2024, 1, 10),
-        is_247_market=True,
+        calendar="24/7",
     )
 
 
@@ -1798,11 +2120,11 @@ def test_cache_covers_rejects_a_missing_single_weekday_session(
     dates = pd.bdate_range("2024-12-01", "2025-01-03")
     _write_daily_cache(storage, "yahoo", "SPY", dates)
     assert not storage.cache_covers(
-        "yahoo", "SPY", "1d", date(2024, 12, 1), date(2025, 1, 6), is_247_market=False
+        "yahoo", "SPY", "1d", date(2024, 12, 1), date(2025, 1, 6), calendar="XNYS"
     )
     # Through Sunday (the weekend itself): nothing more could exist.
     assert storage.cache_covers(
-        "yahoo", "SPY", "1d", date(2024, 12, 1), date(2025, 1, 5), is_247_market=False
+        "yahoo", "SPY", "1d", date(2024, 12, 1), date(2025, 1, 5), calendar="XNYS"
     )
 
 
@@ -1820,7 +2142,7 @@ def test_cache_covers_rejects_several_missing_leading_sessions(
     dates = pd.bdate_range("2025-01-24", "2025-02-01")
     _write_daily_cache(storage, "yahoo", "SPY", dates)
     assert not storage.cache_covers(
-        "yahoo", "SPY", "1d", date(2025, 1, 20), date(2025, 2, 1), is_247_market=False
+        "yahoo", "SPY", "1d", date(2025, 1, 20), date(2025, 2, 1), calendar="XNYS"
     )
 
 
@@ -1844,14 +2166,14 @@ def test_cache_covers_hourly_247_flags_missing_edge_hours(
             "volume": 100.0,
         }
     )
-    storage.write_symbol(data, "binance", "BTCUSDT", "1h")
+    storage.write_symbol(data, "binance", "BTCUSDT", "1h", calendar="24/7")
     assert not storage.cache_covers(
         "binance",
         "BTCUSDT",
         "1h",
         date(2024, 1, 1),
         date(2024, 1, 2),
-        is_247_market=True,
+        calendar="24/7",
     )
 
 
@@ -1877,9 +2199,9 @@ def test_cache_covers_weekly_complete_cache_is_not_declared_incomplete(
             "volume": 100.0,
         }
     )
-    storage.write_symbol(data, "yahoo", "SPY", "1w")
+    storage.write_symbol(data, "yahoo", "SPY", "1w", calendar="XNYS")
     assert storage.cache_covers(
-        "yahoo", "SPY", "1w", date(2024, 1, 1), date(2024, 12, 30), is_247_market=False
+        "yahoo", "SPY", "1w", date(2024, 1, 1), date(2024, 12, 30), calendar="XNYS"
     )
 
 
@@ -1901,9 +2223,9 @@ def test_cache_covers_monthly_january_bar_covers_whole_january(
             "volume": 100.0,
         }
     )
-    storage.write_symbol(data, "yahoo", "SPY", "1mo")
+    storage.write_symbol(data, "yahoo", "SPY", "1mo", calendar="XNYS")
     assert storage.cache_covers(
-        "yahoo", "SPY", "1mo", date(2021, 1, 1), date(2021, 1, 31), is_247_market=False
+        "yahoo", "SPY", "1mo", date(2021, 1, 1), date(2021, 1, 31), calendar="XNYS"
     )
 
 
@@ -1925,13 +2247,13 @@ def test_cache_covers_monthly_february_bar_does_not_mask_missing_march(
             "volume": 100.0,
         }
     )
-    storage.write_symbol(data, "yahoo", "SPY", "1mo")
+    storage.write_symbol(data, "yahoo", "SPY", "1mo", calendar="XNYS")
     assert not storage.cache_covers(
-        "yahoo", "SPY", "1mo", date(2021, 2, 1), date(2021, 3, 1), is_247_market=False
+        "yahoo", "SPY", "1mo", date(2021, 2, 1), date(2021, 3, 1), calendar="XNYS"
     )
     # But the same cache genuinely does cover a request confined to February.
     assert storage.cache_covers(
-        "yahoo", "SPY", "1mo", date(2021, 2, 1), date(2021, 2, 28), is_247_market=False
+        "yahoo", "SPY", "1mo", date(2021, 2, 1), date(2021, 2, 28), calendar="XNYS"
     )
 
 
@@ -1942,9 +2264,9 @@ def test_cache_covers_monthly_detects_a_missing_internal_month(
 
     storage = ParquetStorage(cache_dir=tmp_path / "cache", metadata_dir=tmp_path / "md")
     dates = pd.to_datetime(["2021-01-01", "2021-03-01"])
-    storage.write_symbol(_ohlcv_at(dates), "yahoo", "SPY", "1mo")
+    storage.write_symbol(_ohlcv_at(dates), "yahoo", "SPY", "1mo", calendar="XNYS")
     assert not storage.cache_covers(
-        "yahoo", "SPY", "1mo", date(2021, 1, 1), date(2021, 3, 31), is_247_market=False
+        "yahoo", "SPY", "1mo", date(2021, 1, 1), date(2021, 3, 31), calendar="XNYS"
     )
 
 
@@ -1957,9 +2279,9 @@ def test_cache_covers_weekly_detects_a_missing_internal_week(
 
     storage = ParquetStorage(cache_dir=tmp_path / "cache", metadata_dir=tmp_path / "md")
     dates = pd.to_datetime(["2021-01-01", "2021-01-15"])
-    storage.write_symbol(_ohlcv_at(dates), "yahoo", "SPY", "1w")
+    storage.write_symbol(_ohlcv_at(dates), "yahoo", "SPY", "1w", calendar="XNYS")
     assert not storage.cache_covers(
-        "yahoo", "SPY", "1w", date(2021, 1, 1), date(2021, 1, 15), is_247_market=False
+        "yahoo", "SPY", "1w", date(2021, 1, 1), date(2021, 1, 15), calendar="XNYS"
     )
 
 
@@ -1972,15 +2294,17 @@ def test_cache_covers_monthly_and_weekly_complete_caches_still_pass(
 
     storage = ParquetStorage(cache_dir=tmp_path / "cache", metadata_dir=tmp_path / "md")
     monthly = pd.to_datetime(["2021-01-01", "2021-02-01", "2021-03-01"])
-    storage.write_symbol(_ohlcv_at(monthly), "yahoo", "SPY", "1mo")
+    storage.write_symbol(_ohlcv_at(monthly), "yahoo", "SPY", "1mo", calendar="XNYS")
     assert storage.cache_covers(
-        "yahoo", "SPY", "1mo", date(2021, 1, 1), date(2021, 3, 31), is_247_market=False
+        "yahoo", "SPY", "1mo", date(2021, 1, 1), date(2021, 3, 31), calendar="XNYS"
     )
 
     weekly = pd.to_datetime(["2021-01-01", "2021-01-08", "2021-01-15"])
-    storage.write_symbol(_ohlcv_at(weekly, symbol="QQQ"), "yahoo", "QQQ", "1w")
+    storage.write_symbol(
+        _ohlcv_at(weekly, symbol="QQQ"), "yahoo", "QQQ", "1w", calendar="XNYS"
+    )
     assert storage.cache_covers(
-        "yahoo", "QQQ", "1w", date(2021, 1, 1), date(2021, 1, 15), is_247_market=False
+        "yahoo", "QQQ", "1w", date(2021, 1, 1), date(2021, 1, 15), calendar="XNYS"
     )
 
 
@@ -1991,14 +2315,18 @@ def test_cache_covers_monthly_bar_does_not_overclaim_past_its_own_month(
 
     storage = ParquetStorage(cache_dir=tmp_path / "cache", metadata_dir=tmp_path / "md")
     storage.write_symbol(
-        _ohlcv_at(pd.to_datetime(["2021-01-02"])), "yahoo", "SPY", "1mo"
+        _ohlcv_at(pd.to_datetime(["2021-01-02"])),
+        "yahoo",
+        "SPY",
+        "1mo",
+        calendar="XNYS",
     )
     assert not storage.cache_covers(
-        "yahoo", "SPY", "1mo", date(2021, 1, 2), date(2021, 2, 1), is_247_market=False
+        "yahoo", "SPY", "1mo", date(2021, 1, 2), date(2021, 2, 1), calendar="XNYS"
     )
     # But it does genuinely cover a request confined to its own month.
     assert storage.cache_covers(
-        "yahoo", "SPY", "1mo", date(2021, 1, 2), date(2021, 1, 31), is_247_market=False
+        "yahoo", "SPY", "1mo", date(2021, 1, 2), date(2021, 1, 31), calendar="XNYS"
     )
 
 
@@ -2009,9 +2337,9 @@ def test_cache_covers_monthly_gap_in_requested_start_month_detected(
 
     storage = ParquetStorage(cache_dir=tmp_path / "cache", metadata_dir=tmp_path / "md")
     dates = pd.to_datetime(["2019-12-01", "2020-02-01"])
-    storage.write_symbol(_ohlcv_at(dates), "yahoo", "SPY", "1mo")
+    storage.write_symbol(_ohlcv_at(dates), "yahoo", "SPY", "1mo", calendar="XNYS")
     assert not storage.cache_covers(
-        "yahoo", "SPY", "1mo", date(2020, 1, 15), date(2020, 2, 29), is_247_market=False
+        "yahoo", "SPY", "1mo", date(2020, 1, 15), date(2020, 2, 29), calendar="XNYS"
     )
 
 
@@ -2022,9 +2350,9 @@ def test_cache_covers_weekly_gap_in_requested_start_week_detected(
 
     storage = ParquetStorage(cache_dir=tmp_path / "cache", metadata_dir=tmp_path / "md")
     dates = pd.to_datetime(["2020-01-01", "2020-01-15"])
-    storage.write_symbol(_ohlcv_at(dates), "yahoo", "SPY", "1w")
+    storage.write_symbol(_ohlcv_at(dates), "yahoo", "SPY", "1w", calendar="XNYS")
     assert not storage.cache_covers(
-        "yahoo", "SPY", "1w", date(2020, 1, 10), date(2020, 1, 15), is_247_market=False
+        "yahoo", "SPY", "1w", date(2020, 1, 10), date(2020, 1, 15), calendar="XNYS"
     )
 
 
@@ -2035,9 +2363,9 @@ def test_cache_covers_monthly_tolerates_shifting_first_trading_day(
 
     storage = ParquetStorage(cache_dir=tmp_path / "cache", metadata_dir=tmp_path / "md")
     dates = pd.to_datetime(["2020-01-03", "2020-02-03", "2020-03-03", "2020-04-03"])
-    storage.write_symbol(_ohlcv_at(dates), "yahoo", "SPY", "1mo")
+    storage.write_symbol(_ohlcv_at(dates), "yahoo", "SPY", "1mo", calendar="XNYS")
     assert storage.cache_covers(
-        "yahoo", "SPY", "1mo", date(2020, 1, 3), date(2020, 4, 3), is_247_market=False
+        "yahoo", "SPY", "1mo", date(2020, 1, 3), date(2020, 4, 3), calendar="XNYS"
     )
 
 
@@ -2051,9 +2379,9 @@ def test_cache_covers_weekly_tolerates_a_holiday_shifted_first_week(
         pd.Timestamp("2024-01-02"),
         *pd.date_range("2024-01-08", "2024-12-30", freq="W-MON"),
     ]
-    storage.write_symbol(_ohlcv_at(dates), "yahoo", "SPY", "1w")
+    storage.write_symbol(_ohlcv_at(dates), "yahoo", "SPY", "1w", calendar="XNYS")
     assert storage.cache_covers(
-        "yahoo", "SPY", "1w", date(2024, 1, 2), date(2024, 12, 30), is_247_market=False
+        "yahoo", "SPY", "1w", date(2024, 1, 2), date(2024, 12, 30), calendar="XNYS"
     )
 
 
@@ -2064,16 +2392,16 @@ def test_cache_covers_rejects_sparse_cache_narrower_than_a_bucket(
 
     storage = ParquetStorage(cache_dir=tmp_path / "cache", metadata_dir=tmp_path / "md")
     dates = pd.to_datetime(["2024-01-01", "2024-01-10"])
-    storage.write_symbol(_ohlcv_at(dates), "yahoo", "SPY", "1w")
+    storage.write_symbol(_ohlcv_at(dates), "yahoo", "SPY", "1w", calendar="XNYS")
     assert not storage.cache_covers(
-        "yahoo", "SPY", "1w", date(2024, 1, 5), date(2024, 1, 6), is_247_market=False
+        "yahoo", "SPY", "1w", date(2024, 1, 5), date(2024, 1, 6), calendar="XNYS"
     )
     # Same root cause, different shape: the one raw-timestamp match that
     # exists (January 1st) is real, but its own bucket doesn't settle until
     # the following week, so a request for exactly that one day alone still
     # can't actually be served either.
     assert not storage.cache_covers(
-        "yahoo", "SPY", "1w", date(2024, 1, 1), date(2024, 1, 1), is_247_market=False
+        "yahoo", "SPY", "1w", date(2024, 1, 1), date(2024, 1, 1), calendar="XNYS"
     )
 
 
@@ -2087,26 +2415,36 @@ def test_cache_covers_weekly_request_starting_on_a_holiday(
         pd.Timestamp("2024-01-02"),
         *pd.date_range("2024-01-08", "2024-03-25", freq="W-MON"),
     ]
-    storage.write_symbol(_ohlcv_at(dates), "yahoo", "SPY", "1w")
+    storage.write_symbol(_ohlcv_at(dates), "yahoo", "SPY", "1w", calendar="XNYS")
     assert storage.cache_covers(
-        "yahoo", "SPY", "1w", date(2024, 1, 1), date(2024, 3, 1), is_247_market=False
+        "yahoo", "SPY", "1w", date(2024, 1, 1), date(2024, 3, 1), calendar="XNYS"
     )
     # Sanity: a genuine gap must still be caught, holiday-start or not.
     gappy = [d for d in dates if d != pd.Timestamp("2024-01-08")]
-    storage.write_symbol(_ohlcv_at(gappy, symbol="QQQ"), "yahoo", "QQQ", "1w")
+    storage.write_symbol(
+        _ohlcv_at(gappy, symbol="QQQ"), "yahoo", "QQQ", "1w", calendar="XNYS"
+    )
     assert not storage.cache_covers(
-        "yahoo", "QQQ", "1w", date(2024, 1, 1), date(2024, 3, 1), is_247_market=False
+        "yahoo", "QQQ", "1w", date(2024, 1, 1), date(2024, 3, 1), calendar="XNYS"
     )
 
 
-def test_write_symbol_drops_a_still_open_bar(tmp_path: Path) -> None:
+def test_write_then_read_symbol_hides_a_still_open_bar_from_the_served_view(
+    tmp_path: Path,
+) -> None:
+    """The round trip serves a still-open bar as absent -- write_symbol
+    itself never drops it from the persisted file (see
+    test_write_symbol_never_drops_still_open_bars_from_the_persisted_file);
+    only read_symbol's own view is filtered."""
     from quantlab.data.storage import ParquetStorage
 
     storage = ParquetStorage(cache_dir=tmp_path / "cache", metadata_dir=tmp_path / "md")
     now = pd.Timestamp.now(tz="UTC").tz_localize(None)
     still_open_month = now.normalize() + pd.offsets.MonthBegin(1)
-    storage.write_symbol(_ohlcv_at([still_open_month]), "yahoo", "SPY", "1mo")
-    cached = storage.read_symbol("yahoo", "SPY", "1mo")
+    storage.write_symbol(
+        _ohlcv_at([still_open_month]), "yahoo", "SPY", "1mo", calendar="XNYS"
+    )
+    cached = storage.read_symbol("yahoo", "SPY", "1mo", calendar="XNYS")
     assert cached is None or cached.empty
 
 
@@ -2124,12 +2462,24 @@ def test_write_symbol_forced_rewrite_clears_a_stale_legacy_bar(
     assert len(before) == 1  # stale bar present, read directly off disk
 
     empty = _ohlcv_at([]).astype({"timestamp": "datetime64[ns]", "symbol": "object"})
-    storage.write_symbol(empty, "yahoo", "SPY", "1mo")
-    after = storage.read_symbol("yahoo", "SPY", "1mo")
+    storage.write_symbol(empty, "yahoo", "SPY", "1mo", calendar="XNYS")
+    after = storage.read_symbol("yahoo", "SPY", "1mo", calendar="XNYS")
     assert after is None or after.empty
 
 
-def test_read_symbol_purges_a_still_open_bar_from_disk(tmp_path: Path) -> None:
+def test_read_symbol_filters_a_still_open_bar_without_touching_disk(
+    tmp_path: Path,
+) -> None:
+    """read_symbol must never rewrite the cache file -- only write_symbol
+    does. Two experiments can legitimately share one cache key (same
+    source/symbol/frequency) while using different calendars, which settle
+    a bar's bucket at different instants (e.g. XNYS's real close time vs
+    24/7's UTC-midnight convention); if a read purged the file using
+    whichever caller happened to ask first, one calendar's "still open"
+    opinion could permanently delete a bar another calendar had already
+    correctly settled and stored. Filtering the served view without ever
+    rewriting the file rules that out categorically, regardless of which
+    calendar reads it or in what order."""
     from quantlab.data.storage import ParquetStorage
 
     storage = ParquetStorage(cache_dir=tmp_path / "cache", metadata_dir=tmp_path / "md")
@@ -2138,14 +2488,14 @@ def test_read_symbol_purges_a_still_open_bar_from_disk(tmp_path: Path) -> None:
     path = storage._cache_path("yahoo", "SPY", "1mo")
     storage.save(_ohlcv_at([still_open_month]), path)
 
-    served = storage.read_symbol("yahoo", "SPY", "1mo")
+    served = storage.read_symbol("yahoo", "SPY", "1mo", calendar="XNYS")
     assert served is not None
     assert served.empty
 
-    # Purged from disk too, not merely filtered in-memory -- a second,
-    # independent read of the raw file must not see it either.
+    # Left untouched on disk -- a still-open bar is filtered for THIS
+    # caller only, never purged from the shared file.
     on_disk = storage.load(path)
-    assert on_disk.empty
+    assert len(on_disk) == 1
 
 
 def test_csv_source_does_not_serve_a_still_open_bar(tmp_path: Path) -> None:
@@ -2180,12 +2530,10 @@ def test_csv_source_does_not_serve_a_still_open_bar(tmp_path: Path) -> None:
         {
             "experiment_name": "test",
             "data": {
-                "source": "csv",
-                "symbols": ["BTC"],
+                "instruments": [{"symbol": "BTC", "source": "csv", "calendar": "24/7"}],
                 "start_date": str(dates[0].date()),
                 "end_date": str(still_open_day.date()),
                 "frequency": "1d",
-                "market_calendar": "24/7",
             },
             "strategy": {"name": "buy_and_hold"},
         }
@@ -2212,9 +2560,9 @@ def test_cache_covers_detects_missing_internal_daily_bar(tmp_path: Path) -> None
             "volume": 100.0,
         }
     )
-    storage.write_symbol(data, "yahoo", "SPY", "1d")
+    storage.write_symbol(data, "yahoo", "SPY", "1d", calendar="XNYS")
     assert not storage.cache_covers(
-        "yahoo", "SPY", "1d", date(2021, 1, 4), date(2021, 3, 1), is_247_market=False
+        "yahoo", "SPY", "1d", date(2021, 1, 4), date(2021, 3, 1), calendar="XNYS"
     )
 
 
@@ -2238,9 +2586,9 @@ def test_cache_covers_detects_missing_internal_hourly_247_bar(
             "volume": 100.0,
         }
     )
-    storage.write_symbol(data, "binance", "BTC", "1h")
+    storage.write_symbol(data, "binance", "BTC", "1h", calendar="24/7")
     assert not storage.cache_covers(
-        "binance", "BTC", "1h", date(2021, 1, 1), date(2021, 1, 2), is_247_market=True
+        "binance", "BTC", "1h", date(2021, 1, 1), date(2021, 1, 2), calendar="24/7"
     )
 
 
@@ -2264,9 +2612,9 @@ def test_cache_covers_tolerates_a_small_number_of_calendar_blind_spots(
             "volume": 100.0,
         }
     )
-    storage.write_symbol(data, "yahoo", "SPY", "1d")
+    storage.write_symbol(data, "yahoo", "SPY", "1d", calendar="XNYS")
     assert storage.cache_covers(
-        "yahoo", "SPY", "1d", date(2012, 10, 1), date(2012, 11, 30), is_247_market=False
+        "yahoo", "SPY", "1d", date(2012, 10, 1), date(2012, 11, 30), calendar="XNYS"
     )
 
 
@@ -2290,9 +2638,9 @@ def test_cache_covers_rejects_an_arbitrary_missing_session(
             "volume": 100.0,
         }
     )
-    storage.write_symbol(data, "yahoo", "SPY", "1d")
+    storage.write_symbol(data, "yahoo", "SPY", "1d", calendar="XNYS")
     assert not storage.cache_covers(
-        "yahoo", "SPY", "1d", date(2019, 1, 1), date(2019, 12, 31), is_247_market=False
+        "yahoo", "SPY", "1d", date(2019, 1, 1), date(2019, 12, 31), calendar="XNYS"
     )
 
 
@@ -2316,14 +2664,14 @@ def test_cache_covers_247_daily_has_zero_calendar_tolerance(
             "volume": 100.0,
         }
     )
-    storage.write_symbol(data, "binance", "BTCUSDT", "1d")
+    storage.write_symbol(data, "binance", "BTCUSDT", "1d", calendar="24/7")
     assert not storage.cache_covers(
         "binance",
         "BTCUSDT",
         "1d",
         date(2021, 1, 1),
         date(2021, 3, 1),
-        is_247_market=True,
+        calendar="24/7",
     )
 
 
@@ -2349,14 +2697,14 @@ def test_cache_covers_247_hourly_has_zero_calendar_tolerance(
             "volume": 100.0,
         }
     )
-    storage.write_symbol(data, "binance", "BTCUSDT", "1h")
+    storage.write_symbol(data, "binance", "BTCUSDT", "1h", calendar="24/7")
     assert not storage.cache_covers(
         "binance",
         "BTCUSDT",
         "1h",
         date(2021, 1, 1),
         date(2021, 1, 20),
-        is_247_market=True,
+        calendar="24/7",
     )
 
 
@@ -2378,9 +2726,9 @@ def test_cache_covers_equity_daily_tolerance_unaffected(tmp_path: Path) -> None:
             "volume": 100.0,
         }
     )
-    storage.write_symbol(data, "yahoo", "SPY", "1d")
+    storage.write_symbol(data, "yahoo", "SPY", "1d", calendar="XNYS")
     assert storage.cache_covers(
-        "yahoo", "SPY", "1d", date(2012, 10, 1), date(2012, 11, 30), is_247_market=False
+        "yahoo", "SPY", "1d", date(2012, 10, 1), date(2012, 11, 30), calendar="XNYS"
     )
 
 
@@ -2406,9 +2754,9 @@ def test_cache_covers_complete_daily_and_hourly_caches_still_pass(
             "volume": 100.0,
         }
     )
-    storage.write_symbol(data, "yahoo", "SPY", "1d")
+    storage.write_symbol(data, "yahoo", "SPY", "1d", calendar="XNYS")
     assert storage.cache_covers(
-        "yahoo", "SPY", "1d", date(2021, 1, 4), date(2021, 1, 8), is_247_market=False
+        "yahoo", "SPY", "1d", date(2021, 1, 4), date(2021, 1, 8), calendar="XNYS"
     )
 
     hours = pd.date_range("2021-01-01", periods=48, freq="h").tolist()
@@ -2424,9 +2772,9 @@ def test_cache_covers_complete_daily_and_hourly_caches_still_pass(
             "volume": 100.0,
         }
     )
-    storage.write_symbol(data2, "binance", "BTC", "1h")
+    storage.write_symbol(data2, "binance", "BTC", "1h", calendar="24/7")
     assert storage.cache_covers(
-        "binance", "BTC", "1h", date(2021, 1, 1), date(2021, 1, 2), is_247_market=True
+        "binance", "BTC", "1h", date(2021, 1, 1), date(2021, 1, 2), calendar="24/7"
     )
 
 
@@ -2450,9 +2798,9 @@ def test_cache_covers_ignores_a_gap_outside_the_requested_range(
             "volume": 100.0,
         }
     )
-    storage.write_symbol(data, "yahoo", "SPY", "1d")
+    storage.write_symbol(data, "yahoo", "SPY", "1d", calendar="XNYS")
     assert storage.cache_covers(
-        "yahoo", "SPY", "1d", date(2020, 1, 1), date(2020, 12, 31), is_247_market=False
+        "yahoo", "SPY", "1d", date(2020, 1, 1), date(2020, 12, 31), calendar="XNYS"
     )
     # A request that actually spans the (small, tolerated) 2012 Sandy gap
     # must still pass too — see
@@ -2477,9 +2825,10 @@ def test_cache_covers_ignores_a_gap_outside_the_requested_range(
         "yahoo",
         "QQQ",
         "1d",
+        calendar="XNYS",
     )
     assert not storage.cache_covers(
-        "yahoo", "QQQ", "1d", date(2016, 1, 1), date(2016, 12, 31), is_247_market=False
+        "yahoo", "QQQ", "1d", date(2016, 1, 1), date(2016, 12, 31), calendar="XNYS"
     )
 
 
@@ -2505,9 +2854,9 @@ def test_cache_covers_hourly_247_ignores_a_gap_outside_the_requested_range(
             "volume": 100.0,
         }
     )
-    storage.write_symbol(data, "binance", "BTC", "1h")
+    storage.write_symbol(data, "binance", "BTC", "1h", calendar="24/7")
     assert storage.cache_covers(
-        "binance", "BTC", "1h", date(2021, 1, 7), date(2021, 1, 8), is_247_market=True
+        "binance", "BTC", "1h", date(2021, 1, 7), date(2021, 1, 8), calendar="24/7"
     )
 
 
@@ -2549,14 +2898,14 @@ def test_cache_covers_daily_spy_stopped_dec30_2021_is_incomplete_for_dec31(
             "volume": 100.0,
         }
     )
-    storage.write_symbol(data, "yahoo", "SPY", "1d")
+    storage.write_symbol(data, "yahoo", "SPY", "1d", calendar="XNYS")
     assert not storage.cache_covers(
         "yahoo",
         "SPY",
         "1d",
         date(2021, 12, 20),
         date(2021, 12, 31),
-        is_247_market=False,
+        calendar="XNYS",
     )
 
 
@@ -2577,10 +2926,10 @@ def test_cache_covers_a_future_end_date_does_not_perpetually_fail(
     # cache stopping at a fixed "yesterday" would itself be stale (missing
     # today's already-closed session) whenever this test happens to run
     # after today's market close.
-    latest_closed_day = last_trading_day_on_or_before(today, is_247_market=False)
+    latest_closed_day = last_trading_day_on_or_before(today, calendar="XNYS")
     if latest_closed_day == today and daily_equity_bucket_settlement(today) > now:
         latest_closed_day = last_trading_day_on_or_before(
-            today - pd.Timedelta(days=1), is_247_market=False
+            today - pd.Timedelta(days=1), calendar="XNYS"
         )
     dates = pd.bdate_range(end=latest_closed_day, periods=250)
     data = pd.DataFrame(
@@ -2595,10 +2944,10 @@ def test_cache_covers_a_future_end_date_does_not_perpetually_fail(
             "volume": 100.0,
         }
     )
-    storage.write_symbol(data, "yahoo", "SPY", "1d")
+    storage.write_symbol(data, "yahoo", "SPY", "1d", calendar="XNYS")
     future_end = (today + pd.Timedelta(days=365)).date()
     assert storage.cache_covers(
-        "yahoo", "SPY", "1d", dates[0].date(), future_end, is_247_market=False
+        "yahoo", "SPY", "1d", dates[0].date(), future_end, calendar="XNYS"
     )
 
 
@@ -2626,10 +2975,10 @@ def test_cache_covers_a_future_end_date_still_rejects_a_genuinely_stale_cache(
             "volume": 100.0,
         }
     )
-    storage.write_symbol(stale, "yahoo", "SPY", "1d")
+    storage.write_symbol(stale, "yahoo", "SPY", "1d", calendar="XNYS")
     future_end = (today + pd.Timedelta(days=365)).date()
     assert not storage.cache_covers(
-        "yahoo", "SPY", "1d", dates[0].date(), future_end, is_247_market=False
+        "yahoo", "SPY", "1d", dates[0].date(), future_end, calendar="XNYS"
     )
 
 
@@ -2676,11 +3025,11 @@ def test_safe_prevents_cache_read_write_collision_end_to_end() -> None:
                 "volume": 0.0,
             }
         )
-        storage.write_symbol(eur, "yahoo", "EURUSD=X", "1d")
-        storage.write_symbol(other, "yahoo", "EURUSD_X", "1d")
+        storage.write_symbol(eur, "yahoo", "EURUSD=X", "1d", calendar="XNYS")
+        storage.write_symbol(other, "yahoo", "EURUSD_X", "1d", calendar="XNYS")
 
-        read_eur = storage.read_symbol("yahoo", "EURUSD=X", "1d")
-        read_other = storage.read_symbol("yahoo", "EURUSD_X", "1d")
+        read_eur = storage.read_symbol("yahoo", "EURUSD=X", "1d", calendar="XNYS")
+        read_other = storage.read_symbol("yahoo", "EURUSD_X", "1d", calendar="XNYS")
         assert read_eur is not None
         assert read_other is not None
         assert (read_eur["close"] == 1.1).all()
@@ -2713,10 +3062,10 @@ def test_load_slices_before_cleaning_not_after() -> None:
 
     # The *correct*, order-independent pipeline: slice first, then clean.
     sliced_then_cleaned_wide = cleaner.clean(
-        DataLoader._slice_range(raw_wide, start, end, "1d", is_247_market=False)
+        DataLoader._slice_range(raw_wide, start, end, "1d", calendar="XNYS")
     )
     sliced_then_cleaned_narrow = cleaner.clean(
-        DataLoader._slice_range(narrow, start, end, "1d", is_247_market=False)
+        DataLoader._slice_range(narrow, start, end, "1d", calendar="XNYS")
     )
     assert len(sliced_then_cleaned_wide) == len(sliced_then_cleaned_narrow) == 2
     pd.testing.assert_frame_equal(
@@ -2729,10 +3078,10 @@ def test_load_slices_before_cleaning_not_after() -> None:
     # regression back to that order is caught by this test actually
     # detecting a difference.
     clean_then_slice_wide = DataLoader._slice_range(
-        cleaner.clean(raw_wide), start, end, "1d", is_247_market=False
+        cleaner.clean(raw_wide), start, end, "1d", calendar="XNYS"
     )
     clean_then_slice_narrow = DataLoader._slice_range(
-        cleaner.clean(narrow), start, end, "1d", is_247_market=False
+        cleaner.clean(narrow), start, end, "1d", calendar="XNYS"
     )
     assert len(clean_then_slice_wide) != len(clean_then_slice_narrow)
 
@@ -2753,7 +3102,9 @@ def test_validator_flags_a_requested_symbol_with_zero_rows() -> None:
         }
     )
     # A file for "AAA" that actually contains "BBB"'s data.
-    report = DataValidator().validate(frame, expected_symbols=["AAA"])
+    report = DataValidator(symbol_calendars=_UniformCalendar("XNYS")).validate(
+        frame, expected_symbols=["AAA"]
+    )
     assert not report.is_clean
     assert any("AAA" in w for w in report.warnings)
 
@@ -2779,13 +3130,17 @@ def test_validator_flags_a_symbol_fully_removed_by_cleaning() -> None:
     cleaned = DataCleaner(MissingValuePolicy.DROP).clean(frame)
     assert "BBB" not in set(cleaned["symbol"].unique())
 
-    report = DataValidator().validate(cleaned, expected_symbols=["AAA", "BBB"])
+    report = DataValidator(symbol_calendars=_UniformCalendar("XNYS")).validate(
+        cleaned, expected_symbols=["AAA", "BBB"]
+    )
     assert not report.is_clean
     assert any("BBB" in w for w in report.warnings)
 
     # Without `expected_symbols`, validation must still complete normally
     # (not raise/error) — it simply can't detect the missing-symbol gap.
-    report_without = DataValidator().validate(cleaned)
+    report_without = DataValidator(symbol_calendars=_UniformCalendar("XNYS")).validate(
+        cleaned
+    )
     assert not any("BBB" in w for w in report_without.warnings)
 
 
@@ -2806,7 +3161,9 @@ def test_validator_raises_on_missing_symbol_in_strict_mode() -> None:
         }
     )
     with pytest.raises(DataValidationError, match="BBB"):
-        DataValidator().validate(frame, expected_symbols=["AAA", "BBB"], strict=True)
+        DataValidator(symbol_calendars=_UniformCalendar("XNYS")).validate(
+            frame, expected_symbols=["AAA", "BBB"], strict=True
+        )
 
 
 def test_loader_passes_expected_symbols_including_benchmark() -> None:
@@ -2834,7 +3191,11 @@ def test_frequency_mismatch_flagged_at_exact_tolerance_boundary() -> None:
             "volume": 1000.0,
         }
     )
-    report = DataValidator(expected_frequency="1h", min_coverage_rows=1).validate(frame)
+    report = DataValidator(
+        expected_frequency="1h",
+        min_coverage_rows=1,
+        symbol_calendars=_UniformCalendar("XNYS"),
+    ).validate(frame)
     assert any("does not match the declared frequency" in w for w in report.warnings)
 
 
@@ -2856,7 +3217,11 @@ def test_frequency_exact_match_still_clean_after_boundary_fix() -> None:
             "volume": 1000.0,
         }
     )
-    report = DataValidator(expected_frequency="1h", min_coverage_rows=1).validate(frame)
+    report = DataValidator(
+        expected_frequency="1h",
+        min_coverage_rows=1,
+        symbol_calendars=_UniformCalendar("XNYS"),
+    ).validate(frame)
     assert not any(
         "does not match the declared frequency" in w for w in report.warnings
     )
@@ -2869,9 +3234,11 @@ def test_frequency_uniform_89min_bars_declared_1h_now_flagged() -> None:
     from quantlab.data.validator import DataValidator
 
     idx = pd.date_range("2020-01-01", periods=50, freq="89min")
-    report = DataValidator(expected_frequency="1h", min_coverage_rows=1).validate(
-        _ohlcv_frame(idx)
-    )
+    report = DataValidator(
+        expected_frequency="1h",
+        min_coverage_rows=1,
+        symbol_calendars=_UniformCalendar("XNYS"),
+    ).validate(_ohlcv_frame(idx))
     assert report.warnings
 
 
@@ -2882,9 +3249,11 @@ def test_frequency_uniform_41min_bars_declared_1h_now_flagged() -> None:
     from quantlab.data.validator import DataValidator
 
     idx = pd.date_range("2020-01-01", periods=50, freq="41min")
-    report = DataValidator(expected_frequency="1h", min_coverage_rows=1).validate(
-        _ohlcv_frame(idx)
-    )
+    report = DataValidator(
+        expected_frequency="1h",
+        min_coverage_rows=1,
+        symbol_calendars=_UniformCalendar("XNYS"),
+    ).validate(_ohlcv_frame(idx))
     assert report.warnings
 
 
@@ -2898,7 +3267,9 @@ def test_frequency_mixed_60_40_spacing_median_cannot_hide_it() -> None:
         timestamps.append(timestamps[-1] + pd.Timedelta(hours=int(h)))
     idx = pd.DatetimeIndex(timestamps)
     report = DataValidator(
-        expected_frequency="1h", min_coverage_rows=1, is_247_market=True
+        expected_frequency="1h",
+        min_coverage_rows=1,
+        symbol_calendars=_UniformCalendar("24/7"),
     ).validate(_ohlcv_frame(idx))
     assert report.warnings
 
@@ -2908,7 +3279,9 @@ def test_frequency_normal_equity_daily_weekends_not_flagged() -> None:
 
     idx = pd.bdate_range("2015-01-01", periods=500)
     report = DataValidator(
-        expected_frequency="1d", min_coverage_rows=1, is_247_market=False
+        expected_frequency="1d",
+        min_coverage_rows=1,
+        symbol_calendars=_UniformCalendar("XNYS"),
     ).validate(_ohlcv_frame(idx))
     assert not report.warnings
 
@@ -2918,7 +3291,9 @@ def test_frequency_equity_daily_friday_to_monday_not_flagged() -> None:
 
     idx = pd.DatetimeIndex([pd.Timestamp("2024-01-05"), pd.Timestamp("2024-01-08")])
     report = DataValidator(
-        expected_frequency="1d", min_coverage_rows=1, is_247_market=False
+        expected_frequency="1d",
+        min_coverage_rows=1,
+        symbol_calendars=_UniformCalendar("XNYS"),
     ).validate(_ohlcv_frame(idx))
     assert not report.warnings
 
@@ -2931,7 +3306,9 @@ def test_frequency_equity_daily_genuine_every_other_day_still_flagged() -> None:
 
     idx = pd.bdate_range("2020-01-01", periods=200)[::2]
     report = DataValidator(
-        expected_frequency="1d", min_coverage_rows=1, is_247_market=False
+        expected_frequency="1d",
+        min_coverage_rows=1,
+        symbol_calendars=_UniformCalendar("XNYS"),
     ).validate(_ohlcv_frame(idx))
     assert report.warnings
 
@@ -2941,7 +3318,9 @@ def test_frequency_equity_daily_friday_to_tuesday_after_mlk_not_flagged() -> Non
 
     idx = pd.DatetimeIndex([pd.Timestamp("2024-01-12"), pd.Timestamp("2024-01-16")])
     report = DataValidator(
-        expected_frequency="1d", min_coverage_rows=1, is_247_market=False
+        expected_frequency="1d",
+        min_coverage_rows=1,
+        symbol_calendars=_UniformCalendar("XNYS"),
     ).validate(_ohlcv_frame(idx))
     assert not report.warnings
 
@@ -2957,7 +3336,9 @@ def test_frequency_equity_subdaily_overnight_gaps_not_flagged() -> None:
             )
     idx = pd.DatetimeIndex(dates)
     report = DataValidator(
-        expected_frequency="1h", min_coverage_rows=1, is_247_market=False
+        expected_frequency="1h",
+        min_coverage_rows=1,
+        symbol_calendars=_UniformCalendar("XNYS"),
     ).validate(_ohlcv_frame(idx))
     assert not report.warnings
 
@@ -2972,7 +3353,9 @@ def test_frequency_247_market_80_20_mix_now_flagged() -> None:
         timestamps.append(timestamps[-1] + pd.Timedelta(hours=5))
     idx = pd.DatetimeIndex(timestamps)
     report = DataValidator(
-        expected_frequency="1h", min_coverage_rows=1, is_247_market=True
+        expected_frequency="1h",
+        min_coverage_rows=1,
+        symbol_calendars=_UniformCalendar("24/7"),
     ).validate(_ohlcv_frame(idx))
     assert report.warnings
 
@@ -2987,7 +3370,9 @@ def test_frequency_247_market_exactly_90_10_mix_now_flagged() -> None:
         timestamps.append(timestamps[-1] + pd.Timedelta(hours=5))
     idx = pd.DatetimeIndex(timestamps)
     report = DataValidator(
-        expected_frequency="1h", min_coverage_rows=1, is_247_market=True
+        expected_frequency="1h",
+        min_coverage_rows=1,
+        symbol_calendars=_UniformCalendar("24/7"),
     ).validate(_ohlcv_frame(idx))
     assert report.warnings
 
@@ -3002,7 +3387,9 @@ def test_frequency_247_market_91_9_mix_now_flagged() -> None:
         timestamps.append(timestamps[-1] + pd.Timedelta(hours=5))
     idx = pd.DatetimeIndex(timestamps)
     report = DataValidator(
-        expected_frequency="1h", min_coverage_rows=1, is_247_market=True
+        expected_frequency="1h",
+        min_coverage_rows=1,
+        symbol_calendars=_UniformCalendar("24/7"),
     ).validate(_ohlcv_frame(idx))
     assert report.warnings
 
@@ -3016,7 +3403,9 @@ def test_frequency_247_market_large_clean_series_not_flagged() -> None:
         timestamps.append(timestamps[-1] + step)
     idx = pd.DatetimeIndex(timestamps)
     report = DataValidator(
-        expected_frequency="1h", min_coverage_rows=1, is_247_market=True
+        expected_frequency="1h",
+        min_coverage_rows=1,
+        symbol_calendars=_UniformCalendar("24/7"),
     ).validate(_ohlcv_frame(idx))
     assert not any(
         "does not match the declared frequency" in w for w in report.warnings
@@ -3032,7 +3421,9 @@ def test_frequency_247_market_single_missing_bar_now_flagged() -> None:
         timestamps.append(timestamps[-1] + step)
     idx = pd.DatetimeIndex(timestamps)
     report = DataValidator(
-        expected_frequency="1h", min_coverage_rows=1, is_247_market=True
+        expected_frequency="1h",
+        min_coverage_rows=1,
+        symbol_calendars=_UniformCalendar("24/7"),
     ).validate(_ohlcv_frame(idx))
     assert any("abnormal gap" in w for w in report.warnings)
     assert len(report.missing_periods) == 1
@@ -3067,7 +3458,9 @@ def test_frequency_247_market_missing_exactly_the_edge_day_now_flagged() -> None
         )
 
     validator = DataValidator(
-        expected_frequency="1d", is_247_market=True, min_coverage_rows=1
+        expected_frequency="1d",
+        symbol_calendars=_UniformCalendar("24/7"),
+        min_coverage_rows=1,
     )
 
     missing_first = pd.date_range("2024-01-02", "2024-01-30", freq="D")
@@ -3099,7 +3492,9 @@ def test_frequency_247_hourly_missing_the_last_23_hours_now_flagged() -> None:
     dates = pd.date_range("2020-01-01", "2020-01-05 00:00:00", freq="1h")
     incomplete = _ohlcv_frame(dates)
     report = DataValidator(
-        expected_frequency="1h", is_247_market=True, min_coverage_rows=1
+        expected_frequency="1h",
+        symbol_calendars=_UniformCalendar("24/7"),
+        min_coverage_rows=1,
     ).validate(incomplete, start=date(2020, 1, 1), end=date(2020, 1, 5))
     assert report.warnings
     assert not report.is_clean
@@ -3107,7 +3502,9 @@ def test_frequency_247_hourly_missing_the_last_23_hours_now_flagged() -> None:
     # Sanity: a history reaching the day's actual last expected hour is clean.
     complete_dates = pd.date_range("2020-01-01", "2020-01-05 23:00:00", freq="1h")
     complete_report = DataValidator(
-        expected_frequency="1h", is_247_market=True, min_coverage_rows=1
+        expected_frequency="1h",
+        symbol_calendars=_UniformCalendar("24/7"),
+        min_coverage_rows=1,
     ).validate(
         _ohlcv_frame(complete_dates), start=date(2020, 1, 1), end=date(2020, 1, 5)
     )
@@ -3124,7 +3521,9 @@ def test_frequency_equity_subdaily_bar_missing_every_session_now_flagged() -> No
         dates.extend(session_start + pd.Timedelta(hours=h) for h in range(7) if h != 3)
     idx = pd.DatetimeIndex(dates)
     report = DataValidator(
-        expected_frequency="1h", min_coverage_rows=1, is_247_market=False
+        expected_frequency="1h",
+        min_coverage_rows=1,
+        symbol_calendars=_UniformCalendar("XNYS"),
     ).validate(_ohlcv_frame(idx))
     assert report.warnings
 
@@ -3145,9 +3544,7 @@ def test_yahoo_intraday_timezone_converted_to_utc_not_stripped_naively() -> None
         index=idx,
     )
     raw.index.name = "Datetime"
-    out = YahooFinanceDataSource._normalise(
-        raw, "AAPL", "1h", pd.Timestamp("2025-01-01"), date(2025, 1, 1)
-    )
+    out = YahooFinanceDataSource._normalise(raw, "AAPL", "1h")
     assert out["timestamp"].dt.tz is None
     assert out["timestamp"].tolist() == [
         pd.Timestamp("2021-01-04 14:30:00"),
@@ -3175,9 +3572,7 @@ def test_yahoo_daily_naive_timestamps_unaffected_by_tz_fix() -> None:
         index=idx,
     )
     raw.index.name = "Date"
-    out = YahooFinanceDataSource._normalise(
-        raw, "AAPL", "1d", pd.Timestamp("2025-01-01"), date(2025, 1, 1)
-    )
+    out = YahooFinanceDataSource._normalise(raw, "AAPL", "1d")
     assert out["timestamp"].dt.tz is None
     assert out["timestamp"].tolist() == [
         pd.Timestamp("2021-01-04"),
@@ -3186,72 +3581,35 @@ def test_yahoo_daily_naive_timestamps_unaffected_by_tz_fix() -> None:
     ]
 
 
-def test_yahoo_drops_a_still_open_daily_bar() -> None:
+def test_yahoo_daily_tz_aware_timestamps_keep_the_local_date() -> None:
+    """A calendar-date granularity (daily/weekly/monthly) represents a
+    *local* trading date, not a specific UTC instant. Converting a
+    tz-aware Yahoo response through UTC first (correct for intraday, see
+    test_yahoo_intraday_timezone_converted_to_utc_not_stripped_naively)
+    would shift the date backward for any exchange ahead of UTC (e.g.
+    XASX, UTC+11) -- turning a Monday session into "Sunday"."""
     from quantlab.data.yahoo import YahooFinanceDataSource
 
-    now = pd.Timestamp("2021-01-10 15:00:00")
-    idx = pd.date_range("2021-01-04", "2021-01-10", freq="D")
+    idx = pd.date_range("2024-01-08", periods=3, freq="D", tz="Australia/Sydney")
     raw = pd.DataFrame(
         {
-            "Open": 1.0,
-            "High": 1.0,
-            "Low": 1.0,
-            "Close": 1.0,
-            "Adj Close": 1.0,
-            "Volume": 100,
+            "Open": [1.0, 2.0, 3.0],
+            "High": [1.0, 2.0, 3.0],
+            "Low": [1.0, 2.0, 3.0],
+            "Close": [1.0, 2.0, 3.0],
+            "Adj Close": [1.0, 2.0, 3.0],
+            "Volume": [100, 200, 300],
         },
         index=idx,
     )
     raw.index.name = "Date"
-    out = YahooFinanceDataSource._normalise(raw, "AAA", "1d", now, date(2021, 1, 10))
-    assert out["timestamp"].tolist() == list(idx[:-1])
-
-
-def test_yahoo_keeps_fully_historical_bars() -> None:
-    """A genuinely historical
-    download, where every bar's period has long since ended, must be
-    completely unaffected by this filter."""
-    from quantlab.data.yahoo import YahooFinanceDataSource
-
-    now = pd.Timestamp("2025-01-01")
-    idx = pd.date_range("2021-01-04", "2021-01-10", freq="D")
-    raw = pd.DataFrame(
-        {
-            "Open": 1.0,
-            "High": 1.0,
-            "Low": 1.0,
-            "Close": 1.0,
-            "Adj Close": 1.0,
-            "Volume": 100,
-        },
-        index=idx,
-    )
-    raw.index.name = "Date"
-    out = YahooFinanceDataSource._normalise(raw, "AAA", "1d", now, date(2021, 1, 10))
-    assert out["timestamp"].tolist() == list(idx)
-
-
-def test_yahoo_drops_a_still_open_monthly_bar() -> None:
-    """Same rule, for a monthly bar — the current month's bar (dated the 1st)
-    must be dropped while `now` is still within that same month."""
-    from quantlab.data.yahoo import YahooFinanceDataSource
-
-    now = pd.Timestamp("2021-01-15")
-    idx = pd.to_datetime(["2020-11-01", "2020-12-01", "2021-01-01"])
-    raw = pd.DataFrame(
-        {
-            "Open": 1.0,
-            "High": 1.0,
-            "Low": 1.0,
-            "Close": 1.0,
-            "Adj Close": 1.0,
-            "Volume": 100,
-        },
-        index=idx,
-    )
-    raw.index.name = "Date"
-    out = YahooFinanceDataSource._normalise(raw, "AAA", "1mo", now, date(2021, 1, 15))
-    assert out["timestamp"].tolist() == list(idx[:-1])
+    out = YahooFinanceDataSource._normalise(raw, "BHP.AX", "1d")
+    assert out["timestamp"].dt.tz is None
+    assert out["timestamp"].tolist() == [
+        pd.Timestamp("2024-01-08"),
+        pd.Timestamp("2024-01-09"),
+        pd.Timestamp("2024-01-10"),
+    ]
 
 
 def test_canonical_schema_normalises_timezone_aware_timestamps() -> None:
@@ -3263,7 +3621,7 @@ def test_canonical_schema_normalises_timezone_aware_timestamps() -> None:
     assert out["timestamp"].dt.tz is None
     # Must not raise, and must not silently drop the in-range rows.
     sliced = DataLoader._slice_range(
-        out, date(2020, 1, 1), date(2020, 1, 2), "1d", is_247_market=False
+        out, date(2020, 1, 1), date(2020, 1, 2), "1d", calendar="XNYS"
     )
     assert len(sliced) == 2
 
@@ -3300,9 +3658,9 @@ def test_cli_backtest_prints_data_warning_text_not_just_a_count(
     config = {
         "experiment_name": "cli_data_warning_test",
         "data": {
-            "source": "csv",
-            "market_calendar": "XNYS",
-            "symbols": ["AAA"],
+            "instruments": [
+                {"symbol": "AAA", "source": "csv", "calendar": "XNYS"},
+            ],
             "start_date": "2020-01-01",
             "end_date": "2020-03-01",
             "frequency": "1h",
@@ -3342,9 +3700,9 @@ def test_run_backtest_script_prints_data_warning_text_not_just_a_count(
     config = {
         "experiment_name": "run_backtest_script_warning_test",
         "data": {
-            "source": "csv",
-            "market_calendar": "XNYS",
-            "symbols": ["AAA"],
+            "instruments": [
+                {"symbol": "AAA", "source": "csv", "calendar": "XNYS"},
+            ],
             "start_date": "2020-01-01",
             "end_date": "2020-03-01",
             "frequency": "1h",
@@ -3389,9 +3747,9 @@ def test_generate_report_script_prints_data_warning_text_not_just_a_count(
     config = {
         "experiment_name": "generate_report_script_warning_test",
         "data": {
-            "source": "csv",
-            "market_calendar": "XNYS",
-            "symbols": ["AAA"],
+            "instruments": [
+                {"symbol": "AAA", "source": "csv", "calendar": "XNYS"},
+            ],
             "start_date": "2020-01-01",
             "end_date": "2020-03-01",
             "frequency": "1h",
@@ -3523,31 +3881,6 @@ def test_binance_drops_candle_closing_after_requested_end() -> None:
     assert len(out2) == 1
 
 
-def test_yahoo_drops_bar_closing_after_requested_end() -> None:
-    from quantlab.data.yahoo import YahooFinanceDataSource
-
-    idx = pd.to_datetime(["2024-03-01"])
-    raw = pd.DataFrame(
-        {
-            "Open": [1.0],
-            "High": [1.0],
-            "Low": [1.0],
-            "Close": [1.0],
-            "Adj Close": [1.0],
-            "Volume": [100],
-        },
-        index=idx,
-    )
-    raw.index.name = "Date"
-    now = pd.Timestamp("2024-06-01")  # well after the bar's own bucket closed
-
-    out = YahooFinanceDataSource._normalise(raw, "AAA", "1mo", now, date(2024, 3, 15))
-    assert out.empty
-
-    out2 = YahooFinanceDataSource._normalise(raw, "AAA", "1mo", now, date(2024, 4, 1))
-    assert len(out2) == 1
-
-
 def test_slice_range_drops_a_look_ahead_bar_reused_from_a_wider_cache() -> None:
     from quantlab.data.loader import DataLoader
 
@@ -3567,14 +3900,14 @@ def test_slice_range_drops_a_look_ahead_bar_reused_from_a_wider_cache() -> None:
     # Narrower request: Jan 3rd falls inside the Jan 1st-7th bar's own
     # bucket, which hasn't genuinely closed by Jan 3rd -- must drop it.
     narrow = DataLoader._slice_range(
-        cached, date(2024, 1, 1), date(2024, 1, 3), "1w", is_247_market=False
+        cached, date(2024, 1, 1), date(2024, 1, 3), "1w", calendar="XNYS"
     )
     assert narrow.empty
 
     # A request reaching far enough for the bar's own week to have
     # genuinely closed must still keep it.
     wide = DataLoader._slice_range(
-        cached, date(2024, 1, 1), date(2024, 1, 10), "1w", is_247_market=False
+        cached, date(2024, 1, 1), date(2024, 1, 10), "1w", calendar="XNYS"
     )
     assert len(wide) == 1
 
@@ -3599,102 +3932,14 @@ def test_slice_range_drops_a_look_ahead_monthly_bar_from_wider_cache() -> None:
     )
 
     narrow = DataLoader._slice_range(
-        cached, date(2024, 3, 1), date(2024, 3, 15), "1mo", is_247_market=False
+        cached, date(2024, 3, 1), date(2024, 3, 15), "1mo", calendar="XNYS"
     )
     assert narrow.empty
 
     wide = DataLoader._slice_range(
-        cached, date(2024, 3, 1), date(2024, 4, 1), "1mo", is_247_market=False
+        cached, date(2024, 3, 1), date(2024, 4, 1), "1mo", calendar="XNYS"
     )
     assert len(wide) == 1
-
-
-def test_yahoo_keeps_a_week_that_genuinely_finished_on_friday() -> None:
-    from quantlab.data.yahoo import YahooFinanceDataSource
-
-    idx = pd.to_datetime(["2024-01-01"])  # a Monday
-    raw = pd.DataFrame(
-        {
-            "Open": [1.0],
-            "High": [1.0],
-            "Low": [1.0],
-            "Close": [1.0],
-            "Adj Close": [1.0],
-            "Volume": [100],
-        },
-        index=idx,
-    )
-    raw.index.name = "Date"
-    now = pd.Timestamp("2026-01-01")
-
-    # Requested through that week's own Friday -- the week has genuinely
-    # finished (equity markets never trade the intervening weekend).
-    out = YahooFinanceDataSource._normalise(raw, "SPY", "1wk", now, date(2024, 1, 5))
-    assert len(out) == 1
-
-    # Requested only through the Wednesday of that same week -- the week
-    # has not finished yet, still correctly dropped.
-    out2 = YahooFinanceDataSource._normalise(raw, "SPY", "1wk", now, date(2024, 1, 3))
-    assert out2.empty
-
-
-def test_yahoo_keeps_a_month_whose_last_trading_day_already_passed() -> None:
-    from quantlab.data.yahoo import YahooFinanceDataSource
-
-    idx = pd.to_datetime(["2024-11-01"])
-    raw = pd.DataFrame(
-        {
-            "Open": [1.0],
-            "High": [1.0],
-            "Low": [1.0],
-            "Close": [1.0],
-            "Adj Close": [1.0],
-            "Volume": [100],
-        },
-        index=idx,
-    )
-    raw.index.name = "Date"
-    now = pd.Timestamp("2026-01-01")
-
-    out = YahooFinanceDataSource._normalise(raw, "SPY", "1mo", now, date(2024, 11, 29))
-    assert len(out) == 1
-
-    # Still correctly dropped for a request ending before the month's own
-    # last trading day.
-    out2 = YahooFinanceDataSource._normalise(raw, "SPY", "1mo", now, date(2024, 11, 15))
-    assert out2.empty
-
-
-def test_yahoo_keeps_a_daily_bar_finalised_after_market_close() -> None:
-    from quantlab.data.yahoo import YahooFinanceDataSource
-
-    idx = pd.to_datetime(["2024-01-16"])
-    raw = pd.DataFrame(
-        {
-            "Open": [1.0],
-            "High": [1.0],
-            "Low": [1.0],
-            "Close": [1.0],
-            "Adj Close": [1.0],
-            "Volume": [100],
-        },
-        index=idx,
-    )
-    raw.index.name = "Date"
-
-    # 21:30 UTC = 4:30pm EST -- just after the real market close.
-    now_after_close = pd.Timestamp("2024-01-16 21:30:00")
-    out = YahooFinanceDataSource._normalise(
-        raw, "SPY", "1d", now_after_close, date(2024, 1, 16)
-    )
-    assert len(out) == 1
-
-    # 19:00 UTC = 2pm EST -- market still open, must still be dropped.
-    now_before_close = pd.Timestamp("2024-01-16 19:00:00")
-    out2 = YahooFinanceDataSource._normalise(
-        raw, "SPY", "1d", now_before_close, date(2024, 1, 16)
-    )
-    assert out2.empty
 
 
 def test_daily_equity_bucket_settlement_reflects_a_real_early_close() -> None:
@@ -3753,78 +3998,131 @@ def test_periodic_equity_settlement_uses_the_last_session_close() -> None:
 
     expected = daily_equity_bucket_settlement(pd.Timestamp("2024-11-29"))
     assert (
-        weekly_bucket_settlement(pd.Timestamp("2024-11-25"), is_247_market=False)
+        weekly_bucket_settlement(pd.Timestamp("2024-11-25"), calendar="XNYS")
         == expected
     )
     assert (
-        monthly_bucket_settlement(pd.Timestamp("2024-11-01"), is_247_market=False)
+        monthly_bucket_settlement(pd.Timestamp("2024-11-01"), calendar="XNYS")
         == expected
     )
 
 
-def test_yahoo_247_daily_not_closed_at_equity_market_close() -> None:
-    from quantlab.data.yahoo import YahooFinanceDataSource
-
-    idx = pd.to_datetime(["2024-01-16"])
-    raw = pd.DataFrame(
-        {
-            "Open": [1.0],
-            "High": [1.0],
-            "Low": [1.0],
-            "Close": [1.0],
-            "Adj Close": [1.0],
-            "Volume": [100],
-        },
-        index=idx,
+def test_weekly_bucket_settlement_uses_the_calendars_own_trading_week() -> None:
+    """XSAU trades Sunday-Thursday (weekend Friday-Saturday) -- a fixed
+    Monday-Sunday ISO week would misfile every date into the wrong week
+    (Monday isn't the start of XSAU's week, Sunday isn't its end). Every day
+    from Sunday through Saturday of one native XSAU week must settle at that
+    same week's Thursday close, mirroring how every day from Monday through
+    Sunday of an XNYS week already settles at that week's Friday close."""
+    from quantlab.data.calendar import (
+        daily_equity_bucket_settlement,
+        weekly_bucket_settlement,
     )
-    raw.index.name = "Date"
+
+    expected = daily_equity_bucket_settlement(
+        pd.Timestamp("2024-01-11"), calendar="XSAU"
+    )
+    for day in [
+        "2024-01-07",  # Sunday -- start of the native week
+        "2024-01-08",
+        "2024-01-09",
+        "2024-01-10",
+        "2024-01-11",  # Thursday -- end of the native week
+        "2024-01-12",  # Friday -- rest day, belongs to the week just ended
+        "2024-01-13",  # Saturday -- rest day, same
+    ]:
+        assert (
+            weekly_bucket_settlement(pd.Timestamp(day), calendar="XSAU") == expected
+        ), day
+
+
+def test_weekly_bucket_settlement_not_derailed_by_a_midweek_holiday() -> None:
+    """A one-off holiday (Thanksgiving, a Thursday) must never be mistaken
+    for the structural end of the trading week -- the week still runs
+    through its real last trading weekday (Friday), just skipping the
+    holiday itself."""
+    from quantlab.data.calendar import (
+        daily_equity_bucket_settlement,
+        weekly_bucket_settlement,
+    )
+
+    expected = daily_equity_bucket_settlement(pd.Timestamp("2024-11-29"))  # Friday
+    for day in ["2024-11-25", "2024-11-26", "2024-11-27", "2024-11-28", "2024-11-29"]:
+        assert (
+            weekly_bucket_settlement(pd.Timestamp(day), calendar="XNYS") == expected
+        ), day
+
+
+def test_weekly_bucket_settlement_resolves_a_holiday_on_the_boundary_weekday() -> None:
+    """A one-off holiday landing exactly *on* the structural last trading
+    weekday (Good Friday 2024-03-29, a Friday, for XNYS) is different from
+    a mid-week holiday: the structural walk lands the cursor itself on the
+    holiday, which has no real close of its own. Falling back to
+    daily_equity_bucket_settlement's own "no session -> next UTC midnight"
+    default there (Saturday 2024-03-30 00:00) would be wrong -- the week
+    must instead resolve to the last real trading day before it (Thursday
+    2024-03-28) and settle at *that* day's actual close."""
+    from quantlab.data.calendar import (
+        daily_equity_bucket_settlement,
+        weekly_bucket_settlement,
+    )
+
+    expected = daily_equity_bucket_settlement(
+        pd.Timestamp("2024-03-28"), calendar="XNYS"
+    )
+    assert expected == pd.Timestamp("2024-03-28 20:00:00")
+    for day in [
+        "2024-03-25",  # Monday
+        "2024-03-26",
+        "2024-03-27",
+        "2024-03-28",  # Thursday -- last real trading day
+        "2024-03-29",  # Good Friday -- holiday, structurally the boundary
+        "2024-03-30",  # Saturday -- rest day, belongs to the week just ended
+        "2024-03-31",  # Sunday -- rest day, same
+    ]:
+        assert (
+            weekly_bucket_settlement(pd.Timestamp(day), calendar="XNYS") == expected
+        ), day
+
+
+def test_bar_bucket_end_distinguishes_xnys_close_from_24_7_midnight() -> None:
+    """The same daily bar settles at different instants under different
+    calendars -- XNYS at its real market close, 24/7 at UTC midnight. This is
+    the single settlement primitive :class:`~quantlab.data.storage.
+    ParquetStorage`'s ``_drop_still_open_bars``/``_slice_range`` rely on for
+    every provider (Yahoo included, see quantlab.data.yahoo._normalise's own
+    docstring) -- filtering must key off the calendar actually configured for
+    the symbol, not a fixed cutoff."""
+    from quantlab.data.calendar import bar_bucket_end
+
+    idx = pd.Series(pd.to_datetime(["2024-01-16"]))
+    xnys_close = bar_bucket_end(idx, "1d", calendar="XNYS")
+    day_247_close = bar_bucket_end(idx, "1d", calendar="24/7")
 
     # 21:30 UTC: already closed for an equity asset, but the crypto day
     # genuinely runs until midnight UTC.
     now = pd.Timestamp("2024-01-16 21:30:00")
-    out_equity = YahooFinanceDataSource._normalise(
-        raw, "SPY", "1d", now, date(2024, 1, 16), False
-    )
-    assert len(out_equity) == 1
-    out_crypto = YahooFinanceDataSource._normalise(
-        raw, "BTC-USD", "1d", now, date(2024, 1, 16), True
-    )
-    assert out_crypto.empty
+    assert (xnys_close <= now).all()
+    assert not (day_247_close <= now).all()
 
     # Just after midnight UTC: the crypto day has genuinely finished too.
     now_after_midnight = pd.Timestamp("2024-01-17 00:30:00")
-    out_crypto_done = YahooFinanceDataSource._normalise(
-        raw, "BTC-USD", "1d", now_after_midnight, date(2024, 1, 16), True
-    )
-    assert len(out_crypto_done) == 1
+    assert (day_247_close <= now_after_midnight).all()
 
 
-def test_yahoo_247_weekly_not_closed_at_friday_equity_close() -> None:
-    from quantlab.data.yahoo import YahooFinanceDataSource
+def test_bar_bucket_end_distinguishes_xnys_friday_close_from_24_7_monday() -> None:
+    """Same distinction as :func:`test_bar_bucket_end_distinguishes_xnys_
+    close_from_24_7_midnight`, for a weekly bar: an equity week closes
+    Friday, but a 24/7 week doesn't close until the following Monday."""
+    from quantlab.data.calendar import bar_bucket_end
 
-    idx = pd.to_datetime(["2024-01-01"])  # a Monday
-    raw = pd.DataFrame(
-        {
-            "Open": [1.0],
-            "High": [1.0],
-            "Low": [1.0],
-            "Close": [1.0],
-            "Adj Close": [1.0],
-            "Volume": [100],
-        },
-        index=idx,
-    )
-    raw.index.name = "Date"
+    idx = pd.Series(pd.to_datetime(["2024-01-01"]))  # a Monday
+    xnys_close = bar_bucket_end(idx, "1w", calendar="XNYS")
+    day_247_close = bar_bucket_end(idx, "1w", calendar="24/7")
 
     sunday_noon = pd.Timestamp("2024-01-07 12:00:00")
-    out_equity = YahooFinanceDataSource._normalise(
-        raw, "SPY", "1wk", sunday_noon, date(2024, 1, 7), False
-    )
-    assert len(out_equity) == 1  # equity week already closed Friday
-    out_crypto = YahooFinanceDataSource._normalise(
-        raw, "BTC-USD", "1wk", sunday_noon, date(2024, 1, 7), True
-    )
-    assert out_crypto.empty  # crypto week doesn't close until Monday
+    assert (xnys_close <= sunday_noon).all()  # equity week already closed Friday
+    assert not (day_247_close <= sunday_noon).all()  # 24/7 week runs to Monday
 
 
 def test_drop_still_open_bars_uses_the_right_calendar(
@@ -3839,11 +4137,11 @@ def test_drop_still_open_bars_uses_the_right_calendar(
     now = pd.Timestamp.now(tz="UTC").tz_localize(None)
     today = pd.Timestamp(year=now.year, month=now.month, day=now.day)
     closed_session = last_trading_day_on_or_before(
-        today - pd.Timedelta(days=1), is_247_market=False
+        today - pd.Timedelta(days=1), calendar="XNYS"
     )
     data = pd.DataFrame({"timestamp": [closed_session], "symbol": ["AAPL"]})
-    assert len(_drop_still_open_bars(data, "1d", is_247_market=False)) == 1
-    assert len(_drop_still_open_bars(data, "1d", is_247_market=True)) == 1
+    assert len(_drop_still_open_bars(data, "1d", calendar="XNYS")) == 1
+    assert len(_drop_still_open_bars(data, "1d", calendar="24/7")) == 1
 
     equity_close = daily_equity_bucket_settlement(closed_session)
     flat_close = closed_session + pd.Timedelta(days=1)
@@ -3862,8 +4160,8 @@ def test_drop_still_open_bars_uses_the_right_calendar(
             "volume": 100.0,
         }
     )
-    storage.write_symbol(equity_data, "yahoo", "AAPL", "1d", is_247_market=False)
-    read_back = storage.read_symbol("yahoo", "AAPL", "1d", is_247_market=False)
+    storage.write_symbol(equity_data, "yahoo", "AAPL", "1d", calendar="XNYS")
+    read_back = storage.read_symbol("yahoo", "AAPL", "1d", calendar="XNYS")
     assert read_back is not None
     assert len(read_back) == 1
 
@@ -3888,9 +4186,7 @@ def test_yahoo_missing_close_reaches_missing_value_policy() -> None:
         index=idx,
     )
     raw.index.name = "Date"
-    out = YahooFinanceDataSource._normalise(
-        raw, "AAA", "1d", pd.Timestamp("2025-01-01"), date(2020, 1, 3)
-    )
+    out = YahooFinanceDataSource._normalise(raw, "AAA", "1d")
     assert len(out) == 3  # the row is no longer dropped inside `_normalise`
     assert out["close"].isna().sum() == 1
 
@@ -3919,48 +4215,8 @@ def test_yahoo_missing_volume_not_silently_zeroed() -> None:
         index=idx,
     )
     raw.index.name = "Date"
-    out = YahooFinanceDataSource._normalise(
-        raw, "AAA", "1d", pd.Timestamp("2025-01-01"), date(2020, 1, 3)
-    )
+    out = YahooFinanceDataSource._normalise(raw, "AAA", "1d")
     assert out["volume"].isna().tolist() == [False, True, False]
-
-
-def test_yahoo_download_one_raises_when_every_bar_is_filtered_out() -> None:
-    from unittest.mock import patch
-
-    from quantlab.data.yahoo import YahooFinanceDataSource
-    from quantlab.exceptions import DataDownloadError
-
-    source = YahooFinanceDataSource(max_retries=1)
-    now = pd.Timestamp.now(tz="UTC").tz_localize(None)
-    # Dated *tomorrow*, not today: with market-close-aware daily
-    # settlement, "today" is only still-forming before 4pm US/Eastern —
-    # ambiguous depending on what time of day this test happens to run.
-    # Tomorrow's own close is unconditionally still in the future relative
-    # to `now`, regardless of time of day, so it stays unambiguously
-    # still-forming.
-    still_forming = now.normalize() + pd.Timedelta(days=1)
-    idx = pd.DatetimeIndex([still_forming])
-    raw = pd.DataFrame(
-        {
-            "Open": [1.0],
-            "High": [1.0],
-            "Low": [1.0],
-            "Close": [1.0],
-            "Adj Close": [1.0],
-            "Volume": [100],
-        },
-        index=idx,
-    )
-    raw.index.name = "Date"
-
-    with (
-        patch("yfinance.download", return_value=raw),
-        pytest.raises(DataDownloadError),
-    ):
-        source._download_one(
-            "AAA", still_forming.date(), still_forming.date(), "1d", now
-        )
 
 
 def test_binance_download_one_threads_a_single_now_across_batches(
@@ -4032,9 +4288,9 @@ def test_loader_strict_mode_raises_on_duplicate_rows_before_cleaning(
         {
             "experiment_name": "dup_raise_test",
             "data": {
-                "source": "csv",
-                "market_calendar": "XNYS",
-                "symbols": ["AAA"],
+                "instruments": [
+                    {"symbol": "AAA", "source": "csv", "calendar": "XNYS"},
+                ],
                 "start_date": "2020-01-01",
                 "end_date": "2020-01-03",
                 "missing_value_policy": "raise",
@@ -4086,9 +4342,9 @@ def test_loader_strict_mode_raises_on_non_positive_price_before_cleaning(
         {
             "experiment_name": "neg_price_raise_test",
             "data": {
-                "source": "csv",
-                "market_calendar": "XNYS",
-                "symbols": ["AAA"],
+                "instruments": [
+                    {"symbol": "AAA", "source": "csv", "calendar": "XNYS"},
+                ],
                 "start_date": "2020-01-01",
                 "end_date": "2020-01-03",
                 "missing_value_policy": "raise",
@@ -4126,10 +4382,10 @@ def test_loader_report_reflects_pre_clean_defects_under_drop_policy(
                 "volume": 100.0,
             }
             for ts, price in [
-                ("2020-01-01", 10.0),
-                ("2020-01-01", 10.0),  # duplicate
-                ("2020-01-02", -5.0),  # non-positive
-                ("2020-01-03", 12.0),
+                ("2020-01-03", 10.0),
+                ("2020-01-03", 10.0),  # duplicate
+                ("2020-01-06", -5.0),  # non-positive
+                ("2020-01-07", 12.0),
             ]
         ],
     )
@@ -4137,11 +4393,11 @@ def test_loader_report_reflects_pre_clean_defects_under_drop_policy(
         {
             "experiment_name": "drop_policy_report_test",
             "data": {
-                "source": "csv",
-                "market_calendar": "XNYS",
-                "symbols": ["AAA"],
-                "start_date": "2020-01-01",
-                "end_date": "2020-01-03",
+                "instruments": [
+                    {"symbol": "AAA", "source": "csv", "calendar": "XNYS"},
+                ],
+                "start_date": "2020-01-03",
+                "end_date": "2020-01-07",
                 "missing_value_policy": "drop",
             },
             "strategy": {"name": "buy_and_hold"},
@@ -4192,9 +4448,9 @@ def test_data_quality_report_persists_into_result_metadata_and_html(
         {
             "experiment_name": "dq_persist_test",
             "data": {
-                "source": "csv",
-                "market_calendar": "XNYS",
-                "symbols": ["AAA"],
+                "instruments": [
+                    {"symbol": "AAA", "source": "csv", "calendar": "XNYS"},
+                ],
                 "start_date": "2020-01-01",
                 "end_date": "2020-01-05",
                 "frequency": "1h",
@@ -4253,7 +4509,9 @@ def test_quality_report_warnings_reflect_duplicate_and_price_counts() -> None:
             "volume": 100.0,
         }
     )
-    report = DataValidator().validate(df, strict=False)
+    report = DataValidator(symbol_calendars=_UniformCalendar("XNYS")).validate(
+        df, strict=False
+    )
     assert report.duplicate_count == 2
     assert report.invalid_price_count == 5
     assert not report.is_clean
@@ -4283,9 +4541,9 @@ def test_loader_report_reflects_missing_values_dropped_before_validation(
                 "volume": 100.0,
             }
             for ts, close in [
-                ("2020-01-01", 10.0),
-                ("2020-01-02", ""),  # missing -> dropped by the `drop` policy
-                ("2020-01-03", 12.0),
+                ("2020-01-03", 10.0),
+                ("2020-01-06", ""),  # missing -> dropped by the `drop` policy
+                ("2020-01-07", 12.0),
             ]
         ],
     )
@@ -4293,11 +4551,11 @@ def test_loader_report_reflects_missing_values_dropped_before_validation(
         {
             "experiment_name": "missing_value_drop_report_test",
             "data": {
-                "source": "csv",
-                "market_calendar": "XNYS",
-                "symbols": ["AAA"],
-                "start_date": "2020-01-01",
-                "end_date": "2020-01-03",
+                "instruments": [
+                    {"symbol": "AAA", "source": "csv", "calendar": "XNYS"},
+                ],
+                "start_date": "2020-01-03",
+                "end_date": "2020-01-07",
                 "missing_value_policy": "drop",
             },
             "strategy": {"name": "buy_and_hold"},
@@ -4346,9 +4604,9 @@ def test_loader_missing_values_not_double_counted_under_none_policy(
         {
             "experiment_name": "missing_value_none_report_test",
             "data": {
-                "source": "csv",
-                "market_calendar": "XNYS",
-                "symbols": ["AAA"],
+                "instruments": [
+                    {"symbol": "AAA", "source": "csv", "calendar": "XNYS"},
+                ],
                 "start_date": "2020-01-01",
                 "end_date": "2020-01-03",
                 "missing_value_policy": "none",
@@ -4386,3 +4644,1150 @@ def test_write_metadata_produces_strict_json_for_nan_and_infinity(
     assert "Infinity" not in text
     parsed = json.loads(text)
     assert parsed == {"skewness": None, "kurtosis": None, "ok": 1.5}
+
+
+# --------------------------------------------------------------------------- #
+# Multi-instrument calendars: verified closures, multi-source loading,
+# benchmark isolation (Phase A of the calendar-per-instrument initiative).
+# --------------------------------------------------------------------------- #
+
+
+def _write_instrument_csv(raw_dir: Path, symbol: str, frame: pd.DataFrame) -> None:
+    frame.to_csv(raw_dir / f"{symbol}.csv", index=False)
+
+
+def test_mixed_xnys_and_247_symbol_gets_forward_filled_on_weekend(
+    tmp_path: Path,
+) -> None:
+    """A weekday-only (XNYS) instrument loaded alongside a 24/7 instrument
+    must get synthetic weekend bars carrying its last close forward."""
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    aapl_dates = pd.bdate_range("2024-01-01", "2024-01-10")  # weekdays only
+    btc_dates = pd.date_range("2024-01-01", "2024-01-10", freq="D")  # every day
+    _write_instrument_csv(
+        raw,
+        "AAPL",
+        make_ohlcv(
+            "AAPL", np.linspace(100, 109, len(aapl_dates)), start="2024-01-01", freq="B"
+        ),
+    )
+    _write_instrument_csv(
+        raw,
+        "BTC",
+        make_ohlcv(
+            "BTC",
+            np.linspace(40000, 40009, len(btc_dates)),
+            start="2024-01-01",
+            freq="D",
+        ),
+    )
+
+    cfg = ExperimentConfig.from_dict(
+        {
+            "experiment_name": "mixed_calendar",
+            "data": {
+                "instruments": [
+                    {"symbol": "AAPL", "source": "csv", "calendar": "XNYS"},
+                    {"symbol": "BTC", "source": "csv", "calendar": "24/7"},
+                ],
+                "start_date": "2024-01-01",
+                "end_date": "2024-01-10",
+            },
+            "strategy": {"name": "buy_and_hold"},
+            "backtest": {"periods_per_year": 252},
+        }
+    )
+    from quantlab.data.loader import DataLoader
+
+    data, report = DataLoader(raw_dir=raw).load(cfg)
+    aapl = data[data["symbol"] == "AAPL"].set_index("timestamp").sort_index()
+    # Saturday 2024-01-06 and Sunday 2024-01-07 must now exist for AAPL.
+    saturday = pd.Timestamp("2024-01-06")
+    assert saturday in aapl.index
+    friday_close = aapl.loc[pd.Timestamp("2024-01-05"), "close"]
+    assert aapl.loc[saturday, "close"] == pytest.approx(friday_close)
+    assert aapl.loc[saturday, "volume"] == 0.0
+    assert report.closure_inserted_count > 0
+
+
+def test_verified_closure_return_is_exactly_zero_and_does_not_cascade(
+    tmp_path: Path,
+) -> None:
+    """A verified closure produces exactly a 0 return that day, and the
+    following real session's return is a real number, never NaN (the
+    cascading-NaN bug forward-filling before pct_change eliminates)."""
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    aapl_dates = pd.bdate_range("2024-01-01", "2024-01-10")
+    btc_dates = pd.date_range("2024-01-01", "2024-01-10", freq="D")
+    _write_instrument_csv(
+        raw,
+        "AAPL",
+        make_ohlcv(
+            "AAPL", np.linspace(100, 109, len(aapl_dates)), start="2024-01-01", freq="B"
+        ),
+    )
+    _write_instrument_csv(
+        raw,
+        "BTC",
+        make_ohlcv(
+            "BTC",
+            np.linspace(40000, 40009, len(btc_dates)),
+            start="2024-01-01",
+            freq="D",
+        ),
+    )
+    cfg = ExperimentConfig.from_dict(
+        {
+            "experiment_name": "mixed_calendar_returns",
+            "data": {
+                "instruments": [
+                    {"symbol": "AAPL", "source": "csv", "calendar": "XNYS"},
+                    {"symbol": "BTC", "source": "csv", "calendar": "24/7"},
+                ],
+                "start_date": "2024-01-01",
+                "end_date": "2024-01-10",
+            },
+            "strategy": {"name": "buy_and_hold"},
+            "backtest": {"periods_per_year": 252},
+        }
+    )
+    from quantlab.backtesting.accounting import compute_asset_returns
+    from quantlab.data.base import price_matrix
+    from quantlab.data.loader import DataLoader
+
+    data, _ = DataLoader(raw_dir=raw).load(cfg)
+    prices = price_matrix(data, adjusted=True)
+    returns = compute_asset_returns(prices)
+    saturday = pd.Timestamp("2024-01-06")
+    monday = pd.Timestamp("2024-01-08")
+    assert returns.loc[saturday, "AAPL"] == 0.0
+    assert not pd.isna(returns.loc[monday, "AAPL"])
+
+
+def test_genuine_data_gap_is_not_treated_as_a_verified_closure(tmp_path: Path) -> None:
+    """A real, non-calendar gap on a single-instrument (single-calendar)
+    experiment must still be governed by `missing_value_policy`, completely
+    unaffected by the closure machinery (which is a no-op here since there's
+    no second instrument to union a wider date grid with)."""
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    # Start on Jan 2 (not Jan 1, an XNYS holiday) so every bar in `frame` sits
+    # on a real trading day -- otherwise the Jan 1 bar would itself be a real
+    # row on a verified closure and get discarded before this test's own gap
+    # scenario is even reached.
+    dates = pd.bdate_range("2024-01-02", "2024-02-01")
+    frame = make_ohlcv(
+        "AAA", np.linspace(100, 118, len(dates)), start="2024-01-02", freq="B"
+    )
+    # Remove a week-plus run of genuine trading days (2024-01-08..2024-01-16,
+    # 7 business days) -- long enough to exceed DataValidator's default
+    # max_gap_periods=5 tolerance and register as an abnormal gap, unlike a
+    # single verified calendar closure.
+    removed = pd.bdate_range("2024-01-08", "2024-01-16")
+    frame = frame[~frame["timestamp"].isin(removed)].reset_index(drop=True)
+    _write_instrument_csv(raw, "AAA", frame)
+    cfg = ExperimentConfig.from_dict(
+        {
+            "experiment_name": "genuine_gap",
+            "data": {
+                "instruments": [{"symbol": "AAA", "source": "csv", "calendar": "XNYS"}],
+                "start_date": "2024-01-02",
+                "end_date": "2024-02-01",
+            },
+            "strategy": {"name": "buy_and_hold"},
+            "backtest": {"periods_per_year": 252},
+        }
+    )
+    from quantlab.data.loader import DataLoader
+
+    data, report = DataLoader(raw_dir=raw).load(cfg)
+    assert report.closure_inserted_count == 0
+    assert report.closure_discarded_count == 0
+    assert not (set(removed) & set(data["timestamp"]))
+    assert any("abnormal gap" in w for w in report.warnings)
+
+
+def test_real_bar_on_verified_closure_is_discarded_not_treated_as_a_trade(
+    tmp_path: Path,
+) -> None:
+    """A real (anomalous) provider row dated on a verified closure -- e.g. a
+    stray Saturday print for an XNYS symbol -- must never be trusted as a
+    genuine trade: it is discarded, not forward-flowed into the return
+    series, however implausible its price looks."""
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    # Friday, Saturday (closed for XNYS!), Monday -- Saturday's price jumps
+    # 100 -> 200, which would be a fabricated 100% return if trusted.
+    dates = pd.to_datetime(["2024-01-05", "2024-01-06", "2024-01-08"])
+    frame = make_ohlcv("AAA", [100.0, 200.0, 205.0], start="2024-01-05", freq="D")
+    frame["timestamp"] = dates
+    _write_instrument_csv(raw, "AAA", frame)
+    cfg = ExperimentConfig.from_dict(
+        {
+            "experiment_name": "closure_real_bar",
+            "data": {
+                "instruments": [{"symbol": "AAA", "source": "csv", "calendar": "XNYS"}],
+                "start_date": "2024-01-05",
+                "end_date": "2024-01-08",
+            },
+            "strategy": {"name": "buy_and_hold"},
+        }
+    )
+    from quantlab.backtesting.runner import run_backtest_from_config
+    from quantlab.data.loader import DataLoader
+
+    data, report = DataLoader(raw_dir=raw).load(cfg)
+    assert pd.Timestamp("2024-01-06") not in set(data["timestamp"])
+    assert any("verified market closure" in w for w in report.warnings)
+
+    result = run_backtest_from_config(data, cfg)
+    assert pd.Timestamp("2024-01-06") not in result.returns.index
+    # The real Friday->Monday move (100 -> 205), never a separate fabricated
+    # 100% Saturday leg (100 -> 200) chained with a second 2.5% leg.
+    assert result.returns.loc[pd.Timestamp("2024-01-08")] == pytest.approx(1.05)
+
+
+def test_real_bar_on_verified_closure_raises_in_strict_mode(tmp_path: Path) -> None:
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    dates = pd.to_datetime(["2024-01-05", "2024-01-06", "2024-01-08"])
+    frame = make_ohlcv("AAA", [100.0, 200.0, 205.0], start="2024-01-05", freq="D")
+    frame["timestamp"] = dates
+    _write_instrument_csv(raw, "AAA", frame)
+    cfg = ExperimentConfig.from_dict(
+        {
+            "experiment_name": "closure_real_bar_strict",
+            "data": {
+                "instruments": [{"symbol": "AAA", "source": "csv", "calendar": "XNYS"}],
+                "start_date": "2024-01-05",
+                "end_date": "2024-01-08",
+                "missing_value_policy": "raise",
+            },
+            "strategy": {"name": "buy_and_hold"},
+        }
+    )
+    from quantlab.data.loader import DataLoader
+    from quantlab.exceptions import DataValidationError
+
+    with pytest.raises(DataValidationError, match="verified market closure"):
+        DataLoader(raw_dir=raw).load(cfg)
+
+
+def test_loader_report_row_count_reflects_closure_fill_drops(tmp_path: Path) -> None:
+    """``row_count`` is set inside DataValidator.validate(), before closure-
+    fill (which can now discard anomalous rows, not just insert synthetic
+    ones -- see quantlab.data.closures) ever runs. It must be refreshed
+    afterward the same way ``clean_row_count`` already is, or it silently
+    goes stale whenever a symbol has a real bar on its own verified
+    closure."""
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    dates = pd.to_datetime(["2024-01-05", "2024-01-06", "2024-01-08"])
+    frame = make_ohlcv("AAA", [100.0, 200.0, 205.0], start="2024-01-05", freq="D")
+    frame["timestamp"] = dates
+    _write_instrument_csv(raw, "AAA", frame)
+    cfg = ExperimentConfig.from_dict(
+        {
+            "experiment_name": "closure_real_bar_row_count",
+            "data": {
+                "instruments": [{"symbol": "AAA", "source": "csv", "calendar": "XNYS"}],
+                "start_date": "2024-01-05",
+                "end_date": "2024-01-08",
+            },
+            "strategy": {"name": "buy_and_hold"},
+        }
+    )
+    from quantlab.data.loader import DataLoader
+
+    data, report = DataLoader(raw_dir=raw).load(cfg)
+    assert report.row_count == len(data)
+    assert report.row_count == report.clean_row_count == 2
+
+
+def test_loader_report_decomposes_closure_inserted_from_discarded(
+    tmp_path: Path,
+) -> None:
+    """A single net counter would go negative here and hide what actually
+    happened (one row discarded, none inserted) -- ``DataQualityReport``
+    has no such net counter; ``closure_discarded_count``/
+    ``closure_inserted_count`` report the two effects separately, never
+    netted against each other."""
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    dates = pd.to_datetime(["2024-01-05", "2024-01-06", "2024-01-08"])
+    frame = make_ohlcv("AAA", [100.0, 200.0, 205.0], start="2024-01-05", freq="D")
+    frame["timestamp"] = dates
+    _write_instrument_csv(raw, "AAA", frame)
+    cfg = ExperimentConfig.from_dict(
+        {
+            "experiment_name": "closure_counts_decomposed",
+            "data": {
+                "instruments": [{"symbol": "AAA", "source": "csv", "calendar": "XNYS"}],
+                "start_date": "2024-01-05",
+                "end_date": "2024-01-08",
+            },
+            "strategy": {"name": "buy_and_hold"},
+        }
+    )
+    from quantlab.data.loader import DataLoader
+
+    _, report = DataLoader(raw_dir=raw).load(cfg)
+    assert report.closure_discarded_count == 1
+    assert report.closure_inserted_count == 0
+    assert not hasattr(report, "closure_fill_count")
+
+
+def test_closure_fill_is_noop_for_non_daily_frequency() -> None:
+    from quantlab.constants import (
+        ADJUSTED_CLOSE,
+        CLOSE,
+        HIGH,
+        LOW,
+        OPEN,
+        SYMBOL,
+        TIMESTAMP,
+        VOLUME,
+    )
+    from quantlab.data.closures import insert_verified_closure_bars
+
+    dates = pd.date_range("2024-01-05", periods=3, freq="h")
+    frame = pd.DataFrame(
+        {
+            TIMESTAMP: dates,
+            SYMBOL: "AAA",
+            OPEN: 1.0,
+            HIGH: 1.0,
+            LOW: 1.0,
+            CLOSE: 1.0,
+            ADJUSTED_CLOSE: 1.0,
+            VOLUME: 1.0,
+        }
+    )
+    result = insert_verified_closure_bars(
+        frame, symbol_calendars={"AAA": "XNYS"}, frequency="1h"
+    )
+    pd.testing.assert_frame_equal(result, frame)
+
+
+def test_xhkg_gap_detection_uses_hong_kong_holidays_not_xnys() -> None:
+    """A symbol on the XHKG calendar must have its gaps evaluated against
+    Hong Kong's own holiday schedule, not the hard-coded XNYS one."""
+    from quantlab.data.validator import DataValidator
+
+    # 2024-02-12 is a Hong Kong (Lunar New Year) holiday but an ordinary
+    # XNYS trading day -- a symbol skipping straight from 2024-02-09 to
+    # 2024-02-14 (skipping only HK holidays + a weekend) must not be flagged
+    # as an abnormal gap under XHKG, even though it would be under XNYS.
+    dates = pd.DatetimeIndex(["2024-02-09", "2024-02-14"])
+    frame = _ohlcv_frame(dates, symbol="0001.HK")
+    report_xhkg = DataValidator(
+        expected_frequency="1d",
+        min_coverage_rows=1,
+        symbol_calendars=_UniformCalendar("XHKG"),
+    ).validate(frame)
+    assert not any("abnormal gap" in w for w in report_xhkg.warnings)
+
+
+def test_session_labels_handles_a_calendar_whose_session_crosses_utc_midnight() -> None:
+    """A calendar whose local trading day starts before UTC midnight (e.g.
+    XASX/ASX, UTC+10/+11) must have its session recognized as one real
+    trading day, not split by a naive UTC calendar-day boundary
+    (ts.dt.normalize()/ts.dt.date) -- otherwise gap/frequency-mismatch
+    detection would wrongly treat bars within the same real session as
+    belonging to two different "days"."""
+    from quantlab.data.calendar import session_labels
+
+    # 2024-01-09's real ASX session opens 2024-01-08 23:00 UTC and closes
+    # 2024-01-09 05:00 UTC -- straddling UTC midnight in local terms.
+    ts = pd.Series(
+        pd.to_datetime(
+            ["2024-01-08 23:30:00", "2024-01-09 01:00:00", "2024-01-09 03:00:00"]
+        )
+    )
+    labels = session_labels("XASX", ts)
+    assert labels.nunique() == 1
+    assert labels.iloc[0] == pd.Timestamp("2024-01-09")
+
+
+def test_session_labels_keeps_yahoo_style_midnight_daily_bars_on_their_own_day() -> (
+    None
+):
+    """Yahoo's daily bars are timestamped at UTC midnight of their own
+    trading date. For a calendar whose session opens many hours after UTC
+    midnight (e.g. XNYS, 13:30 UTC), midnight of day D is *closer in raw
+    time* to the previous session's open than to its own -- matching by
+    nearest market_open would misattribute every consecutive daily bar to
+    the day before, silently merging Monday's and Tuesday's volume under
+    one label and turning 5 daily bars into 4 after a daily->daily
+    resample. Matching by forward-on-close instead (see session_labels'
+    own docstring) avoids this."""
+    from quantlab.data.calendar import session_labels
+
+    ts = pd.Series(
+        pd.to_datetime(
+            [
+                "2024-08-01",
+                "2024-08-02",
+                "2024-08-05",
+                "2024-08-06",
+                "2024-08-07",
+            ]
+        )
+    )
+    labels = session_labels("XNYS", ts)
+    assert labels.tolist() == ts.tolist()  # each bar keeps its own day
+    assert labels.nunique() == 5  # never merged
+
+
+def test_session_labels_post_market_on_the_last_date_still_resolves() -> None:
+    """A genuinely post-market timestamp on `ts`'s own last calendar date
+    (after that date's close) needs the *next* session's close to resolve
+    -- the schedule fetched for `ts` must reach far enough past `ts.max()`
+    to find it, or this silently returns NaT instead of a real label."""
+    from quantlab.data.calendar import session_labels
+
+    ts = pd.Series(pd.to_datetime(["2024-08-05 10:00:00", "2024-08-05 23:00:00"]))
+    labels = session_labels("XNYS", ts)
+    assert labels.notna().all()
+    assert labels.iloc[0] == pd.Timestamp("2024-08-05")
+    assert labels.iloc[1] == pd.Timestamp("2024-08-06")
+
+
+def test_session_labels_tolerates_a_coarser_datetime_resolution_than_the_schedule() -> (
+    None
+):
+    """Parquet-cached data can come back as ``datetime64[ms]`` while
+    pandas_market_calendars' own schedule is ``[us]`` -- pandas' merge_asof
+    (used internally to match each timestamp to its session) requires an
+    exact dtype match on its join keys, not just "both datetime64", so a
+    caller passing a coarser resolution than the schedule's must not raise
+    ``MergeError: incompatible merge keys``."""
+    from quantlab.data.calendar import session_labels
+
+    ts = pd.Series(
+        pd.to_datetime(["2024-08-01", "2024-08-02"]).values.astype("datetime64[ms]")
+    )
+    assert ts.dtype == "datetime64[ms]"
+    labels = session_labels("XNYS", ts)
+    assert labels.tolist() == [pd.Timestamp("2024-08-01"), pd.Timestamp("2024-08-02")]
+
+
+def test_closure_bar_is_flat_zero_volume_with_independent_adjusted_close() -> None:
+    """A synthetic closure bar: OHLC flat at the last close, adjusted_close
+    flat at the last adjusted_close *independently* (not derived from
+    close), volume exactly 0 -- even when close and adjusted_close diverge
+    (e.g. after a split)."""
+    from quantlab.constants import (
+        ADJUSTED_CLOSE,
+        CLOSE,
+        HIGH,
+        LOW,
+        OPEN,
+        SYMBOL,
+        TIMESTAMP,
+        VOLUME,
+    )
+    from quantlab.data.closures import insert_verified_closure_bars
+
+    aapl_dates = pd.to_datetime(["2024-01-05"])  # Friday only
+    btc_dates = pd.to_datetime(["2024-01-05", "2024-01-06"])  # Fri + Sat
+    data = pd.concat(
+        [
+            pd.DataFrame(
+                {
+                    TIMESTAMP: aapl_dates,
+                    SYMBOL: "AAPL",
+                    OPEN: 100.0,
+                    HIGH: 100.0,
+                    LOW: 100.0,
+                    CLOSE: 100.0,
+                    ADJUSTED_CLOSE: 90.0,  # diverges from close, e.g. a split
+                    VOLUME: 1_000.0,
+                }
+            ),
+            pd.DataFrame(
+                {
+                    TIMESTAMP: btc_dates,
+                    SYMBOL: "BTC",
+                    OPEN: 40_000.0,
+                    HIGH: 40_000.0,
+                    LOW: 40_000.0,
+                    CLOSE: 40_000.0,
+                    ADJUSTED_CLOSE: 40_000.0,
+                    VOLUME: 1_000.0,
+                }
+            ),
+        ],
+        ignore_index=True,
+    )
+    filled = insert_verified_closure_bars(
+        data, symbol_calendars={"AAPL": "XNYS", "BTC": "24/7"}, frequency="1d"
+    )
+    synthetic = filled[
+        (filled[SYMBOL] == "AAPL") & (filled[TIMESTAMP] == pd.Timestamp("2024-01-06"))
+    ].iloc[0]
+    assert synthetic[OPEN] == 100.0
+    assert synthetic[HIGH] == 100.0
+    assert synthetic[LOW] == 100.0
+    assert synthetic[CLOSE] == 100.0
+    assert synthetic[ADJUSTED_CLOSE] == 90.0  # independent of close, not derived
+    assert synthetic[VOLUME] == 0.0
+
+
+def test_multi_source_experiment_downloads_from_each_instruments_own_source(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A yahoo-sourced and a binance-sourced instrument in the same
+    experiment must each be routed to their own provider."""
+    from quantlab.data import loader as loader_module
+    from quantlab.data.base import MarketDataSource
+    from quantlab.data.loader import DataLoader
+    from quantlab.data.storage import ParquetStorage as _ParquetStorage
+
+    calls: list[tuple[str, list[str]]] = []
+
+    class _FakeSource(MarketDataSource):
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+        def download(
+            self,
+            symbols: list[str],
+            start: date,
+            end: date,
+            frequency: str,
+            *,
+            calendar: str = "XNYS",
+        ) -> pd.DataFrame:
+            calls.append((self.name, list(symbols)))
+            return make_ohlcv(
+                symbols[0], np.linspace(100, 110, 5), start="2024-01-01", freq="B"
+            )
+
+    def fake_build_source(name: str) -> _FakeSource:
+        return _FakeSource(name)
+
+    monkeypatch.setattr(loader_module, "build_source", fake_build_source)
+    cfg = ExperimentConfig.from_dict(
+        {
+            "experiment_name": "multi_source",
+            "data": {
+                "instruments": [
+                    {"symbol": "SPY", "source": "yahoo", "calendar": "XNYS"},
+                    {"symbol": "BTCUSDT", "source": "binance", "calendar": "24/7"},
+                ],
+                "start_date": "2024-01-01",
+                "end_date": "2024-01-05",
+            },
+            "backtest": {"periods_per_year": 252},
+            "strategy": {"name": "buy_and_hold"},
+        }
+    )
+    loader = DataLoader(
+        storage=_ParquetStorage(
+            cache_dir=tmp_path / "cache", metadata_dir=tmp_path / "metadata"
+        )
+    )
+    loader.download(cfg)
+    routed = dict(calls)
+    assert routed.get("yahoo") == ["SPY"]
+    assert routed.get("binance") == ["BTCUSDT"]
+
+
+def test_benchmark_overlapping_tradable_instrument_is_not_downloaded_twice(
+    tmp_path: Path,
+) -> None:
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    _write_instrument_csv(
+        raw, "SPY", make_ohlcv("SPY", np.linspace(100, 110, 10), start="2024-01-01")
+    )
+    cfg = ExperimentConfig.from_dict(
+        {
+            "experiment_name": "benchmark_overlap",
+            "data": {
+                "instruments": [{"symbol": "SPY", "source": "csv", "calendar": "XNYS"}],
+                "start_date": "2024-01-01",
+                "end_date": "2024-01-15",
+            },
+            "strategy": {"name": "buy_and_hold"},
+            "backtest": {
+                "benchmark": {"symbol": "SPY", "source": "csv", "calendar": "XNYS"}
+            },
+        }
+    )
+    from quantlab.data.loader import DataLoader
+
+    data = DataLoader(raw_dir=raw).download(cfg)
+    # SPY must appear exactly once per timestamp, not duplicated by a second
+    # (redundant) download of the same symbol as an "external" benchmark.
+    assert not data.duplicated(subset=["timestamp", "symbol"]).any()
+
+
+def test_external_benchmark_frequency_must_be_supported_by_its_own_source() -> None:
+    """A benchmark outside the tradable universe has its own source, whose
+    frequency support `DataConfig._check_frequency_supported_by_every_
+    instrument` never sees (it only checks `data.instruments`). Without a
+    dedicated check, e.g. frequency '1mo' with an external Binance
+    benchmark would be silently accepted at config-load time only to fail
+    later, confusingly, at download time."""
+    base: dict[str, Any] = {
+        "experiment_name": "external_benchmark_frequency",
+        "data": {
+            "instruments": [{"symbol": "AAPL", "source": "yahoo", "calendar": "XNYS"}],
+            "start_date": "2020-01-01",
+            "end_date": "2021-01-01",
+            "frequency": "1mo",
+        },
+        "strategy": {"name": "buy_and_hold"},
+        "backtest": {
+            "benchmark": {
+                "symbol": "BTCUSDT",
+                "source": "binance",
+                "calendar": "24/7",
+            }
+        },
+    }
+    with pytest.raises(InvalidConfigurationError, match="benchmark's source"):
+        ExperimentConfig.from_dict(base)
+
+    # The tradable side alone supports '1mo' (Yahoo does) -- confirms the
+    # rejection above is specifically about the benchmark's own source, not
+    # a false positive from the existing tradable-side check.
+    ExperimentConfig.from_dict({**base, "data": {**base["data"], "frequency": "1d"}})
+
+
+def test_benchmark_outside_tradable_universe_loaded_via_its_own_instrument(
+    tmp_path: Path,
+) -> None:
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    _write_instrument_csv(
+        raw, "AAA", make_ohlcv("AAA", np.linspace(100, 110, 10), start="2024-01-01")
+    )
+    _write_instrument_csv(
+        raw, "BENCH", make_ohlcv("BENCH", np.linspace(50, 60, 10), start="2024-01-01")
+    )
+    cfg = ExperimentConfig.from_dict(
+        {
+            "experiment_name": "external_benchmark",
+            "data": {
+                "instruments": [{"symbol": "AAA", "source": "csv", "calendar": "XNYS"}],
+                "start_date": "2024-01-01",
+                "end_date": "2024-01-15",
+            },
+            "strategy": {"name": "buy_and_hold"},
+            "backtest": {
+                "benchmark": {"symbol": "BENCH", "source": "csv", "calendar": "XNYS"}
+            },
+        }
+    )
+    from quantlab.data.loader import DataLoader
+
+    data, _report = DataLoader(raw_dir=raw).load(cfg)
+    assert "BENCH" in set(data["symbol"].unique())
+
+
+def test_external_benchmark_never_expands_the_tradable_timeline(tmp_path: Path) -> None:
+    """A 24/7 external benchmark must never cause synthetic weekend bars to
+    appear for an all-XNYS tradable universe."""
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    # AAPL starts on Jan 2 (not Jan 1, an XNYS holiday) so every bar sits on a
+    # real trading day -- otherwise the Jan 1 bar would itself be a real row
+    # on a verified closure and get discarded before it ever reaches the
+    # weekend-expansion assertion below.
+    aapl_dates = pd.bdate_range("2024-01-02", "2024-01-10")
+    btc_dates = pd.date_range("2024-01-01", "2024-01-10", freq="D")
+    _write_instrument_csv(
+        raw,
+        "AAPL",
+        make_ohlcv(
+            "AAPL", np.linspace(100, 109, len(aapl_dates)), start="2024-01-02", freq="B"
+        ),
+    )
+    _write_instrument_csv(
+        raw,
+        "BENCHBTC",
+        make_ohlcv(
+            "BENCHBTC",
+            np.linspace(40000, 40009, len(btc_dates)),
+            start="2024-01-01",
+            freq="D",
+        ),
+    )
+    cfg = ExperimentConfig.from_dict(
+        {
+            "experiment_name": "benchmark_never_expands",
+            "data": {
+                "instruments": [
+                    {"symbol": "AAPL", "source": "csv", "calendar": "XNYS"}
+                ],
+                "start_date": "2024-01-01",
+                "end_date": "2024-01-10",
+            },
+            "strategy": {"name": "buy_and_hold"},
+            "backtest": {
+                "benchmark": {
+                    "symbol": "BENCHBTC",
+                    "source": "csv",
+                    "calendar": "24/7",
+                }
+            },
+        }
+    )
+    from quantlab.data.loader import DataLoader
+
+    data, report = DataLoader(raw_dir=raw).load(cfg)
+    aapl = data[data["symbol"] == "AAPL"]
+    assert pd.Timestamp("2024-01-06") not in set(aapl["timestamp"])  # no Saturday
+    assert pd.Timestamp("2024-01-07") not in set(aapl["timestamp"])  # no Sunday
+    assert report.closure_inserted_count == 0
+    assert report.closure_discarded_count == 0
+
+
+def test_external_benchmark_is_validated_with_its_own_calendar(tmp_path: Path) -> None:
+    """The validator must receive the external benchmark's own calendar (not
+    KeyError on a symbol it doesn't recognise), while that calendar never
+    feeds the tradable-universe closure machinery."""
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    _write_instrument_csv(
+        raw, "AAA", make_ohlcv("AAA", np.linspace(100, 110, 10), start="2024-01-01")
+    )
+    _write_instrument_csv(
+        raw,
+        "BENCHBTC",
+        make_ohlcv(
+            "BENCHBTC", np.linspace(40000, 40010, 10), start="2024-01-01", freq="D"
+        ),
+    )
+    cfg = ExperimentConfig.from_dict(
+        {
+            "experiment_name": "benchmark_own_calendar",
+            "data": {
+                "instruments": [{"symbol": "AAA", "source": "csv", "calendar": "XNYS"}],
+                "start_date": "2024-01-01",
+                "end_date": "2024-01-15",
+            },
+            "strategy": {"name": "buy_and_hold"},
+            "backtest": {
+                "benchmark": {
+                    "symbol": "BENCHBTC",
+                    "source": "csv",
+                    "calendar": "24/7",
+                }
+            },
+        }
+    )
+    from quantlab.data.loader import DataLoader
+
+    # Must not raise (no KeyError from the validator's strict symbol_calendars).
+    data, _report = DataLoader(raw_dir=raw).load(cfg)
+    assert "BENCHBTC" in set(data["symbol"].unique())
+
+
+def test_csv_instrument_never_narrows_the_frequency_intersection() -> None:
+    from quantlab.config import (
+        DataFrequency,
+        DataSourceName,
+        compatible_frequencies_for_sources,
+    )
+
+    only_csv = compatible_frequencies_for_sources([DataSourceName.CSV])
+    assert only_csv == set(DataFrequency)
+
+    mixed = compatible_frequencies_for_sources(
+        [DataSourceName.CSV, DataSourceName.YAHOO]
+    )
+    yahoo_only = compatible_frequencies_for_sources([DataSourceName.YAHOO])
+    assert mixed == yahoo_only  # csv is neutral, never narrows the result
+
+
+def test_market_data_cache_is_independent_of_experiment_calendar(
+    tmp_path: Path,
+) -> None:
+    """The same (source, symbol, frequency) cache entry must be reused
+    regardless of which calendar the requesting experiment declares for
+    that instrument -- calendar-dependent filtering happens only after
+    reading the cache, never baked into what gets written to it."""
+    from quantlab.data.base import MarketDataSource
+    from quantlab.data.loader import DataLoader
+    from quantlab.data.storage import ParquetStorage
+
+    storage = ParquetStorage(cache_dir=tmp_path / "cache", metadata_dir=tmp_path / "md")
+
+    class _FakeSource(MarketDataSource):
+        name = "yahoo"
+        call_count = 0
+
+        def download(
+            self,
+            symbols: list[str],
+            start: date,
+            end: date,
+            frequency: str,
+            *,
+            calendar: str = "XNYS",
+        ) -> pd.DataFrame:
+            _FakeSource.call_count += 1
+            return make_ohlcv(
+                symbols[0], np.linspace(100, 110, 10), start="2024-01-01", freq="D"
+            )
+
+    loader = DataLoader(storage=storage)
+    instrument_xnys = ExperimentConfig.from_dict(
+        {
+            "experiment_name": "cache_a",
+            "data": {
+                "instruments": [
+                    {"symbol": "AAA", "source": "yahoo", "calendar": "XNYS"}
+                ],
+                "start_date": "2024-01-01",
+                "end_date": "2024-01-10",
+            },
+            "strategy": {"name": "buy_and_hold"},
+        }
+    ).data.instruments[0]
+    instrument_247 = ExperimentConfig.from_dict(
+        {
+            "experiment_name": "cache_b",
+            "data": {
+                "instruments": [
+                    {"symbol": "AAA", "source": "yahoo", "calendar": "24/7"}
+                ],
+                "start_date": "2024-01-01",
+                "end_date": "2024-01-10",
+            },
+            "strategy": {"name": "buy_and_hold"},
+        }
+    ).data.instruments[0]
+    dummy_config = ExperimentConfig.from_dict(
+        {
+            "experiment_name": "cache_dummy",
+            "data": {
+                "instruments": [
+                    {"symbol": "AAA", "source": "yahoo", "calendar": "XNYS"}
+                ],
+                "start_date": "2024-01-01",
+                "end_date": "2024-01-10",
+            },
+            "strategy": {"name": "buy_and_hold"},
+        }
+    )
+    source = _FakeSource()
+    loader._download_symbol(source, instrument_xnys, dummy_config, force=False)
+    loader._download_symbol(source, instrument_247, dummy_config, force=False)
+    # Both instruments share the same (source, symbol, frequency) cache key,
+    # so the second call must be served from the cache the first call wrote
+    # -- the provider is hit only once.
+    assert _FakeSource.call_count == 1
+
+
+def test_loader_trims_to_common_coverage_when_a_247_symbol_starts_earlier(
+    tmp_path: Path,
+) -> None:
+    """A 24/7 instrument's earlier real coverage must not widen the combined
+    tradable timeline into a date an XNYS instrument has no data for yet --
+    left unfixed, price_matrix's pct_change would produce an unrecoverable
+    NaN on the XNYS instrument's own genuinely-first trading day (caught,
+    confusingly, only by a downstream benchmark-alignment or
+    missing-return-while-held guard). The loader must instead trim the whole
+    panel to the date every tradable symbol actually has data from."""
+    from quantlab.constants import TIMESTAMP
+
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    # SPY/TSLA: XNYS, first real bar 2019-01-02 (2019-01-01 is a holiday).
+    bdates = pd.bdate_range("2019-01-02", periods=10)
+    for sym, seed in [("SPY", 1), ("TSLA", 2)]:
+        sym_prices = geometric_series(
+            len(bdates), mu=0.0005, sigma=0.01, s0=100.0, seed=seed
+        )
+        frame = make_ohlcv(sym, sym_prices, start="2019-01-02", freq="B")
+        _write_instrument_csv(raw, sym, frame)
+    # ETH: 24/7, already has a real bar on 2019-01-01.
+    cdates = pd.date_range("2019-01-01", periods=14)
+    eth_prices = geometric_series(len(cdates), mu=0.0003, sigma=0.02, s0=100.0, seed=3)
+    _write_instrument_csv(
+        raw, "ETH", make_ohlcv("ETH", eth_prices, start="2019-01-01", freq="D")
+    )
+
+    cfg = ExperimentConfig.from_dict(
+        {
+            "experiment_name": "common_coverage",
+            "data": {
+                "instruments": [
+                    {"symbol": "SPY", "source": "csv", "calendar": "XNYS"},
+                    {"symbol": "TSLA", "source": "csv", "calendar": "XNYS"},
+                    {"symbol": "ETH", "source": "csv", "calendar": "24/7"},
+                ],
+                "start_date": "2019-01-01",
+                "end_date": "2019-01-14",
+            },
+            "backtest": {"periods_per_year": 252},
+            "strategy": {"name": "buy_and_hold"},
+        }
+    )
+    from quantlab.data.loader import DataLoader
+
+    data, report = DataLoader(raw_dir=raw).load(cfg)
+    assert data[TIMESTAMP].min() == pd.Timestamp("2019-01-02")
+    assert any(
+        "coverage effectively starts 2019-01-02" in w and "SPY" in w and "TSLA" in w
+        for w in report.warnings
+    )
+
+    from quantlab.backtesting.accounting import compute_asset_returns
+    from quantlab.data.base import price_matrix
+
+    prices = price_matrix(data, adjusted=True)
+    returns = compute_asset_returns(prices)
+    # No NaN survives beyond the mandatory first row (undefined by
+    # construction -- there is no prior price for anything on day 1).
+    assert not returns.iloc[1:].isna().to_numpy().any()
+
+    from quantlab.backtesting.runner import run_backtest_from_config
+
+    result = run_backtest_from_config(data, cfg)
+    assert not result.returns.isna().any()
+
+
+def test_loader_trims_to_common_coverage_when_a_symbol_ends_earlier(
+    tmp_path: Path,
+) -> None:
+    """Symmetric case at the other end of history: one tradable symbol's data
+    simply stops earlier than another's (a stale feed), while the other
+    keeps going -- left unfixed, the engine hits an unrecoverable "asset
+    return missing while held" failure on the first date the stopped
+    symbol has no data for. The loader must trim the whole panel to the
+    date every tradable symbol actually still has data through, the same
+    way it already trims to a common start."""
+    from quantlab.constants import TIMESTAMP
+
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    # AAPL stops 5 business days before MSFT does; both same calendar (XNYS)
+    # so no closure-fill interaction confounds the scenario.
+    aapl_dates = pd.bdate_range("2024-01-02", "2024-01-10")
+    msft_dates = pd.bdate_range("2024-01-02", "2024-01-17")
+    for sym, dates in [("AAPL", aapl_dates), ("MSFT", msft_dates)]:
+        prices = geometric_series(len(dates), mu=0.0005, sigma=0.01, s0=100.0, seed=1)
+        frame = make_ohlcv(sym, prices, start="2024-01-02", freq="B")
+        frame["timestamp"] = dates
+        _write_instrument_csv(raw, sym, frame)
+
+    cfg = ExperimentConfig.from_dict(
+        {
+            "experiment_name": "common_end_coverage",
+            "data": {
+                "instruments": [
+                    {"symbol": "AAPL", "source": "csv", "calendar": "XNYS"},
+                    {"symbol": "MSFT", "source": "csv", "calendar": "XNYS"},
+                ],
+                "start_date": "2024-01-02",
+                "end_date": "2024-01-17",
+            },
+            "strategy": {"name": "buy_and_hold"},
+        }
+    )
+    from quantlab.data.loader import DataLoader
+
+    data, report = DataLoader(raw_dir=raw).load(cfg)
+    assert data[TIMESTAMP].max() == pd.Timestamp("2024-01-10")
+    assert any(
+        "coverage effectively ends 2024-01-10" in w and "AAPL" in w
+        for w in report.warnings
+    )
+
+    from quantlab.backtesting.runner import run_backtest_from_config
+
+    result = run_backtest_from_config(data, cfg)
+    assert not result.returns.isna().any()
+
+
+def _write_gap_pair(raw: Path, missing_date: str) -> None:
+    """Two 24/7 instruments spanning 2024-01-01..06; ETH has no row at all
+    for ``missing_date`` (a genuine gap), while BTC trades every day."""
+    btc_dates = pd.date_range("2024-01-01", "2024-01-06", freq="D")
+    eth_dates = pd.DatetimeIndex(
+        [d for d in btc_dates if d != pd.Timestamp(missing_date)]
+    )
+    btc_prices = geometric_series(
+        len(btc_dates), mu=0.0005, sigma=0.01, s0=100.0, seed=1
+    )
+    btc = make_ohlcv("BTC", btc_prices, start="2024-01-01", freq="D")
+    btc["timestamp"] = btc_dates
+    _write_instrument_csv(raw, "BTC", btc)
+    eth_prices = geometric_series(
+        len(eth_dates), mu=0.0005, sigma=0.01, s0=50.0, seed=2
+    )
+    eth = make_ohlcv("ETH", eth_prices, start="2024-01-01", freq="D")
+    eth["timestamp"] = eth_dates
+    _write_instrument_csv(raw, "ETH", eth)
+
+
+def _gap_config(policy: str) -> ExperimentConfig:
+    return ExperimentConfig.from_dict(
+        {
+            "experiment_name": f"genuine_gap_{policy}",
+            "data": {
+                "instruments": [
+                    {"symbol": "BTC", "source": "csv", "calendar": "24/7"},
+                    {"symbol": "ETH", "source": "csv", "calendar": "24/7"},
+                ],
+                "start_date": "2024-01-01",
+                "end_date": "2024-01-06",
+                "missing_value_policy": policy,
+            },
+            "strategy": {"name": "buy_and_hold"},
+        }
+    )
+
+
+def test_genuine_gap_under_raise_policy_gives_a_clear_early_error(
+    tmp_path: Path,
+) -> None:
+    """A (date, symbol) combination with no row at all for a real trading
+    session -- never a verified closure -- must be governed by
+    ``missing_value_policy`` the same way a missing *value* already is.
+    Under ``raise`` it must fail loudly at load time, not surface later as
+    an opaque "asset return missing while held" backtest failure."""
+    from quantlab.exceptions import DataValidationError
+
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    _write_gap_pair(raw, "2024-01-03")
+    cfg = _gap_config("raise")
+
+    from quantlab.data.loader import DataLoader
+
+    with pytest.raises(DataValidationError, match="ETH@2024-01-03"):
+        DataLoader(raw_dir=raw).load(cfg)
+
+
+def test_genuine_gap_under_drop_policy_removes_the_date_and_backtest_succeeds(
+    tmp_path: Path,
+) -> None:
+    """``drop`` must remove the affected date from the *whole* tradable
+    universe (not just the missing symbol's own row) so the resulting panel
+    stays dense enough for the engine to run end to end."""
+    from quantlab.constants import SYMBOL, TIMESTAMP
+    from quantlab.data.loader import DataLoader
+
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    _write_gap_pair(raw, "2024-01-03")
+    cfg = _gap_config("drop")
+
+    data, report = DataLoader(raw_dir=raw).load(cfg)
+    assert pd.Timestamp("2024-01-03") not in set(data[TIMESTAMP])
+    assert any("dropped from the tradable universe" in w for w in report.warnings)
+    # BTC also loses its (perfectly fine) row that day -- the whole date is
+    # dropped, not just ETH's missing one.
+    btc_dates = set(data.loc[data[SYMBOL] == "BTC", TIMESTAMP])
+    assert pd.Timestamp("2024-01-03") not in btc_dates
+
+    from quantlab.backtesting.runner import run_backtest_from_config
+
+    result = run_backtest_from_config(data, cfg)
+    assert not result.returns.isna().any()
+
+
+def test_genuine_gap_under_forward_fill_policy_materializes_a_flat_bar(
+    tmp_path: Path,
+) -> None:
+    """``forward_fill`` must synthesize a flat bar (close carried forward,
+    zero volume) for the missing (date, symbol) rather than dropping the
+    date outright, and the backtest must run cleanly on the result."""
+    from quantlab.constants import CLOSE, SYMBOL, TIMESTAMP, VOLUME
+    from quantlab.data.loader import DataLoader
+
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    _write_gap_pair(raw, "2024-01-03")
+    cfg = _gap_config("forward_fill")
+
+    data, report = DataLoader(raw_dir=raw).load(cfg)
+    assert pd.Timestamp("2024-01-03") in set(data.loc[data[SYMBOL] == "ETH", TIMESTAMP])
+    assert any("forward-filled" in w for w in report.warnings)
+    eth_sorted = data.loc[data[SYMBOL] == "ETH"].sort_values(TIMESTAMP)
+    filled_row = eth_sorted.loc[eth_sorted[TIMESTAMP] == pd.Timestamp("2024-01-03")]
+    prior_row = eth_sorted.loc[eth_sorted[TIMESTAMP] == pd.Timestamp("2024-01-02")]
+    assert filled_row[CLOSE].iloc[0] == prior_row[CLOSE].iloc[0]
+    assert filled_row[VOLUME].iloc[0] == 0.0
+
+    from quantlab.backtesting.runner import run_backtest_from_config
+
+    result = run_backtest_from_config(data, cfg)
+    assert not result.returns.isna().any()
+
+
+def test_genuine_gap_under_none_policy_is_left_unfilled(tmp_path: Path) -> None:
+    """``none`` must remain an explicit pass-through: the gap stays exactly
+    as-is (no drop, no synthetic row), consistent with existing "abnormal
+    gap" warning behaviour -- this fix must never activate under ``none``."""
+    from quantlab.constants import SYMBOL, TIMESTAMP
+    from quantlab.data.loader import DataLoader
+
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    _write_gap_pair(raw, "2024-01-03")
+    cfg = _gap_config("none")
+
+    data, _report = DataLoader(raw_dir=raw).load(cfg)
+    eth_dates = set(data.loc[data[SYMBOL] == "ETH", TIMESTAMP])
+    assert pd.Timestamp("2024-01-03") not in eth_dates
+    assert len(data.loc[data[SYMBOL] == "ETH"]) == 5
+
+
+def test_genuine_gap_detection_does_not_reclassify_a_trailing_coverage_difference(
+    tmp_path: Path,
+) -> None:
+    """A symbol whose feed simply stops earlier than another's (all dates
+    trailing its own last observation) is a coverage-window difference,
+    handled by the loader's own common-end trim with its own warning -- it
+    must never be caught first by genuine-gap drop/forward-fill, which
+    would needlessly discard the *other* symbol's perfectly good rows on
+    those trailing dates too."""
+    from quantlab.constants import SYMBOL, TIMESTAMP
+    from quantlab.data.loader import DataLoader
+
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    aapl_dates = pd.bdate_range("2024-01-02", "2024-01-10")
+    msft_dates = pd.bdate_range("2024-01-02", "2024-01-17")
+    for sym, dates in [("AAPL", aapl_dates), ("MSFT", msft_dates)]:
+        prices = geometric_series(len(dates), mu=0.0005, sigma=0.01, s0=100.0, seed=1)
+        frame = make_ohlcv(sym, prices, start="2024-01-02", freq="B")
+        frame["timestamp"] = dates
+        _write_instrument_csv(raw, sym, frame)
+
+    cfg = ExperimentConfig.from_dict(
+        {
+            "experiment_name": "trailing_not_a_gap",
+            "data": {
+                "instruments": [
+                    {"symbol": "AAPL", "source": "csv", "calendar": "XNYS"},
+                    {"symbol": "MSFT", "source": "csv", "calendar": "XNYS"},
+                ],
+                "start_date": "2024-01-02",
+                "end_date": "2024-01-17",
+                "missing_value_policy": "drop",
+            },
+            "strategy": {"name": "buy_and_hold"},
+        }
+    )
+    data, report = DataLoader(raw_dir=raw).load(cfg)
+    assert data[TIMESTAMP].max() == pd.Timestamp("2024-01-10")
+    assert any(
+        "coverage effectively ends 2024-01-10" in w and "AAPL" in w
+        for w in report.warnings
+    )
+    assert not any("dropped from the tradable universe" in w for w in report.warnings)
+    # MSFT keeps every one of its own rows through 01-10; none were
+    # discarded by the genuine-gap logic misfiring on trailing dates.
+    msft_kept = data.loc[data[SYMBOL] == "MSFT", TIMESTAMP]
+    assert len(msft_kept) == len(pd.bdate_range("2024-01-02", "2024-01-10"))

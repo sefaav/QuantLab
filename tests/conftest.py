@@ -111,13 +111,15 @@ def sample_config() -> ExperimentConfig:
         {
             "experiment_name": "unit_test_experiment",
             "data": {
-                "source": "csv",
-                "symbols": ["AAA", "BBB", "CCC"],
+                "instruments": [
+                    {"symbol": "AAA", "source": "csv", "calendar": "XNYS"},
+                    {"symbol": "BBB", "source": "csv", "calendar": "XNYS"},
+                    {"symbol": "CCC", "source": "csv", "calendar": "XNYS"},
+                ],
                 "start_date": date(2020, 1, 1),
                 "end_date": date(2021, 8, 1),
                 "frequency": "1d",
                 "missing_value_policy": "drop",
-                "market_calendar": "XNYS",
             },
             "strategy": {"name": "buy_and_hold", "parameters": {}},
             "portfolio": {
@@ -132,7 +134,7 @@ def sample_config() -> ExperimentConfig:
             },
             "backtest": {
                 "initial_capital": 100_000.0,
-                "benchmark_symbol": "AAA",
+                "benchmark": {"symbol": "AAA", "source": "csv", "calendar": "XNYS"},
                 "risk_free_rate": 0.0,
                 "periods_per_year": 252,
             },

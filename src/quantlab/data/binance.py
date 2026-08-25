@@ -74,13 +74,30 @@ class BinanceDataSource(MarketDataSource):
         end: date,
         frequency: str = "1d",
         *,
-        is_247_market: bool = False,
+        calendar: str = "24/7",
     ) -> pd.DataFrame:
         """Download candles for ``symbols`` and normalise to canonical schema.
 
-        ``is_247_market`` is unused because Binance provides each kline's
-        explicit ``close_time`` and QuantLab only supports Binance as 24/7.
+        ``calendar`` is unused because Binance provides each kline's explicit
+        ``close_time`` and every Binance instrument's calendar is always
+        ``"24/7"`` (enforced by :class:`~quantlab.config.InstrumentConfig`).
         """
+        if not isinstance(symbols, list) or not symbols:
+            raise DataDownloadError("Binance download requires at least one symbol.")
+        normalised_symbols: list[str] = []
+        for position, symbol in enumerate(symbols):
+            if not isinstance(symbol, str) or not symbol.strip():
+                raise DataDownloadError(
+                    f"Binance symbol at position {position} must be a non-empty string."
+                )
+            normalised_symbols.append(symbol.strip().upper())
+        if not isinstance(start, date) or not isinstance(end, date):
+            raise DataDownloadError("Binance start and end must be date values.")
+        if start > end:
+            raise DataDownloadError("Binance start must be on or before end.")
+        if not isinstance(frequency, str):
+            raise DataDownloadError("Binance frequency must be a string.")
+
         interval = _INTERVAL.get(frequency)
         if interval is None:
             raise DataDownloadError(
@@ -89,7 +106,10 @@ class BinanceDataSource(MarketDataSource):
             )
         # Use one cutoff instant for every symbol in this download.
         now_ms = int(time.time() * 1000)
-        frames = [self._download_one(s, start, end, interval, now_ms) for s in symbols]
+        frames = [
+            self._download_one(s, start, end, interval, now_ms)
+            for s in normalised_symbols
+        ]
         frames = [f for f in frames if not f.empty]
         if not frames:
             raise DataDownloadError(

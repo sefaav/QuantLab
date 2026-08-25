@@ -15,11 +15,14 @@ from quantlab.validation.parameter_grid import (
 )
 from quantlab.validation.parameter_sensitivity import (
     run_parameter_sensitivity,
+    run_walk_forward_parameter_sensitivity,
     sensitivity_heatmap_data,
 )
 from quantlab.validation.robustness import (
     monte_carlo_permutation,
     run_stress_tests,
+    run_walk_forward_stress_tests,
+    stress_test_checkpoint_paths,
 )
 from quantlab.validation.splits import (
     ChronologicalSplit,
@@ -51,6 +54,9 @@ __all__ = [
     "run_holdout_validation",
     "run_parameter_sensitivity",
     "run_stress_tests",
+    "run_walk_forward_parameter_sensitivity",
+    "run_walk_forward_stress_tests",
     "sensitivity_heatmap_data",
+    "stress_test_checkpoint_paths",
     "walk_forward_windows",
 ]

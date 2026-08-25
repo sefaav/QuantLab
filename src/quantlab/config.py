@@ -15,7 +15,7 @@ import itertools
 import math
 import re
 import types
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from datetime import date
 from enum import StrEnum
 from pathlib import Path
@@ -137,9 +137,17 @@ def _reject_non_json_safe(value: Any, *, path: str) -> None:
     """Reject values that cannot be represented safely in saved metadata.
 
     Accepted values are ``None``, booleans, integers, finite floats, strings,
-    dates, lists, and dictionaries with string keys. Array-like objects and
-    unordered containers must be converted explicitly by the caller.
+    dates, lists, dictionaries with string keys, and nested Pydantic models
+    (each validates its own fields recursively via
+    ``_reject_non_json_safe_fields``, so re-walking its internals here would
+    be redundant — this mirrors the same skip already applied to a model
+    stored directly in a field, generalised to one nested inside a list or
+    dict too, e.g. ``DataConfig.instruments: list[InstrumentConfig]``).
+    Array-like objects and unordered containers must be converted explicitly
+    by the caller.
     """
+    if isinstance(value, BaseModel):
+        return
     if isinstance(value, _JSON_SAFE_SCALARS):
         return
     if isinstance(value, float):
@@ -237,18 +245,6 @@ class DataSourceName(StrEnum):
     CSV = "csv"
 
 
-class MarketCalendar(StrEnum):
-    """Market-hours model used for settlement, gaps, and annualisation.
-
-    QuantLab applies one calendar to the entire experiment. Yahoo defaults to
-    XNYS but may be configured as 24/7, Binance is always 24/7, and CSV
-    experiments must choose explicitly. Other calendars are not supported.
-    """
-
-    XNYS = "XNYS"
-    TWENTY_FOUR_SEVEN = "24/7"
-
-
 class OptimizationMetric(StrEnum):
     """Metrics available for walk-forward parameter selection."""
 
@@ -340,13 +336,90 @@ _SOURCE_SUPPORTED_FREQUENCIES: dict[DataSourceName, frozenset[DataFrequency]] = 
 }
 
 
+def compatible_frequencies_for_sources(
+    sources: Iterable[DataSourceName],
+) -> set[DataFrequency]:
+    """Return the frequencies compatible with every remote source in ``sources``.
+
+    ``csv`` is neutral: its real frequency depends on the timestamps actually
+    present in the file, checked after loading by
+    :class:`~quantlab.data.validator.DataValidator` (``_check_declared_frequency``),
+    not known in advance the way a remote API's capabilities are. A
+    ``sources`` collection containing only ``csv`` (or empty) is therefore
+    compatible with every :class:`DataFrequency`.
+
+    This is the single source of truth for frequency compatibility — both
+    :class:`DataConfig`'s validator and the dashboard's frequency picker call
+    it directly, so the two can never diverge.
+    """
+    remote = [source for source in sources if source is not DataSourceName.CSV]
+    if not remote:
+        return set(DataFrequency)
+    tables = [_SOURCE_SUPPORTED_FREQUENCIES[source] for source in remote]
+    return set.intersection(*(set(table) for table in tables))
+
+
+class InstrumentConfig(_StrictModel):
+    """A single instrument: its symbol, data source, and trading calendar.
+
+    The unit of configuration for a tradable asset or a benchmark. Each
+    instrument resolves its own source and calendar explicitly — nothing here
+    is inferred at run time; any auto-detection happens upstream (e.g. in the
+    dashboard) before this model is constructed.
+    """
+
+    symbol: str
+    source: DataSourceName
+    calendar: str = Field(
+        description=(
+            "'24/7' for a continuous market, or any calendar name accepted "
+            "by pandas_market_calendars (e.g. 'XNYS', 'XHKG', 'CME_Equity')."
+        )
+    )
+
+    @field_validator("symbol")
+    @classmethod
+    def _normalize_symbol(cls, value: str) -> str:
+        """Normalise the symbol and make it safe as a CSV/cache filename."""
+        sym = value.strip().upper()
+        if not sym:
+            raise ValueError("symbol must not be empty.")
+        _validate_path_component(sym, field_name="symbol")
+        return sym
+
+    @field_validator("calendar")
+    @classmethod
+    def _validate_calendar(cls, value: str) -> str:
+        # Local import: quantlab.data imports quantlab.config at module load
+        # time (via data/loader.py), so a top-level import here would cycle.
+        from quantlab.data.calendar import validate_calendar_name
+
+        calendar = value.strip()
+        if not calendar:
+            raise ValueError("calendar must not be empty.")
+        validate_calendar_name(calendar)
+        return calendar
+
+    @model_validator(mode="after")
+    def _check_binance_is_always_247(self) -> InstrumentConfig:
+        if self.source is DataSourceName.BINANCE and self.calendar != "24/7":
+            raise ValueError(
+                f"calendar {self.calendar!r} is not permitted with source "
+                f"'binance' for symbol {self.symbol!r} — every Binance "
+                "symbol genuinely trades 24/7, so there is no real "
+                "instrument this combination could correctly describe. "
+                "Set calendar: '24/7'."
+            )
+        return self
+
+
 class DataConfig(_StrictModel):
     """Data-acquisition settings (the ``data:`` block)."""
 
-    source: DataSourceName = Field(
-        default=DataSourceName.YAHOO, description="Data source identifier."
+    instruments: list[InstrumentConfig] = Field(
+        min_length=1,
+        description="Tradable instruments, each with its own symbol/source/calendar.",
     )
-    symbols: list[str] = Field(min_length=1, description="Tickers to load.")
     start_date: date
     end_date: date
     frequency: DataFrequency = Field(
@@ -361,63 +434,44 @@ class DataConfig(_StrictModel):
             "missing_value_policy is 'forward_fill'."
         ),
     )
-    market_calendar: MarketCalendar | None = Field(
-        default=None,
-        description=(
-            "Market-hours model: 'XNYS' or '24/7'. Yahoo defaults to XNYS but "
-            "may select 24/7; Binance is always 24/7; CSV must set it explicitly."
-        ),
-    )
     use_bundled_demo_data: bool = Field(
         default=False,
         description=(
-            "For source 'csv' only, use QuantLab's bundled synthetic demo "
-            "files when every requested symbol is absent from the local "
-            "raw-data directory (a partial match is always a hard error, "
-            "never a mix of local and bundled data). Must be enabled "
-            "explicitly."
+            "For a csv-sourced instrument, use QuantLab's bundled synthetic "
+            "demo files when every requested symbol is absent from the "
+            "local raw-data directory (a partial match is always a hard "
+            "error, never a mix of local and bundled data). Must be "
+            "enabled explicitly."
         ),
     )
 
     @property
-    def effective_market_calendar(self) -> MarketCalendar:
-        """Return the selected or source-implied market calendar."""
-        if self.source is DataSourceName.YAHOO:
-            return self.market_calendar or MarketCalendar.XNYS
-        if self.source is DataSourceName.BINANCE:
-            return MarketCalendar.TWENTY_FOUR_SEVEN
-        assert self.market_calendar is not None  # enforced by validator below
-        return self.market_calendar
+    def symbols(self) -> list[str]:
+        """Normalised list of tickers, one per instrument."""
+        return [instrument.symbol for instrument in self.instruments]
 
-    @property
-    def is_247_market(self) -> bool:
-        """Resolve the effective 24/7-market flag."""
-        return self.effective_market_calendar is MarketCalendar.TWENTY_FOUR_SEVEN
+    @model_validator(mode="after")
+    def _check_unique_symbols(self) -> DataConfig:
+        """Reject the same symbol appearing in more than one instrument.
 
-    @field_validator("symbols")
-    @classmethod
-    def _dedupe_and_upper(cls, value: list[str]) -> list[str]:
-        """Normalise tickers: strip, uppercase, drop duplicates (keep order).
-
-        Raises:
-            ValueError: If a symbol contains anything outside
-                `_SAFE_PATH_COMPONENT` — the ``csv`` source builds
-                ``raw_dir / f"{symbol}.csv"`` directly from this value with
-                no further sanitisation.
+        Price series are indexed by symbol alone downstream (the canonical
+        schema's SYMBOL column, price_matrix columns) — two instruments for
+        the same ticker would be an unresolvable collision, not a case to
+        silently support.
         """
         seen: set[str] = set()
-        out: list[str] = []
-        for raw in value:
-            sym = raw.strip().upper()
-            if not sym:
-                continue
-            _validate_path_component(sym, field_name="symbol")
-            if sym not in seen:
-                seen.add(sym)
-                out.append(sym)
-        if not out:
-            raise ValueError("`symbols` must contain at least one ticker.")
-        return out
+        duplicates: set[str] = set()
+        for instrument in self.instruments:
+            if instrument.symbol in seen:
+                duplicates.add(instrument.symbol)
+            seen.add(instrument.symbol)
+        if duplicates:
+            raise ValueError(
+                f"Duplicate symbol(s) {sorted(duplicates)} across `instruments` "
+                "— each symbol may appear as only one instrument (one source, "
+                "one calendar) per experiment."
+            )
+        return self
 
     @model_validator(mode="after")
     def _check_dates(self) -> DataConfig:
@@ -434,12 +488,83 @@ class DataConfig(_StrictModel):
         return self
 
     @model_validator(mode="after")
-    def _check_frequency_supported(self) -> DataConfig:
-        allowed = _SOURCE_SUPPORTED_FREQUENCIES.get(self.source)
-        if allowed is not None and self.frequency not in allowed:
+    def _check_frequency_supported_by_every_instrument(self) -> DataConfig:
+        sources = {instrument.source for instrument in self.instruments}
+        allowed = compatible_frequencies_for_sources(sources)
+        if self.frequency not in allowed:
+            remote = sorted(
+                (source for source in sources if source is not DataSourceName.CSV),
+                key=str,
+            )
+            details = ", ".join(
+                f"{source}: {sorted(_SOURCE_SUPPORTED_FREQUENCIES[source])}"
+                for source in remote
+            )
             raise ValueError(
-                f"frequency '{self.frequency}' is not supported by source "
-                f"'{self.source}'. Supported: {sorted(allowed)}."
+                f"frequency '{self.frequency}' is not supported by every "
+                "instrument's source. Supported frequencies per remote "
+                f"source: {details or '(none)'}."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _check_intraday_frequency_requires_uniform_calendar(self) -> DataConfig:
+        """Reject a sub-daily mixed-calendar universe.
+
+        Verified-closure handling (:mod:`quantlab.data.closures`) only
+        operates at daily frequency -- an intraday, mixed-calendar universe
+        (e.g. Yahoo/XNYS '1h' alongside Binance/24-7 '1h') has no equivalent
+        mechanism, so a held equity inevitably hits an hour the other
+        calendar trades but it has no return for, failing deep inside
+        accounting with a confusing error instead of at config load. Until a
+        genuine per-session intraday timeline exists, refuse this
+        combination explicitly.
+        """
+        if self.frequency is DataFrequency.H1:
+            calendars = {instrument.calendar for instrument in self.instruments}
+            if len(calendars) > 1:
+                raise ValueError(
+                    "Intraday frequency '1h' does not support a "
+                    f"mixed-calendar universe ({sorted(calendars)}) -- "
+                    "verified-closure handling only operates at daily "
+                    "frequency, so a held equity would inevitably hit an "
+                    "hour another calendar trades but it has no return for. "
+                    "Use a single shared calendar for '1h', or daily "
+                    "frequency for a mixed-calendar universe."
+                )
+        return self
+
+    @model_validator(mode="after")
+    def _warn_if_mixed_calendars_dilute_windowed_features(self) -> DataConfig:
+        """Warn (never reject) that rolling-window features may be diluted.
+
+        A verified closure's synthetic bar (:mod:`quantlab.data.closures`)
+        is exactly flat -- zero return, zero volume -- so any trailing
+        window counted in raw *periods* (a momentum lookback, a volatility
+        window, an ADV window, a technical indicator's own window, ...)
+        spans MORE real trading sessions than its configured length for a
+        session-bound instrument sharing a combined timeline with an
+        always-open one (e.g. equities alongside crypto): those flat bars
+        silently dilute volatility/ADV estimates, and a "252-period"
+        lookback stretches across more than 252 real equity sessions.
+        Computing every instrument's own features on its native calendar
+        before aligning signals would remove this entirely, but that is a
+        substantially larger redesign than a single validator can express
+        -- this only makes the existing, structural limitation visible at
+        config load instead of a silent distortion (see
+        docs/limitations.md).
+        """
+        calendars = {instrument.calendar for instrument in self.instruments}
+        if len(calendars) > 1:
+            logger.warning(
+                "Instruments span more than one calendar (%s): any "
+                "rolling-window feature (momentum lookback, volatility "
+                "window, ADV window, technical indicators, ...) counts raw "
+                "periods, not real trading sessions per instrument -- a "
+                "session-bound instrument's estimates are diluted by the "
+                "flat, zero-return/zero-volume closure bars inserted to "
+                "keep the combined timeline dense. See docs/limitations.md.",
+                sorted(calendars),
             )
         return self
 
@@ -456,39 +581,15 @@ class DataConfig(_StrictModel):
         return self
 
     @model_validator(mode="after")
-    def _check_market_calendar_matches_source(self) -> DataConfig:
-        """Apply QuantLab's current one-calendar-per-experiment policy.
-
-        Yahoo supports XNYS or 24/7, Binance is always 24/7, and CSV has no
-        implied calendar. Other exchange calendars remain unsupported.
-        """
-        if self.source is DataSourceName.BINANCE:
-            if self.market_calendar not in (None, MarketCalendar.TWENTY_FOUR_SEVEN):
-                raise ValueError(
-                    f"market_calendar: {self.market_calendar!r} is not "
-                    "permitted with source: 'binance' — every Binance "
-                    "symbol genuinely trades 24/7, so there is no real "
-                    "instrument this combination could correctly describe. "
-                    "Leave market_calendar unset (implied '24/7')."
-                )
-        elif self.source is DataSourceName.CSV and self.market_calendar is None:
+    def _check_bundled_demo_data_requires_a_csv_instrument(self) -> DataConfig:
+        """Restrict the bundled synthetic-data fallback to csv instruments."""
+        if self.use_bundled_demo_data and not any(
+            instrument.source is DataSourceName.CSV for instrument in self.instruments
+        ):
             raise ValueError(
-                "market_calendar must be set explicitly ('XNYS' or '24/7') "
-                "for source: 'csv' — a CSV feed could contain either kind "
-                "of data, and nothing else here can tell which."
-            )
-        return self
-
-    @model_validator(mode="after")
-    def _check_bundled_demo_data_scoped_to_csv(self) -> DataConfig:
-        """Restrict the bundled synthetic-data fallback to CSV configs."""
-        if self.use_bundled_demo_data and self.source is not DataSourceName.CSV:
-            raise ValueError(
-                f"use_bundled_demo_data: true is not permitted with source: "
-                f"{self.source!r} — the bundled-demo-CSV fallback is only "
-                "ever consulted by the csv loader, so setting this alongside "
-                "any other source has no effect and only misleadingly "
-                "suggests an offline fallback is configured."
+                "use_bundled_demo_data: true has no effect without at least "
+                "one csv-sourced instrument — the bundled-demo-CSV fallback "
+                "is only ever consulted by the csv loader."
             )
         return self
 
@@ -544,6 +645,22 @@ class PortfolioConfig(_StrictModel):
         return self
 
     @model_validator(mode="after")
+    def _check_volatility_targeting_requires_target_volatility(self) -> PortfolioConfig:
+        """Reject an implicit target rather than silently defaulting to 12%.
+
+        ``volatility_targeting`` sizes leverage directly off this number --
+        a value a user reading the YAML would never see must never drive
+        real leverage decisions, so it must always be explicit.
+        """
+        if self.allocator == "volatility_targeting" and self.target_volatility is None:
+            raise ValueError(
+                "allocator 'volatility_targeting' requires an explicit "
+                "target_volatility (e.g. 0.12 for 12% annualised) — there is "
+                "no implicit default."
+            )
+        return self
+
+    @model_validator(mode="after")
     def _warn_if_positions_and_weight_cap_infeasible(self) -> PortfolioConfig:
         """Warn when the position/weight caps can't reach the gross ceiling.
 
@@ -587,31 +704,26 @@ class BacktestConfig(_StrictModel):
 
     initial_capital: float = Field(default=100_000.0, gt=0.0)
     benchmark_kind: BenchmarkKind = BenchmarkKind.SYMBOL
-    benchmark_symbol: str | None = None
+    benchmark: InstrumentConfig | None = Field(
+        default=None,
+        description=(
+            "Benchmark instrument (symbol/source/calendar), only valid when "
+            "benchmark_kind='symbol'. If its symbol is already a tradable "
+            "instrument under data.instruments, its source and calendar must "
+            "match exactly — the already-loaded series is reused rather than "
+            "downloaded twice."
+        ),
+    )
     risk_free_rate: float = DEFAULT_RISK_FREE_RATE
     periods_per_year: int | None = Field(default=None, gt=0)
-
-    @field_validator("benchmark_symbol")
-    @classmethod
-    def _normalize_and_validate_benchmark_symbol(cls, value: str | None) -> str | None:
-        """Normalise the benchmark and make it safe as a CSV/cache filename."""
-        if value is None:
-            return None
-        sym = value.strip().upper()
-        if not sym:
-            return None
-        _validate_path_component(sym, field_name="benchmark_symbol")
-        return sym
 
     @model_validator(mode="after")
     def _check_benchmark_configuration(self) -> BacktestConfig:
         if (
             self.benchmark_kind is not BenchmarkKind.SYMBOL
-            and self.benchmark_symbol is not None
+            and self.benchmark is not None
         ):
-            raise ValueError(
-                "benchmark_symbol is only valid when benchmark_kind='symbol'."
-            )
+            raise ValueError("benchmark is only valid when benchmark_kind='symbol'.")
         return self
 
 
@@ -709,23 +821,30 @@ class SensitivitySettings(_StrictModel):
 
     @model_validator(mode="after")
     def _check_parameters_shape(self) -> SensitivitySettings:
-        if self.parameters is not None:
-            if len(self.parameters) != 2:
+        if self.parameters is None:
+            if self.enabled:
                 raise ValueError(
-                    "robustness.sensitivity.parameters must name exactly 2 "
-                    f"parameters (the x and y axes), got {len(self.parameters)}."
+                    "robustness.sensitivity.enabled is true but parameters is "
+                    "not set -- sensitivity has no meaningful default (unlike "
+                    "validation.parameter_grid), so the x/y axes and their "
+                    "candidate values must be given explicitly."
                 )
-            for name, candidates in self.parameters.items():
-                if not name.strip():
-                    raise ValueError(
-                        "robustness.sensitivity.parameters names must be "
-                        "non-empty strings."
-                    )
-                if not candidates:
-                    raise ValueError(
-                        f"robustness.sensitivity.parameters.{name} must "
-                        "contain at least one candidate value."
-                    )
+            return self
+        if len(self.parameters) != 2:
+            raise ValueError(
+                "robustness.sensitivity.parameters must name exactly 2 "
+                f"parameters (the x and y axes), got {len(self.parameters)}."
+            )
+        for name, candidates in self.parameters.items():
+            if not name.strip():
+                raise ValueError(
+                    "robustness.sensitivity.parameters names must be non-empty strings."
+                )
+            if not candidates:
+                raise ValueError(
+                    f"robustness.sensitivity.parameters.{name} must "
+                    "contain at least one candidate value."
+                )
         return self
 
 
@@ -832,6 +951,23 @@ class ExperimentConfig(_StrictModel):
                     f"key(s) {unknown} for strategy '{self.strategy.name}'. "
                     f"Accepted parameters: {sorted(accepted)}."
                 )
+            # Same value-combination check as validation.parameter_grid above:
+            # a name being sweepable doesn't mean every candidate value (or
+            # combination across the two axes) is actually valid for this
+            # strategy (e.g. lookback_period: [0], or a combination this
+            # strategy's own validator rejects) -- catch it here, at config
+            # load, rather than only once the sensitivity sweep actually runs.
+            sensitivity_names = list(sensitivity_parameters)
+            for values in itertools.product(
+                *(sensitivity_parameters[name] for name in sensitivity_names)
+            ):
+                validate_strategy_parameters(
+                    self.strategy.name,
+                    {
+                        **self.strategy.parameters,
+                        **dict(zip(sensitivity_names, values, strict=True)),
+                    },
+                )
         # A pairs strategy can trade only symbols present in the loaded universe.
         if self.strategy.name == "pairs_trading":
             symbol_a = str(self.strategy.parameters["symbol_a"]).strip().upper()
@@ -906,6 +1042,84 @@ class ExperimentConfig(_StrictModel):
                     "volatility_adjusted time_series_momentum must not be combined "
                     "with an allocator that applies inverse-volatility sizing again."
                 )
+        return self
+
+    @model_validator(mode="after")
+    def _check_mixed_calendars_require_explicit_periods_per_year(
+        self,
+    ) -> ExperimentConfig:
+        """Forbid inferring one annualisation factor from multiple calendars.
+
+        `DataConfig` alone can't see `backtest.periods_per_year`, so this
+        cross-field check lives here rather than on a sub-config.
+        """
+        calendars = {instrument.calendar for instrument in self.data.instruments}
+        if len(calendars) > 1 and self.backtest.periods_per_year is None:
+            raise ValueError(
+                "Mixed market calendars require an explicit "
+                "backtest.periods_per_year — QuantLab cannot infer one "
+                "annualisation factor when instruments trade on different "
+                f"calendars ({sorted(calendars)})."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _check_benchmark_matches_overlapping_instrument(self) -> ExperimentConfig:
+        """A benchmark that duplicates a tradable symbol must match it exactly.
+
+        Downstream data is keyed by symbol alone, so an inconsistent
+        source/calendar override for an overlapping benchmark would be
+        ambiguous — reject it here rather than silently picking one.
+        """
+        benchmark = self.backtest.benchmark
+        if benchmark is None:
+            return self
+        for instrument in self.data.instruments:
+            if instrument.symbol != benchmark.symbol:
+                continue
+            if (
+                instrument.source != benchmark.source
+                or instrument.calendar != benchmark.calendar
+            ):
+                raise ValueError(
+                    f"backtest.benchmark symbol {benchmark.symbol!r} is "
+                    f"already a tradable instrument with source="
+                    f"{instrument.source!r}, calendar={instrument.calendar!r}; "
+                    "the benchmark override must match exactly or be omitted "
+                    "(the tradable instrument's data is then reused automatically)."
+                )
+            break
+        return self
+
+    @model_validator(mode="after")
+    def _check_benchmark_frequency_supported_by_its_own_source(
+        self,
+    ) -> ExperimentConfig:
+        """An external benchmark's source must support the configured frequency too.
+
+        `DataConfig._check_frequency_supported_by_every_instrument` only sees
+        `data.instruments` — a benchmark that reuses a tradable instrument's
+        data is already covered there (and cross-checked for source/calendar
+        consistency by `_check_benchmark_matches_overlapping_instrument`
+        above), but a benchmark outside the tradable universe has its own,
+        otherwise-unchecked source. Without this, e.g. frequency: '1mo' with
+        an external Binance benchmark would be silently accepted here only
+        to fail later, confusingly, at download time.
+        """
+        benchmark = self.backtest.benchmark
+        if benchmark is None or benchmark.symbol in self.data.symbols:
+            return self
+        allowed = compatible_frequencies_for_sources([benchmark.source])
+        if self.data.frequency not in allowed:
+            supported = _SOURCE_SUPPORTED_FREQUENCIES.get(
+                benchmark.source, set(DataFrequency)
+            )
+            raise ValueError(
+                f"frequency '{self.data.frequency}' is not supported by "
+                f"backtest.benchmark's source {benchmark.source!r} (symbol "
+                f"{benchmark.symbol!r}). Supported frequencies: "
+                f"{sorted(supported)}."
+            )
         return self
 
     # ----------------------------------------------------------------- #
@@ -985,14 +1199,23 @@ class ExperimentConfig(_StrictModel):
         """Resolve annualisation factor.
 
         Priority: explicit ``backtest.periods_per_year`` > frequency lookup >
-        daily default. The frequency lookup distinguishes XNYS sessions from
-        24/7 markets.
+        daily default. The frequency lookup distinguishes 24/7 markets from
+        session-bound ones, off the calendar every instrument shares — a
+        validator guarantees a single shared calendar whenever
+        ``backtest.periods_per_year`` isn't set explicitly.
         """
         if self.backtest.periods_per_year is not None:
             return self.backtest.periods_per_year
+        # Local import: avoids a top-level quantlab.data <-> quantlab.config cycle.
+        from quantlab.data.calendar import is_247, uniform_calendar
+
+        calendar = uniform_calendar(
+            instrument.calendar for instrument in self.data.instruments
+        )
+        assert calendar is not None  # enforced by _check_mixed_calendars_...
         table = (
             CRYPTO_FREQUENCY_TO_PERIODS_PER_YEAR
-            if self.data.is_247_market
+            if is_247(calendar)
             else FREQUENCY_TO_PERIODS_PER_YEAR
         )
         return table.get(self.data.frequency, TRADING_DAYS_PER_YEAR)
@@ -1002,8 +1225,13 @@ class ExperimentConfig(_StrictModel):
     # ----------------------------------------------------------------- #
     @property
     def data_source(self) -> str:
-        """Data source identifier (e.g. ``"yahoo"``, ``"binance"``, ``"csv"``)."""
-        return self.data.source
+        """Data source label: a single name, or ``"mixed (a, b)"``."""
+        sources = sorted(
+            {str(instrument.source) for instrument in self.data.instruments}
+        )
+        if len(sources) == 1:
+            return sources[0]
+        return f"mixed ({', '.join(sources)})"
 
     @property
     def symbols(self) -> list[str]:
@@ -1048,7 +1276,17 @@ class ExperimentConfig(_StrictModel):
     @property
     def benchmark_symbol(self) -> str | None:
         """Symbol to compare performance against, if any."""
-        return self.backtest.benchmark_symbol
+        return self.backtest.benchmark.symbol if self.backtest.benchmark else None
+
+    @property
+    def benchmark_source(self) -> DataSourceName | None:
+        """Data source of the benchmark instrument, if any."""
+        return self.backtest.benchmark.source if self.backtest.benchmark else None
+
+    @property
+    def benchmark_calendar(self) -> str | None:
+        """Calendar of the benchmark instrument, if any."""
+        return self.backtest.benchmark.calendar if self.backtest.benchmark else None
 
     @property
     def benchmark_kind(self) -> BenchmarkKind:
@@ -1060,7 +1298,7 @@ class ExperimentConfig(_StrictModel):
         """Human-readable benchmark name, or ``None`` when disabled."""
         kind = self.backtest.benchmark_kind
         if kind is BenchmarkKind.SYMBOL:
-            return self.backtest.benchmark_symbol
+            return self.benchmark_symbol
         if kind is BenchmarkKind.EQUAL_WEIGHT:
             return "Equal weight"
         if kind is BenchmarkKind.FIRST_ASSET:

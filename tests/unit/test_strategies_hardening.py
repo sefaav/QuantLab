@@ -47,11 +47,12 @@ def _config(
         {
             "experiment_name": "strategy_hardening",
             "data": {
-                "source": "csv",
-                "symbols": symbols or ["AAA", "BBB"],
+                "instruments": [
+                    {"symbol": symbol, "source": "csv", "calendar": "XNYS"}
+                    for symbol in (symbols or ["AAA", "BBB"])
+                ],
                 "start_date": "2020-01-01",
                 "end_date": "2021-01-01",
-                "market_calendar": "XNYS",
             },
             "strategy": {"name": strategy, "parameters": dict(parameters)},
             "portfolio": dict(portfolio or {}),

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import date, datetime
 from typing import Any, cast
@@ -24,14 +24,19 @@ from quantlab.constants import (
 )
 from quantlab.data.calendar import DAILY_FREQUENCIES as _DAILY_FREQUENCIES
 from quantlab.data.calendar import FREQUENCY_TIMEDELTA as _FREQUENCY_TIMEDELTA
-from quantlab.data.calendar import XNYS_BUSINESS_DAY as _XNYS_BUSINESS_DAY
+from quantlab.data.calendar import business_day_offset as _business_day_offset
 from quantlab.data.calendar import (
     first_trading_day_on_or_after as _first_trading_day_on_or_after,
 )
+from quantlab.data.calendar import has_session_break as _has_session_break
+from quantlab.data.calendar import holidays_between as _holidays_between
+from quantlab.data.calendar import is_247 as _is_247
 from quantlab.data.calendar import (
     last_trading_day_on_or_before as _last_trading_day_on_or_before,
 )
-from quantlab.data.calendar import xnys_holidays as _xnys_holidays
+from quantlab.data.calendar import session_labels as _session_labels
+from quantlab.data.calendar import session_weekmask as _session_weekmask
+from quantlab.data.calendar import sessions as _sessions
 from quantlab.exceptions import DataValidationError
 from quantlab.logging_config import get_logger
 
@@ -76,10 +81,30 @@ class DataQualityReport:
     invalid_price_count: int = 0
     missing_periods: list[MissingPeriod] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    #: Real rows discarded because they fell on a verified closure for their
+    #: own symbol's calendar (a data anomaly, not a gap).
+    closure_discarded_count: int = 0
+    #: Synthetic flat bars inserted for a verified closure with no real row.
+    closure_inserted_count: int = 0
+    #: Whether the bundled synthetic CSV fallback (``use_bundled_demo_data``)
+    #: was actually triggered for at least one instrument -- distinct from
+    #: the config merely *enabling* it, which by itself says nothing about
+    #: whether local files were actually missing this run.
+    bundled_demo_data_used: bool = False
 
     @property
     def removed_row_count(self) -> int | None:
-        """Return rows removed by cleaning when both stages are known."""
+        """Return the net raw-to-clean row-count delta when both stages are known.
+
+        A net figure, not a count of any single effect: cleaning can both
+        remove rows (duplicates, invalid prices, dropped gaps) and add rows
+        (verified-closure bars, forward-filled gaps), so this can be zero or
+        even negative (more rows added than removed) without that meaning
+        "nothing happened." For what specifically happened, use the
+        dedicated counts instead: ``duplicate_count``, ``invalid_price_
+        count``, ``missing_value_count``, ``closure_inserted_count``,
+        ``closure_discarded_count``.
+        """
         if self.raw_row_count is None or self.clean_row_count is None:
             return None
         return self.raw_row_count - self.clean_row_count
@@ -123,6 +148,9 @@ class DataQualityReport:
             "missing_periods": [period.to_dict() for period in self.missing_periods],
             "warnings": list(self.warnings),
             "is_clean": self.is_clean,
+            "closure_discarded_count": self.closure_discarded_count,
+            "closure_inserted_count": self.closure_inserted_count,
+            "bundled_demo_data_used": self.bundled_demo_data_used,
         }
 
 
@@ -136,9 +164,12 @@ class DataValidator:
             periods is flagged as an abnormal gap.
         min_coverage_rows: Minimum rows per symbol before a short-coverage
             warning is raised.
-        is_247_market: True for venues that trade around the clock (e.g.
-            crypto). Sub-daily bars on a market that is *not* 24/7 legitimately
-            jump overnight and across weekends; gap detection tolerates that
+        symbol_calendars: Each symbol's own calendar name (``"24/7"`` or any
+            ``pandas_market_calendars`` name). Required for every symbol this
+            validator will see — gap detection resolves each symbol's own
+            calendar rather than assuming one market for the whole dataset.
+            Sub-daily bars on a market that is *not* 24/7 legitimately jump
+            overnight and across weekends; gap detection tolerates that
             explicitly instead of flagging every session boundary.
     """
 
@@ -148,7 +179,7 @@ class DataValidator:
         *,
         max_gap_periods: int = 5,
         min_coverage_rows: int = 30,
-        is_247_market: bool = False,
+        symbol_calendars: Mapping[str, str],
     ) -> None:
         if (
             expected_frequency is not None
@@ -164,12 +195,12 @@ class DataValidator:
         ):
             if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
                 raise ValueError(f"{name} must be a positive integer.")
-        if not isinstance(is_247_market, bool):
-            raise TypeError("is_247_market must be a boolean.")
+        if not isinstance(symbol_calendars, Mapping):
+            raise TypeError("symbol_calendars must be a mapping of symbol -> calendar.")
         self.expected_frequency = expected_frequency
         self.max_gap_periods = max_gap_periods
         self.min_coverage_rows = min_coverage_rows
-        self.is_247_market = is_247_market
+        self.symbol_calendars = symbol_calendars
 
     @staticmethod
     def _prepare_input(data: pd.DataFrame) -> pd.DataFrame:
@@ -437,6 +468,26 @@ class DataValidator:
             if strict:
                 raise DataValidationError(message)
 
+    @staticmethod
+    def _session_break(
+        calendar: str, ts: pd.Timestamp
+    ) -> tuple[pd.Timestamp, pd.Timestamp] | None:
+        """Return the (break_start, break_end) of ``ts``'s own session.
+
+        ``None`` when that session has no official intraday break. Only
+        meaningful for a calendar :func:`~quantlab.data.calendar.
+        has_session_break` already confirmed has one.
+        """
+        day = ts.normalize()
+        schedule = _sessions(calendar, day, day)
+        if schedule.empty:
+            return None
+        row = schedule.iloc[0]
+        break_start = row.get("break_start")
+        if break_start is None or pd.isna(break_start):
+            return None
+        return pd.Timestamp(break_start), pd.Timestamp(row["break_end"])
+
     def _check_symbol_coverage(
         self,
         symbol: str,
@@ -445,6 +496,10 @@ class DataValidator:
         start: date | None = None,
         end: date | None = None,
     ) -> None:
+        calendar = self.symbol_calendars.get(symbol)
+        if calendar is None:
+            raise DataValidationError(f"No calendar configured for symbol {symbol!r}.")
+        is_247_market = _is_247(calendar)
         ts = pd.to_datetime(group[TIMESTAMP]).sort_values()
         deltas = ts.diff().dropna()
         observed_step = deltas.median() if not deltas.empty else pd.Timedelta(0)
@@ -456,14 +511,14 @@ class DataValidator:
         step = expected_step or observed_step
         # Two rows are enough to detect a declared-frequency mismatch.
         if observed_step > pd.Timedelta(0):
-            self._check_declared_frequency(symbol, ts, deltas, report)
+            self._check_declared_frequency(symbol, calendar, ts, deltas, report)
 
         # Continuous markets have no legitimate exchange closures.
-        gap_periods = 1 if self.is_247_market else self.max_gap_periods
+        gap_periods = 1 if is_247_market else self.max_gap_periods
         base_tolerance = (
             step * gap_periods if step > pd.Timedelta(0) else pd.Timedelta(0)
         )
-        if self.is_247_market:
+        if is_247_market:
             # Make an edge lag of exactly one expected period fail.
             tolerance = max(
                 base_tolerance - pd.Timedelta(microseconds=1), pd.Timedelta(0)
@@ -473,15 +528,13 @@ class DataValidator:
 
         range_start = pd.Timestamp(start) if start is not None else None
         range_end = pd.Timestamp(end) if end is not None else None
-        if not self.is_247_market:
+        if not is_247_market:
             if range_start is not None:
                 range_start = _first_trading_day_on_or_after(
-                    range_start, is_247_market=False
+                    range_start, calendar=calendar
                 )
             if range_end is not None:
-                range_end = _last_trading_day_on_or_before(
-                    range_end, is_247_market=False
-                )
+                range_end = _last_trading_day_on_or_before(range_end, calendar=calendar)
         if start is not None and len(ts):
             assert range_start is not None
             lag = ts.iloc[0] - range_start
@@ -511,32 +564,38 @@ class DataValidator:
         if step <= pd.Timedelta(0):
             return
         intraday_threshold = step * gap_periods
-        if not self.is_247_market and self.expected_frequency in _DAILY_FREQUENCIES:
+        if not is_247_market and self.expected_frequency in _DAILY_FREQUENCIES:
             start_days = (
                 ts.shift(1).loc[deltas.index].to_numpy().astype("datetime64[D]")
             )
             end_days = ts.loc[deltas.index].to_numpy().astype("datetime64[D]")
             holidays = (
-                _xnys_holidays(ts.min(), ts.max()).to_numpy().astype("datetime64[D]")
+                _holidays_between(calendar, ts.min(), ts.max())
+                .to_numpy()
+                .astype("datetime64[D]")
             )
             session_steps = pd.Series(
-                np.busday_count(start_days, end_days, holidays=holidays),
+                np.busday_count(
+                    start_days,
+                    end_days,
+                    weekmask=_session_weekmask(calendar),
+                    holidays=holidays,
+                ),
                 index=deltas.index,
             )
             gap_candidates = session_steps > gap_periods
         else:
             gap_candidates = deltas > intraday_threshold
-        if (
-            not self.is_247_market
-            and step < pd.Timedelta(days=1)
-            and gap_candidates.any()
-        ):
-            # Evaluate cross-day gaps against XNYS sessions, not wall-clock time.
+        if not is_247_market and step < pd.Timedelta(days=1) and gap_candidates.any():
+            # Evaluate cross-day gaps against this symbol's own calendar
+            # sessions, not wall-clock time.
             starts = ts.shift(1).loc[deltas.index]
             ends = ts.loc[deltas.index]
 
-            # Infer typical edge times to detect truncated bordering sessions.
-            by_day = ts.groupby(ts.dt.normalize())
+            # Infer typical edge times to detect truncated bordering
+            # sessions. Group by each timestamp's real trading session (see
+            # session_labels), not a naive UTC calendar-day boundary.
+            by_day = ts.groupby(_session_labels(calendar, ts))
             last_by_day = by_day.max().dt.time
             first_by_day = by_day.min().dt.time
             # Ties prefer the widest observed session.
@@ -549,7 +608,22 @@ class DataValidator:
                 start_ts, end_ts = starts.loc[pos], ends.loc[pos]
                 start_date, end_date = start_ts.date(), end_ts.date()
                 if start_date == end_date:
-                    continue  # same session: genuinely abnormal, keep flagged
+                    # Same session: genuinely abnormal, UNLESS it's fully
+                    # explained by the calendar's own official intraday
+                    # break (e.g. XHKG's lunch recess) -- a real provider
+                    # legitimately has no bars during it.
+                    if _has_session_break(calendar):
+                        session_break = self._session_break(calendar, start_ts)
+                        if session_break is not None:
+                            break_start, break_end = session_break
+                            residual = (end_ts - start_ts) - (break_end - break_start)
+                            if (
+                                start_ts <= break_start
+                                and end_ts >= break_end
+                                and residual <= intraday_threshold
+                            ):
+                                gap_candidates.loc[pos] = False
+                    continue
                 if typical_last_time is not None and typical_first_time is not None:
                     expected_tail_end = pd.Timestamp.combine(
                         start_date, typical_last_time
@@ -565,7 +639,7 @@ class DataValidator:
                 skipped = pd.bdate_range(
                     start=start_date + pd.Timedelta(days=1),
                     end=end_date - pd.Timedelta(days=1),
-                    freq=_XNYS_BUSINESS_DAY,
+                    freq=_business_day_offset(calendar),
                 )
                 if len(skipped) == 0:
                     gap_candidates.loc[pos] = False
@@ -587,28 +661,42 @@ class DataValidator:
             )
 
     def _check_declared_frequency(
-        self, symbol: str, ts: pd.Series, deltas: pd.Series, report: DataQualityReport
+        self,
+        symbol: str,
+        calendar: str,
+        ts: pd.Series,
+        deltas: pd.Series,
+        report: DataQualityReport,
     ) -> None:
         """Compare median, matching fraction and 24/7 mean spacing.
 
-        Daily equity deltas are measured in XNYS sessions. Intraday equity
-        matching excludes cross-session deltas, which are legitimate closures.
+        Daily equity deltas are measured in the symbol's own calendar
+        sessions. Intraday equity matching excludes cross-session deltas,
+        which are legitimate closures.
         """
         if self.expected_frequency is None or deltas.empty:
             return
         expected = _FREQUENCY_TIMEDELTA.get(self.expected_frequency)
         if expected is None or expected <= pd.Timedelta(0):
             return
-        daily_equity = not self.is_247_market and expected == pd.Timedelta(days=1)
+        is_247_market = _is_247(calendar)
+        daily_equity = not is_247_market and expected == pd.Timedelta(days=1)
         if daily_equity:
-            # Count sessions so weekends and XNYS holidays have zero duration.
+            # Count sessions so weekends and holidays have zero duration.
             starts = ts.shift(1).loc[deltas.index].to_numpy().astype("datetime64[D]")
             ends = ts.loc[deltas.index].to_numpy().astype("datetime64[D]")
             holidays = (
-                _xnys_holidays(ts.min(), ts.max()).to_numpy().astype("datetime64[D]")
+                _holidays_between(calendar, ts.min(), ts.max())
+                .to_numpy()
+                .astype("datetime64[D]")
             )
             ratios = pd.Series(
-                np.busday_count(starts, ends, holidays=holidays).astype(float),
+                np.busday_count(
+                    starts,
+                    ends,
+                    weekmask=_session_weekmask(calendar),
+                    holidays=holidays,
+                ).astype(float),
                 index=deltas.index,
             )
         else:
@@ -626,14 +714,42 @@ class DataValidator:
             )
             return
 
-        is_equity_subdaily = not self.is_247_market and expected < pd.Timedelta(days=1)
+        is_equity_subdaily = not is_247_market and expected < pd.Timedelta(days=1)
         if is_equity_subdaily:
-            same_day = (ts.dt.date == ts.shift(1).dt.date).reindex(
+            # Real trading-session labels, not naive UTC calendar dates (see
+            # session_labels): otherwise a session that straddles UTC
+            # midnight in local terms (e.g. Sydney, +10/+11) would have its
+            # own intraday deltas wrongly excluded as "cross-session".
+            labels = _session_labels(calendar, ts)
+            same_day = (labels == labels.shift(1)).reindex(
                 deltas.index, fill_value=False
             )
             intraday_deltas = deltas[same_day]
             if intraday_deltas.empty:
                 return
+            if _has_session_break(calendar):
+                # A delta that fully spans the calendar's own official
+                # intraday break (e.g. XHKG's lunch recess) is not "missing
+                # a bar" -- no real provider has one during the break -- so
+                # it must not count against the declared-frequency matching
+                # fraction either, the same reasoning already applied to
+                # abnormal-gap detection above.
+                schedule = _sessions(calendar, ts.min(), ts.max())
+                break_start_map = schedule.get("break_start", pd.Series(dtype=object))
+                break_end_map = schedule.get("break_end", pd.Series(dtype=object))
+                row_break_start = labels.map(break_start_map)
+                row_break_end = labels.map(break_end_map)
+                previous_ts = ts.shift(1)
+                explained = (
+                    row_break_start.notna()
+                    & (previous_ts <= row_break_start)
+                    & (ts >= row_break_end)
+                )
+                intraday_deltas = intraday_deltas[
+                    ~explained.reindex(intraday_deltas.index, fill_value=False)
+                ]
+                if intraday_deltas.empty:
+                    return
             intraday_ratios = (
                 intraday_deltas.dt.total_seconds() / expected.total_seconds()
             )
@@ -654,10 +770,10 @@ class DataValidator:
         matching_fraction = ((ratios >= 1.0 / tolerance) & (ratios <= tolerance)).mean()
         minimum_fraction = (
             _FREQUENCY_MATCH_MINIMUM_FRACTION_247
-            if self.is_247_market
+            if is_247_market
             else _FREQUENCY_MATCH_MINIMUM_FRACTION
         )
-        if self.is_247_market:
+        if is_247_market:
             # The mean catches sparse large gaps that a fraction floor can miss.
             mean_step = cast("pd.Timedelta", deltas.mean())
             mean_ratio = mean_step / expected

@@ -79,3 +79,26 @@ rebalance dates (daily / weekly / monthly / quarterly) and holds it constant
 between them — trades, and therefore costs, only occur at rebalances.
 Turnover is `sum(|held_t - held_{t-1}|)` (`w_{-1} = 0`), directly matching the
 manual example of capital 100k, turnover 0.5, 10 bps → cost 50.
+
+For a mixed-calendar portfolio, `rebalance_and_cap_turnover` is
+tradability-aware: a closed instrument (per its own calendar, see
+[Data pipeline](data_pipeline.md#verified-closures-vs-missing-data)) never
+trades on a closed date, and its rebalance target becomes a pending debt that
+keeps retrying — at every following tradable session, not only the next
+scheduled rebalance — until fully executed, even if `maximum_turnover` spreads
+that execution across several sessions. Portfolio constraints (gross/net
+exposure, max weight, long-only) are enforced on the actually-executed
+holdings after accounting for frozen/closed instruments, not just on the
+theoretical fully-open target, since freezing one instrument while others move
+can push the real portfolio out of its mandate even when the target was
+compliant. For a single-calendar experiment this machinery is a proven no-op:
+behaviour is byte-identical to the plain rebalance/turnover-cap path above.
+
+`rebalance_and_cap_turnover`'s output — including a pending target resolving
+there on a reopening day — is still only a *decision*, dated that day. Every
+decision, on a reopening day or an ordinary rebalance date alike, is subject
+to the same one-period (tradability-respecting) look-ahead shift applied by
+the accounting layer before it affects executed weights, turnover or costs —
+a target that resolves in `held_weights` on a symbol's reopening day therefore
+does not reach the accounting layer until that symbol's *next* tradable
+session, not the reopening day itself.

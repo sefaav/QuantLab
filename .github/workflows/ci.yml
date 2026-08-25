@@ -10,8 +10,15 @@ on:
     branches: [main]
 
 jobs:
-  test:
-    # Exercise both supported Python versions on Linux and Windows.
+  test-fast:
+    # Fast feedback: unit tests and light orchestration tests only (`slow`
+    # deselected). Runs in parallel with `test` below rather than blocking
+    # on it, so a regression in the common-case code paths surfaces well
+    # before the slow, walk-forward-heavy suite finishes. No coverage gate
+    # here -- `test` already enforces it over the full suite; gating on
+    # this narrower subset alone would risk a spurious failure merely
+    # because the slow tests are the ones that exercise most of
+    # `quantlab.validation`.
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -43,7 +50,46 @@ jobs:
       - name: Type-check (mypy)
         run: uv run mypy src tests scripts
 
-      - name: Test (offline suite, with coverage)
+      - name: Test (fast offline suite)
+        run: uv run pytest -m "not network and not slow"
+
+  test:
+    # The authoritative, coverage-gated run: the full offline suite,
+    # `slow` included (real multi-fold walk-forward selection,
+    # multi-invocation CLI scenarios, ...). Exercise both supported Python
+    # versions on Linux and Windows.
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python-version: ["3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@ae62891fec2bb8e7d6c99fc78c9fec3a63790f8d # v10.0.0
+        with:
+          version: "0.12.3"
+
+      - name: Set up Python ${{ matrix.python-version }}
+        run: uv python install ${{ matrix.python-version }}
+
+      - name: Install dependencies (locked)
+        run: >-
+          uv sync --locked --python ${{ matrix.python-version }}
+          --extra dev --extra dashboard --extra yahoo --extra docs
+          --extra notebooks
+
+      - name: Lint (ruff)
+        run: |
+          uv run ruff check src tests scripts
+          uv run ruff format --check src tests scripts
+
+      - name: Type-check (mypy)
+        run: uv run mypy src tests scripts
+
+      - name: Test (full offline suite, with coverage)
         run: >-
           uv run pytest -m "not network" --cov=quantlab
           --cov-report=term-missing --cov-report=xml --cov-fail-under=82

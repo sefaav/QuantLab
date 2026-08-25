@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Iterator, Mapping
 from pathlib import Path
 from typing import Any
 
@@ -11,6 +12,24 @@ import pandas as pd
 
 from quantlab.config import ExperimentConfig
 from tests.conftest import geometric_series, make_ohlcv
+
+
+class _UniformCalendar(Mapping[str, str]):
+    """A ``symbol_calendars`` mapping returning the same calendar for every
+    symbol -- for tests that only care about one calendar and don't want to
+    enumerate every symbol a frame happens to contain."""
+
+    def __init__(self, calendar: str) -> None:
+        self._calendar = calendar
+
+    def __getitem__(self, key: str) -> str:
+        return self._calendar
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(())
+
+    def __len__(self) -> int:
+        return 0
 
 
 def _holdout_config() -> tuple[pd.DataFrame, ExperimentConfig]:
@@ -27,9 +46,11 @@ def _holdout_config() -> tuple[pd.DataFrame, ExperimentConfig]:
         {
             "experiment_name": "holdout_report",
             "data": {
-                "source": "csv",
-                "market_calendar": "XNYS",
-                "symbols": ["AAA", "BBB", "CCC"],
+                "instruments": [
+                    {"symbol": "AAA", "source": "csv", "calendar": "XNYS"},
+                    {"symbol": "BBB", "source": "csv", "calendar": "XNYS"},
+                    {"symbol": "CCC", "source": "csv", "calendar": "XNYS"},
+                ],
                 "start_date": "2020-01-01",
                 "end_date": "2021-06-01",
             },
@@ -63,7 +84,10 @@ def _wf_experiment_config() -> ExperimentConfig:
         {
             "experiment_name": "wf_experiment",
             "data": {
-                "symbols": ["A", "B"],
+                "instruments": [
+                    {"symbol": "A", "source": "yahoo", "calendar": "XNYS"},
+                    {"symbol": "B", "source": "yahoo", "calendar": "XNYS"},
+                ],
                 "start_date": "2020-01-01",
                 "end_date": "2021-01-01",
             },
@@ -76,6 +100,9 @@ _FAKE_DATA_HASH = "deadbeef"
 
 
 _FAKE_CODE_HASH = "c0defeed"
+
+
+_FAKE_GENERATOR_HASH = "9ea3a708"
 
 
 _FAKE_GIT_COMMIT = "abc1234"
@@ -119,6 +146,7 @@ def _write_wf_artifacts(exp_dir: Path, config: ExperimentConfig) -> None:
         "walk_forward_csv_checksums": checksums,
         "data_hash": _FAKE_DATA_HASH,
         "code_hash": _FAKE_CODE_HASH,
+        "generator_hash": _FAKE_GENERATOR_HASH,
         "git_commit": _FAKE_GIT_COMMIT,
         "git_dirty": False,
         "dependency_versions": _FAKE_DEPENDENCY_VERSIONS,
@@ -133,6 +161,7 @@ class _FakeResult:
         self.metadata: dict = {
             "data_hash": _FAKE_DATA_HASH,
             "code_hash": _FAKE_CODE_HASH,
+            "generator_hash": _FAKE_GENERATOR_HASH,
             "git_commit": _FAKE_GIT_COMMIT,
             "git_dirty": False,
             "dependency_versions": _FAKE_DEPENDENCY_VERSIONS,
@@ -149,7 +178,10 @@ def _try_strategy(
         {
             "experiment_name": "x",
             "data": {
-                "symbols": ["A", "B"],
+                "instruments": [
+                    {"symbol": "A", "source": "csv", "calendar": "XNYS"},
+                    {"symbol": "B", "source": "csv", "calendar": "XNYS"},
+                ],
                 "start_date": "2020-01-01",
                 "end_date": "2021-01-01",
             },
@@ -195,9 +227,10 @@ def _rf_test_setup(
         {
             "experiment_name": "rf_consistency",
             "data": {
-                "source": "csv",
-                "market_calendar": "XNYS",
-                "symbols": ["AAA", "BBB"],
+                "instruments": [
+                    {"symbol": "AAA", "source": "csv", "calendar": "XNYS"},
+                    {"symbol": "BBB", "source": "csv", "calendar": "XNYS"},
+                ],
                 "start_date": "2020-01-01",
                 "end_date": "2021-06-01",
             },
@@ -240,12 +273,16 @@ def _hourly_symbol_frame(freq: str, periods: int, symbol: str) -> pd.DataFrame:
     )
 
 
-def _market_calendar_config(**data_overrides: Any) -> ExperimentConfig:
+def _market_calendar_config(
+    *, source: str = "csv", calendar: str | None = None, **data_overrides: Any
+) -> ExperimentConfig:
+    instrument: dict[str, Any] = {"symbol": "BTC", "source": source}
+    if calendar is not None:
+        instrument["calendar"] = calendar
     payload: dict[str, Any] = {
         "experiment_name": "test",
         "data": {
-            "source": "csv",
-            "symbols": ["BTC"],
+            "instruments": [instrument],
             "start_date": "2020-01-01",
             "end_date": "2020-06-01",
             "frequency": "1h",
@@ -293,11 +330,11 @@ def _base_config_dict() -> dict[str, Any]:
     return {
         "experiment_name": "test",
         "data": {
-            "source": "csv",
-            "symbols": ["AAA"],
+            "instruments": [
+                {"symbol": "AAA", "source": "csv", "calendar": "XNYS"},
+            ],
             "start_date": "2020-01-01",
             "end_date": "2020-06-01",
-            "market_calendar": "XNYS",
         },
         "strategy": {"name": "buy_and_hold", "parameters": {}},
         "portfolio": {"allocator": "equal_weight"},
@@ -343,7 +380,8 @@ def _write_daily_cache(
             "volume": 100.0,
         }
     )
-    storage.write_symbol(data, source, symbol, "1d")
+    calendar = "24/7" if source == "binance" else "XNYS"
+    storage.write_symbol(data, source, symbol, "1d", calendar=calendar)
 
 
 def _ohlcv_at(dates: pd.DatetimeIndex | list, symbol: str = "SPY") -> pd.DataFrame:

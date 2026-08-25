@@ -29,12 +29,13 @@ def test_csv_to_clean_validated_panel(tmp_path: Path) -> None:
         {
             "experiment_name": "data_pipe",
             "data": {
-                "source": "csv",
-                "symbols": ["AAA", "BBB"],
+                "instruments": [
+                    {"symbol": s, "source": "csv", "calendar": "XNYS"}
+                    for s in ["AAA", "BBB"]
+                ],
                 "start_date": "2020-01-01",
                 "end_date": "2020-08-01",
                 "missing_value_policy": "drop",
-                "market_calendar": "XNYS",
             },
             "strategy": {"name": "buy_and_hold"},
         }

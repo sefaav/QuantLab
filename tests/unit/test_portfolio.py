@@ -119,6 +119,31 @@ def test_rebalance_dates_monthly() -> None:
     assert dates[0] == idx[0]
 
 
+def test_rebalance_dates_weekly_does_not_split_a_non_western_trading_week() -> None:
+    """XSAU trades Sunday-Thursday. Grouping by a fixed Monday-Sunday ISO
+    week (`.to_period("W")`) would put XSAU's Sunday session in the
+    *previous* ISO week from its own Monday-Thursday sessions, splitting one
+    real trading week into two rebalances instead of one -- calendar-aware
+    grouping must use the calendar's own trading week instead (mirrors the
+    equivalent resampler fix, see quantlab.data.resampler._resample_by_session)."""
+    idx = pd.DatetimeIndex(
+        [
+            "2024-01-07",
+            "2024-01-08",
+            "2024-01-09",
+            "2024-01-10",
+            "2024-01-11",  # week 1: Sun-Thu
+            "2024-01-14",
+            "2024-01-15",
+            "2024-01-16",
+            "2024-01-17",
+            "2024-01-18",  # week 2: Sun-Thu
+        ]
+    )
+    dates = rebalance_dates(idx, RebalanceFrequency.WEEKLY, calendar="XSAU")
+    assert list(dates) == [idx[0], idx[5]]
+
+
 def test_apply_rebalancing_holds_between_dates() -> None:
     idx = pd.date_range("2020-01-01", periods=60, freq="D")
     target = pd.DataFrame(np.linspace(0.1, 0.9, 60), index=idx, columns=["A"])

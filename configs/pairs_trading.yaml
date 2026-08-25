@@ -4,10 +4,13 @@
 experiment_name: pairs_trading_ewa_ewc
 
 data:
-  source: yahoo
-  symbols:
-    - EWA
-    - EWC
+  instruments:
+    - symbol: EWA
+      source: yahoo
+      calendar: XNYS
+    - symbol: EWC
+      source: yahoo
+      calendar: XNYS
   start_date: "2010-01-01"
   end_date: "2025-12-31"
   frequency: "1d"
@@ -39,7 +42,11 @@ execution:
 
 backtest:
   initial_capital: 100000
-  benchmark_symbol: SPY
+  # SPY is external here (not a tradable instrument above).
+  benchmark:
+    symbol: SPY
+    source: yahoo
+    calendar: XNYS
   risk_free_rate: 0.02
   periods_per_year: 252
 

@@ -4,9 +4,11 @@ Run with:
 
     streamlit run src/quantlab/dashboard/app.py
 
-Lets a user configure an experiment in the sidebar, run the look-ahead-safe
-backtest, inspect metrics/charts/trades, run robustness checks and download an
-HTML research report.
+Lets a user configure an experiment in the sidebar, run the backtest (its
+delayed-execution barrier prevents common look-ahead leakage, though a custom
+strategy remains responsible for its own causal construction), inspect
+metrics/charts/trades, run robustness checks and download an HTML research
+report.
 """
 
 from __future__ import annotations
@@ -18,6 +20,7 @@ from typing import TYPE_CHECKING, Any, cast
 import pandas as pd
 import streamlit as st
 
+from quantlab.config import DataSourceName, compatible_frequencies_for_sources
 from quantlab.dashboard.components import (
     render_charts,
     render_exposure_and_cost_charts,
@@ -30,6 +33,8 @@ from quantlab.dashboard.state import (
     binance_trading_symbols,
     build_config_from_inputs,
     default_end_date,
+    detect_calendar,
+    detect_source,
     estimate_walk_forward_backtest_count,
     run_dashboard_backtest,
     run_dashboard_bootstrap,
@@ -41,7 +46,7 @@ from quantlab.dashboard.state import (
     run_dashboard_walk_forward_stress_tests,
     yahoo_common_symbols,
 )
-from quantlab.logging_config import get_logger
+from quantlab.logging_config import configure_logging, get_logger
 from quantlab.progress import ProgressReporter
 from quantlab.strategies.base import (
     available_strategies,
@@ -49,12 +54,22 @@ from quantlab.strategies.base import (
     strategy_sweepable_parameter_names,
 )
 from quantlab.validation.parameter_grid import parse_parameter_grid_values
+from quantlab.validation.parameter_sensitivity import (
+    infer_sensitivity_parameter_columns,
+)
 
 if TYPE_CHECKING:
     from quantlab.backtesting.result import BacktestResult
     from quantlab.data.base import SymbolSuggestion
     from quantlab.validation.walk_forward import WalkForwardResult
 
+# Streamlit runs this file in its own process (`quantlab dashboard` launches
+# it via `subprocess.run`; a user can also run `streamlit run` on it
+# directly), separate from any process that already called
+# configure_logging() -- without this call here too, the dashboard's own
+# logger has no handlers attached, so its exceptions/warnings are never
+# written to logs/quantlab.log.
+configure_logging()
 logger = get_logger(__name__)
 
 st.set_page_config(page_title="QuantLab", page_icon="📈", layout="wide")
@@ -105,12 +120,6 @@ _INCOMPLETE_LIST_NOTE = (
     "Not every symbol is suggested — if yours is missing, type its exact "
     "ticker and it'll still be accepted."
 )
-#: Shown whenever mixing symbols across markets is possible (csv and yahoo;
-#: Binance is exempt since every pair already shares the same 24/7 calendar).
-_MARKET_CALENDAR_NOTE = (
-    "One market calendar applies to the entire universe, so every symbol "
-    "must follow the same trading schedule."
-)
 
 
 def _symbols_picker(
@@ -119,7 +128,6 @@ def _symbols_picker(
     default_symbols: tuple[str, ...],
     *,
     accept_new_options: bool = False,
-    warn_market_calendar: bool = False,
 ) -> list[str]:
     """A single instant, client-side-filtered dropdown over a preloaded universe.
 
@@ -139,8 +147,6 @@ def _symbols_picker(
     )
     if accept_new_options:
         help_text += " " + _INCOMPLETE_LIST_NOTE
-    if warn_market_calendar:
-        help_text += " " + _MARKET_CALENDAR_NOTE
 
     if key not in st.session_state:
         st.session_state[key] = [
@@ -169,49 +175,122 @@ def _symbols_picker(
 
 
 def _binance_symbols_picker() -> list[str]:
-    return _symbols_picker(
-        _binance_universe_labels(), "binance_symbols", ("BTCUSDT", "ETHUSDT")
-    )
+    # Empty by default: all three pickers are visible simultaneously now, and
+    # a non-empty default here would immediately conflict with CSV's bundled
+    # demo default below (see `_combine_instrument_picks`).
+    return _symbols_picker(_binance_universe_labels(), "binance_symbols", ())
 
 
 def _yahoo_symbols_picker() -> list[str]:
     return _symbols_picker(
         _yahoo_universe_labels(),
         "yahoo_symbols",
-        ("SPY", "QQQ", "TLT", "GLD"),
+        (),
         accept_new_options=True,
-        warn_market_calendar=True,
     )
 
 
-def _symbol_selectbox(
-    label_by_symbol: dict[str, str],
-    key: str,
-    default_symbol: str,
-    help_text: str,
-    *,
-    accept_new_options: bool = False,
-) -> str:
-    """A single-symbol dropdown over an already-known ``{symbol: label}`` map."""
-    if accept_new_options:
-        help_text += " " + _INCOMPLETE_LIST_NOTE
-    options = list(label_by_symbol.values())
-    default_label = label_by_symbol.get(
-        default_symbol, options[0] if options else default_symbol
+def _csv_symbols_picker() -> list[str]:
+    raw = st.text_input(
+        "CSV symbols (comma-separated)",
+        "SPY, QQQ, TLT, GLD",
+        help=(
+            "Local files under data/raw, one CSV per symbol. When 'Allow "
+            "bundled synthetic demo data' below is enabled, QuantLab falls "
+            "back to its bundled SPY/QQQ/TLT/GLD demo files if every "
+            "requested local file is absent."
+        ),
     )
-    if key not in st.session_state:
-        st.session_state[key] = default_label
-    picked_label = st.selectbox(
-        "Benchmark symbol",
-        options=options,
-        key=key,
-        help=help_text,
-        accept_new_options=accept_new_options,
+    return _parse_symbols(raw)
+
+
+def _combine_instrument_picks(
+    yahoo_symbols: list[str],
+    binance_symbols: list[str],
+    csv_symbols: list[str],
+) -> tuple[list[str], dict[str, str], list[str]]:
+    """Merge the three pickers into one ordered, deduplicated symbol list.
+
+    Provenance is the picker a symbol actually came from — never a
+    heuristic — so the instrument table's Source default is always exact.
+    A symbol picked from two different pickers is a conflict: never
+    silently deduplicated (which source/calendar would even apply is
+    ambiguous), excluded from the returned symbol list and reported
+    separately so the caller can block submission.
+    """
+    picks: list[tuple[list[str], str]] = [
+        (yahoo_symbols, "yahoo"),
+        (binance_symbols, "binance"),
+        (csv_symbols, "csv"),
+    ]
+    seen_in: dict[str, list[str]] = {}
+    order: list[str] = []
+    for symbols, source_name in picks:
+        for symbol in symbols:
+            if symbol not in seen_in:
+                order.append(symbol)
+            seen_in.setdefault(symbol, []).append(source_name)
+    conflicts = [symbol for symbol in order if len(seen_in[symbol]) > 1]
+    conflict_set = set(conflicts)
+    provenance = {
+        symbol: seen_in[symbol][0] for symbol in order if symbol not in conflict_set
+    }
+    combined = [symbol for symbol in order if symbol not in conflict_set]
+    return combined, provenance, conflicts
+
+
+def _instrument_table(
+    symbols: list[str], provenance: dict[str, str]
+) -> list[dict[str, str]]:
+    """Editable Source/Calendar table, one row per selected symbol.
+
+    Source defaults to the picker the symbol came from (``provenance``) —
+    never the ``detect_source`` heuristic. Calendar defaults to
+    ``detect_calendar``'s best guess. Both are editable and rebuilt from
+    ``symbols`` on every render, so removing a symbol from a picker above
+    drops its row (and any prior edit) on the next run instead of leaving a
+    stale entry behind.
+    """
+    overrides: dict[str, dict[str, str]] = st.session_state.get(
+        "instrument_overrides", {}
     )
-    symbol_by_label = {label: symbol for symbol, label in label_by_symbol.items()}
-    if picked_label is None:
-        return ""
-    return symbol_by_label.get(picked_label, picked_label.strip().upper())
+    rows = []
+    for symbol in symbols:
+        saved = overrides.get(symbol, {})
+        default_source = saved.get("source") or provenance.get(symbol, "csv")
+        default_calendar = saved.get("calendar") or (
+            detect_calendar(symbol, DataSourceName(default_source)) or "XNYS"
+        )
+        rows.append(
+            {
+                "Instrument": symbol,
+                "Source": default_source,
+                "Calendar": default_calendar,
+            }
+        )
+    edited = st.data_editor(
+        pd.DataFrame(rows, columns=["Instrument", "Source", "Calendar"]),
+        column_config={
+            "Instrument": st.column_config.TextColumn(disabled=True),
+            "Source": st.column_config.SelectboxColumn(
+                options=["yahoo", "binance", "csv"], required=True
+            ),
+            "Calendar": st.column_config.TextColumn(
+                required=True,
+                help="'24/7' for a continuous market, or a pandas_market_calendars "
+                "name such as XNYS, XHKG, XLON.",
+            ),
+        },
+        hide_index=True,
+        width="stretch",
+        key="instrument_table_editor",
+    )
+    records = cast(list[dict[str, str]], edited.to_dict("records"))
+    st.session_state["instrument_overrides"] = {
+        row["Instrument"]: {"source": row["Source"], "calendar": row["Calendar"]}
+        for row in records
+    }
+    return records
 
 
 def _strategy_param_inputs(strategy_name: str, symbols: list[str]) -> dict:
@@ -580,9 +659,10 @@ with st.expander("About this platform"):
         """
         QuantLab turns a financial hypothesis into a reproducible, bias-aware
         experiment: **data → cleaning & validation → feature functions → signals →
-        allocation → execution costs → look-ahead-safe accounting → risk metrics
+        allocation → execution costs → delayed-execution accounting → risk metrics
         → validation → reporting**. Signals are strictly shifted before returns
-        to prevent look-ahead bias.
+        to prevent common look-ahead leakage; a custom strategy remains
+        responsible for its own causal construction.
 
         Source: [github.com/sefaav/QuantLab](https://github.com/sefaav/QuantLab)
         · [Report an issue](https://github.com/sefaav/QuantLab/issues)
@@ -611,18 +691,33 @@ if mode is None:
 # --------------------------------------------------------------------------- #
 with st.sidebar:
     st.header("Experiment configuration")
-    source = st.selectbox(
-        "Data source",
-        ["csv", "yahoo", "binance"],
-        index=0,
-        help=(
-            "csv reads local files from data/raw. A separate opt-in below "
-            "allows QuantLab's bundled synthetic demo files when every "
-            "requested local file is absent. yahoo and binance download and "
-            "locally cache real market data, and need network access."
-        ),
+    st.subheader("Instruments")
+    st.caption(
+        "Pick symbols from any of the three sources below — they all "
+        "combine into one multi-market universe."
     )
-    if source == "csv":
+    with st.expander("Yahoo Finance", expanded=False):
+        yahoo_symbols = _yahoo_symbols_picker()
+    with st.expander("Binance", expanded=False):
+        binance_symbols = _binance_symbols_picker()
+    with st.expander("CSV (local files)", expanded=True):
+        csv_symbols = _csv_symbols_picker()
+
+    symbols, provenance, conflicts = _combine_instrument_picks(
+        yahoo_symbols, binance_symbols, csv_symbols
+    )
+    if conflicts:
+        st.error(
+            "Picked from more than one source, so source/calendar would be "
+            "ambiguous — remove the duplicate from one picker: "
+            + ", ".join(sorted(conflicts))
+        )
+    if not symbols:
+        st.warning("Pick at least one symbol above to configure an instrument.")
+
+    instrument_rows = _instrument_table(symbols, provenance)
+    use_bundled_demo_data = False
+    if any(row["Source"] == "csv" for row in instrument_rows):
         use_bundled_demo_data = st.toggle(
             "Allow bundled synthetic demo data",
             value=False,
@@ -633,22 +728,34 @@ with st.sidebar:
                 "symbols still fail explicitly."
             ),
         )
-    else:
-        use_bundled_demo_data = False
-    if source == "binance":
-        symbols = _binance_symbols_picker()
-    elif source == "yahoo":
-        symbols = _yahoo_symbols_picker()
-    else:
-        symbols_raw = st.text_input(
-            "Symbols (comma-separated)",
-            "SPY, QQQ, TLT, GLD",
-            help=(
-                "Tradable universe. pairs_trading needs at least two symbols "
-                f"here; its two legs are then picked below. {_MARKET_CALENDAR_NOTE}"
-            ),
+
+    instrument_calendars = {row["Calendar"] for row in instrument_rows}
+    periods_per_year: int | None = None
+    if len(instrument_calendars) > 1:
+        st.warning(
+            "Instruments span more than one calendar "
+            f"({', '.join(sorted(instrument_calendars))}), so QuantLab "
+            "cannot infer a single annualisation factor automatically — "
+            "set one explicitly."
         )
-        symbols = _parse_symbols(symbols_raw)
+        # Default to the 24/7 convention as soon as any instrument actually
+        # trades continuously -- a mixed portfolio that includes one is
+        # closer to a "always-open" annualisation than a pure business-day
+        # one, and 252 silently understates volatility/Sharpe for it.
+        default_periods_per_year = 365 if "24/7" in instrument_calendars else 252
+        periods_per_year = int(
+            st.number_input(
+                "Periods per year (annualisation factor)",
+                min_value=1,
+                value=default_periods_per_year,
+                step=1,
+                help=(
+                    "Used to annualise Sharpe, volatility and vol-targeting "
+                    "across the whole portfolio. 252 for a business-day "
+                    "equity convention, 365 for a continuous 24/7 one."
+                ),
+            )
+        )
 
     # Sidebar date fields need the full width to keep labels and values readable.
     start_date = st.date_input(
@@ -665,46 +772,45 @@ with st.sidebar:
         help="Requested end of the sample, same caveat as Start date above.",
     )
 
-    # Offer only frequencies supported by the selected backend.
-    frequency_options = (
-        ["1d", "1h", "1w"] if source == "binance" else ["1d", "1h", "1w", "1mo"]
+    # Offer only frequencies compatible with every selected instrument's
+    # source — the same intersection ExperimentConfig itself validates, so
+    # the picker can never offer something the config would then reject.
+    instrument_sources = {DataSourceName(row["Source"]) for row in instrument_rows}
+    frequency_options = sorted(compatible_frequencies_for_sources(instrument_sources))
+    # '1h' has no verified-closure handling for a mixed-calendar universe
+    # (that machinery only operates at daily frequency) -- offering it would
+    # let the config validator reject the run only after "Run backtest" is
+    # clicked, so it's excluded here too, matching what ExperimentConfig
+    # itself would refuse.
+    intraday_blocked_by_mixed_calendar = (
+        len(instrument_calendars) > 1 and "1h" in frequency_options
     )
+    if intraday_blocked_by_mixed_calendar:
+        frequency_options = [f for f in frequency_options if f != "1h"]
     frequency = st.selectbox(
         "Frequency",
         frequency_options,
-        index=0,
+        index=0 if frequency_options else None,
         help=(
             "Bar size requested from the data source; also sets the "
             "annualisation factor used by every risk metric."
         ),
     )
-    if source == "csv":
+    if not frequency_options:
+        st.error(
+            "No frequency is compatible with every selected source — remove "
+            "one of the conflicting sources above."
+        )
+    elif intraday_blocked_by_mixed_calendar:
+        st.caption(
+            "'1h' is unavailable for a mixed-calendar universe — verified "
+            "closures only work at daily frequency."
+        )
+    if any(row["Source"] == "csv" for row in instrument_rows):
         st.caption(
             "For CSV data, frequency controls annualisation and data-quality "
             "checks but does not resample the file. A mismatch with the "
             "observed timestamps is reported after the run."
-        )
-    # Yahoo and CSV experiments select a supported calendar explicitly.
-    market_calendar: str | None
-    if source in {"csv", "yahoo"}:
-        market_calendar = st.selectbox(
-            "Market calendar",
-            ["XNYS", "24/7"],
-            index=0,
-            help=(
-                "Use 'XNYS' for US equities and ETFs, or '24/7' for continuous "
-                "markets such as crypto. This controls annualisation, settlement "
-                "and gap checks."
-            ),
-        )
-    else:
-        market_calendar = None
-        st.caption("Market calendar: implied by Binance (24/7).")
-    if source in {"csv", "yahoo"}:
-        st.warning(
-            "One calendar applies to every symbol. Do not mix markets with "
-            "different trading schedules (for example AAPL and 1211.HK); "
-            "run them as separate experiments."
         )
     with st.expander("Advanced data settings"):
         missing_value_policy = st.selectbox(
@@ -1097,7 +1203,13 @@ with st.sidebar:
                 key=f"wf_grid_{parameter_name}",
             )
             parameter_grid[parameter_name] = parse_parameter_grid_values(raw_values)
-        is_247_market = market_calendar == "24/7" or source == "binance"
+        # A rough estimate only (used to warn about a slow configuration
+        # before data is loaded) -- treat the universe as 24/7 only when
+        # every instrument genuinely is, otherwise fall back to the
+        # business-day convention.
+        is_247_market = bool(instrument_rows) and all(
+            row["Calendar"] == "24/7" for row in instrument_rows
+        )
         estimated_backtests = estimate_walk_forward_backtest_count(
             start_date=start_date,
             end_date=end_date or default_end_date(),
@@ -1147,9 +1259,10 @@ with st.sidebar:
                 0.2,
                 0.05,
                 help=(
-                    "Final chronological slice held out as the "
-                    "out-of-sample test block — its metrics are what the "
-                    "report calls out-of-sample evidence."
+                    "Final chronological slice, reported separately as the "
+                    "'Test' block. Genuinely out-of-sample only if the "
+                    "strategy and parameters were fixed before it was ever "
+                    "inspected — this dashboard has no way to verify that."
                 ),
             )
 
@@ -1193,36 +1306,60 @@ with st.sidebar:
             "configured risk-free rate."
         ),
     )
+    # The benchmark symbol is itself an instrument (source + calendar), with
+    # the same provenance rule as the table above: if it duplicates a
+    # tradable instrument, its source/calendar are reused verbatim rather
+    # than letting the user configure an inconsistency the config would
+    # reject anyway (source/calendar must match exactly when they overlap).
     if benchmark_kind == "symbol":
-        if source == "binance":
-            benchmark_symbol = _symbol_selectbox(
-                _binance_universe_labels(),
-                "binance_benchmark_symbol",
-                "BTCUSDT",
-                "External symbol to compare against — pick from Binance's "
-                "active spot pairs.",
-            )
-        elif source == "yahoo":
-            benchmark_symbol = _symbol_selectbox(
-                _yahoo_universe_labels(),
-                "yahoo_benchmark_symbol",
-                "SPY",
-                "External symbol to compare against — pick from the same "
-                "bundled list as Symbols above, or type an exact symbol "
-                f"not in the list. {_MARKET_CALENDAR_NOTE}",
-                accept_new_options=True,
-            )
-        else:
-            benchmark_symbol = st.text_input(
+        benchmark_symbol = (
+            st.text_input(
                 "Benchmark symbol",
                 "SPY",
-                help=(
-                    "External symbol to download and compare against, e.g. "
-                    f"SPY. {_MARKET_CALENDAR_NOTE}"
-                ),
+                help="External symbol to compare the strategy against.",
             )
+            .strip()
+            .upper()
+        )
+        matching_instrument = next(
+            (row for row in instrument_rows if row["Instrument"] == benchmark_symbol),
+            None,
+        )
+        if matching_instrument is not None:
+            benchmark_source = matching_instrument["Source"]
+            benchmark_calendar = matching_instrument["Calendar"]
+            st.caption(
+                f"{benchmark_symbol} is already a tradable instrument — its "
+                f"source ({benchmark_source}) and calendar "
+                f"({benchmark_calendar}) are reused as-is."
+            )
+        elif benchmark_symbol:
+            detected_source = detect_source(benchmark_symbol)
+            source_options = ["yahoo", "binance", "csv"]
+            benchmark_source = st.selectbox(
+                "Benchmark source",
+                source_options,
+                index=source_options.index(
+                    detected_source.value if detected_source else "csv"
+                ),
+                key="benchmark_source_select",
+                help="Data source for the external benchmark symbol.",
+            )
+            benchmark_calendar = st.text_input(
+                "Benchmark calendar",
+                detect_calendar(benchmark_symbol, DataSourceName(benchmark_source))
+                or "XNYS",
+                key="benchmark_calendar_input",
+                help="'24/7' for a continuous market, or a "
+                "pandas_market_calendars name such as XNYS, XHKG, XLON.",
+            )
+        else:
+            benchmark_source = "csv"
+            benchmark_calendar = "XNYS"
     else:
         benchmark_symbol = ""
+        benchmark_source = "csv"
+        benchmark_calendar = "XNYS"
         if benchmark_kind == "first_asset":
             first_symbol = symbols[0] if symbols else "the first universe symbol"
             st.caption(f"Benchmark asset: {first_symbol}")
@@ -1289,10 +1426,21 @@ with st.sidebar:
         else:
             impact_coefficient = 0.1
 
+    submission_blocked = bool(conflicts) or not symbols or not frequency_options
     if mode == "Walk-forward":
-        run = st.button("Run walk-forward", type="primary", width="stretch")
+        run = st.button(
+            "Run walk-forward",
+            type="primary",
+            width="stretch",
+            disabled=submission_blocked,
+        )
     else:
-        run = st.button("Run backtest", type="primary", width="stretch")
+        run = st.button(
+            "Run backtest",
+            type="primary",
+            width="stretch",
+            disabled=submission_blocked,
+        )
 
 
 def _run_and_store(
@@ -1388,8 +1536,11 @@ def _render_robustness_tab(result: BacktestResult) -> None:
     holdout_report = result.metadata.get("holdout_report")
     st.markdown("#### Chronological holdout (train / validation / test)")
     if holdout_report:
-        # Two-way train/test holdouts omit the validation row.
-        blocks = [("Train", "train"), ("Test (out-of-sample)", "test")]
+        # Two-way train/test holdouts omit the validation row. Labeled
+        # plainly "Test", not "out-of-sample": whether it's genuinely OOS
+        # depends on parameters having been fixed before looking at it, a
+        # property of the user's own workflow this table can't verify.
+        blocks = [("Train", "train"), ("Test", "test")]
         if "validation_metrics" in holdout_report:
             blocks.insert(1, ("Validation", "validation"))
         rows = [
@@ -1586,7 +1737,18 @@ def _render_robustness_tab(result: BacktestResult) -> None:
         _run_sensitivity()
     sensitivity = st.session_state.get("sensitivity")
     if sensitivity is not None:
-        render_sensitivity_heatmap(st, sensitivity, sensitivity_x, sensitivity_y)
+        # Read the axes back off the result itself, not the (possibly since
+        # changed) sidebar selection above -- otherwise changing the axis
+        # pickers after a run without re-running would render a stale
+        # result under mismatched labels, or crash pivoting on a column the
+        # stored result never had.
+        used_x, used_y = infer_sensitivity_parameter_columns(sensitivity)
+        if (used_x, used_y) != (sensitivity_x, sensitivity_y):
+            st.caption(
+                f"Showing the last run's axes ({used_x} / {used_y}) — "
+                "the pickers above have changed since. Run again to update."
+            )
+        render_sensitivity_heatmap(st, sensitivity, used_x, used_y)
 
     st.divider()
     if st.button("Run all robustness tests", type="secondary"):
@@ -1851,9 +2013,16 @@ def _render_walk_forward_robustness_tab(wf: WalkForwardResult) -> None:
         _run_wf_sensitivity()
     wf_sensitivity = st.session_state.get("wf_sensitivity")
     if wf_sensitivity is not None:
-        render_sensitivity_heatmap(
-            st, wf_sensitivity, wf_sensitivity_x, wf_sensitivity_y
-        )
+        # See the Backtest-mode sensitivity section above for why the axes
+        # are read back off the result itself, not the sidebar's current
+        # (possibly since changed) selection.
+        used_x, used_y = infer_sensitivity_parameter_columns(wf_sensitivity)
+        if (used_x, used_y) != (wf_sensitivity_x, wf_sensitivity_y):
+            st.caption(
+                f"Showing the last run's axes ({used_x} / {used_y}) — "
+                "the pickers above have changed since. Run again to update."
+            )
+        render_sensitivity_heatmap(st, wf_sensitivity, used_x, used_y)
 
     st.divider()
     if st.button("Run all robustness tests", key="wf_run_all", type="secondary"):
@@ -1974,15 +2143,30 @@ def _render_report_tab(
 # --------------------------------------------------------------------------- #
 def _collect_inputs() -> dict:
     """Return the current sidebar values used to build the experiment config."""
+    instruments = [
+        {
+            "symbol": row["Instrument"],
+            "source": row["Source"],
+            "calendar": row["Calendar"],
+        }
+        for row in instrument_rows
+    ]
+    benchmark = (
+        {
+            "symbol": benchmark_symbol,
+            "source": benchmark_source,
+            "calendar": benchmark_calendar,
+        }
+        if benchmark_kind == "symbol" and benchmark_symbol
+        else None
+    )
     inputs: dict = {
         "experiment_name": f"dashboard_{strategy_name}",
-        "source": source,
+        "instruments": instruments,
         "use_bundled_demo_data": use_bundled_demo_data,
-        "symbols": symbols,
         "start_date": start_date,
         "end_date": end_date or default_end_date(),
         "frequency": frequency,
-        "market_calendar": market_calendar,
         "missing_value_policy": missing_value_policy,
         "forward_fill_limit": forward_fill_limit,
         "strategy_name": strategy_name,
@@ -2001,7 +2185,8 @@ def _collect_inputs() -> dict:
         "rebalance_frequency": rebalance_frequency,
         "initial_capital": initial_capital,
         "benchmark_kind": benchmark_kind,
-        "benchmark_symbol": benchmark_symbol,
+        "benchmark": benchmark,
+        "periods_per_year": periods_per_year,
         "risk_free_rate": risk_free_rate_percent / 100.0,
         "commission_bps": commission_bps,
         "spread_bps": spread_bps,
@@ -2056,7 +2241,7 @@ def _clear_walk_forward_result_state() -> None:
 def _execute_backtest() -> None:
     inputs = _collect_inputs()
     _clear_backtest_result_state()
-    with st.spinner("Running look-ahead-safe backtest…"):
+    with st.spinner("Running backtest…"):
         try:
             config = build_config_from_inputs(inputs)
             result, warnings = run_dashboard_backtest(config)

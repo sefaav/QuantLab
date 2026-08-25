@@ -16,9 +16,10 @@ from quantlab.validation.parameter_grid import parse_parameter_grid_values
 
 def _base_inputs(**overrides: object) -> dict[str, object]:
     inputs: dict[str, object] = {
-        "source": "csv",
-        "market_calendar": "XNYS",
-        "symbols": ["SPY", "QQQ"],
+        "instruments": [
+            {"symbol": "SPY", "source": "csv", "calendar": "XNYS"},
+            {"symbol": "QQQ", "source": "csv", "calendar": "XNYS"},
+        ],
         "start_date": datetime.date(2019, 1, 1),
         "end_date": datetime.date(2020, 1, 1),
         "strategy_name": "buy_and_hold",

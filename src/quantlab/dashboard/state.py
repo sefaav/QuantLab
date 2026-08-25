@@ -18,8 +18,27 @@ from quantlab.constants import GENERATED_REPORTS_DIR
 from quantlab.data.base import SymbolSuggestion
 from quantlab.data.binance import BinanceDataSource
 from quantlab.data.loader import DataLoader
+from quantlab.data.resolution import detect_calendar, detect_source
 from quantlab.data.storage import ParquetStorage
 from quantlab.exceptions import BacktestError
+
+__all__ = [
+    "binance_trading_symbols",
+    "build_config_from_inputs",
+    "default_end_date",
+    "detect_calendar",
+    "detect_source",
+    "estimate_walk_forward_backtest_count",
+    "run_dashboard_backtest",
+    "run_dashboard_bootstrap",
+    "run_dashboard_permutation_test",
+    "run_dashboard_sensitivity",
+    "run_dashboard_stress_tests",
+    "run_dashboard_walk_forward",
+    "run_dashboard_walk_forward_sensitivity",
+    "run_dashboard_walk_forward_stress_tests",
+    "yahoo_common_symbols",
+]
 
 if TYPE_CHECKING:
     from quantlab.validation.walk_forward import WalkForwardResult
@@ -33,19 +52,24 @@ _YAHOO_COMMON_SYMBOLS_CSV = Path(__file__).parent / "data" / "yahoo_common_symbo
 
 
 def build_config_from_inputs(inputs: dict[str, Any]) -> ExperimentConfig:
-    """Assemble a validated :class:`ExperimentConfig` from dashboard inputs."""
+    """Assemble a validated :class:`ExperimentConfig` from dashboard inputs.
+
+    ``instruments`` and ``benchmark`` are taken as-is: the dashboard's
+    instrument table (built directly from picker provenance, not a
+    heuristic) and benchmark section are already fully resolved by the time
+    they reach this function -- each row IS a piece of the config, not a
+    delta against a global default that no longer exists.
+    """
     return ExperimentConfig.from_dict(
         {
             "experiment_name": inputs.get("experiment_name", "dashboard_run"),
             "data": {
-                "source": inputs["source"],
-                "symbols": inputs["symbols"],
+                "instruments": inputs["instruments"],
                 "start_date": inputs["start_date"],
                 "end_date": inputs["end_date"],
                 "frequency": inputs.get("frequency", "1d"),
                 "missing_value_policy": inputs.get("missing_value_policy", "drop"),
                 "forward_fill_limit": inputs.get("forward_fill_limit", 1),
-                "market_calendar": inputs.get("market_calendar"),
                 "use_bundled_demo_data": inputs.get("use_bundled_demo_data", False),
             },
             "strategy": {
@@ -76,7 +100,8 @@ def build_config_from_inputs(inputs: dict[str, Any]) -> ExperimentConfig:
             "backtest": {
                 "initial_capital": inputs.get("initial_capital", 100_000.0),
                 "benchmark_kind": inputs.get("benchmark_kind", "symbol"),
-                "benchmark_symbol": inputs.get("benchmark_symbol") or None,
+                "benchmark": inputs.get("benchmark"),
+                "periods_per_year": inputs.get("periods_per_year"),
                 "risk_free_rate": inputs.get("risk_free_rate", 0.02),
             },
             "validation": _validation_block_from_inputs(inputs),

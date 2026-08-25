@@ -32,7 +32,7 @@ def main() -> int:
     config = ExperimentConfig.from_yaml(args.config)
     data = DataLoader().download(config, force=args.force)
     symbol_count = data["symbol"].nunique()
-    if config.data.source == "csv":
+    if config.data_source == "csv":
         print(
             f"Loaded {len(data)} rows for {symbol_count} symbols from CSV files "
             "(CSV input is not written to the Parquet cache)."
@@ -40,7 +40,7 @@ def main() -> int:
     else:
         print(
             f"Cached {len(data)} rows for {symbol_count} symbols from "
-            f"{config.data.source.value}."
+            f"{config.data_source}."
         )
     return 0
 

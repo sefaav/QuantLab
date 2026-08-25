@@ -24,6 +24,7 @@ from quantlab.backtesting.accounting import (
 from quantlab.backtesting.benchmark import build_benchmark
 from quantlab.backtesting.engine import (
     _dependency_versions,
+    _generator_hash,
     _git_commit_hash,
     _git_is_dirty,
     _source_hash,
@@ -38,9 +39,12 @@ from quantlab.backtesting.trade_log import build_trade_log
 from quantlab.config import BenchmarkKind, ExperimentConfig
 from quantlab.constants import SYMBOL
 from quantlab.data.base import price_matrix
+from quantlab.data.calendar import uniform_calendar
+from quantlab.data.closures import DAILY_FREQUENCY, tradable_mask_for
 from quantlab.data.storage import ParquetStorage
 from quantlab.exceptions import InvalidConfigurationError
 from quantlab.execution.execution_model import ExecutionModel
+from quantlab.execution.orders import shift_respecting_tradability
 from quantlab.logging_config import get_logger
 from quantlab.portfolio.rebalancing import (
     rebalance_and_cap_turnover,
@@ -161,6 +165,80 @@ class _FoldCandidateWeights:
     test_targets: pd.DataFrame | None
 
 
+def _windows_match(a: WalkForwardWindow, b: WalkForwardWindow) -> bool:
+    """Compare two windows field-by-field, never via ``==`` directly.
+
+    ``WalkForwardWindow`` is a plain ``@dataclass(frozen=True)`` with
+    ``pd.DatetimeIndex`` fields -- its auto-generated ``__eq__`` compares
+    field tuples, and ``DatetimeIndex.__eq__`` returns an element-wise
+    boolean array rather than a scalar, which raises ``ValueError`` the
+    moment Python's tuple comparison needs a single bool out of it for any
+    index longer than one element. ``Index.equals`` is the correct,
+    scalar-returning comparison for this exact reason.
+    """
+    return (
+        a.fold == b.fold
+        and a.train.equals(b.train)
+        and a.validation.equals(b.validation)
+        and a.test.equals(b.test)
+    )
+
+
+def _target_frame_is_valid(
+    target: object, expected_columns: set[str], expected_index: pd.DatetimeIndex
+) -> bool:
+    """Return whether a checkpointed target-weights frame is trustworthy.
+
+    Checks the actual content, not just ``isinstance(target, pd.DataFrame)``
+    -- the wrong symbol set, an index that doesn't match this fold's own
+    window exactly (a corrupted or unrelated checkpoint could carry a
+    subset, a reordering, or a stray date from a completely different run,
+    e.g. the year 1900), or a non-finite value would otherwise silently
+    corrupt the stitched OOS curve. Dtypes are checked as numeric *before*
+    attempting a float cast, so a frame holding genuinely non-numeric data
+    (e.g. object/string columns) fails cleanly here rather than raising out
+    of this check.
+    """
+    if not isinstance(target, pd.DataFrame):
+        return False
+    if set(target.columns) != expected_columns:
+        return False
+    if not pd.Index(target.index).equals(pd.DatetimeIndex(expected_index)):
+        return False
+    if not all(pd.api.types.is_numeric_dtype(dtype) for dtype in target.dtypes):
+        return False
+    return bool(np.isfinite(target.to_numpy(dtype=float)).all())
+
+
+def _candidate_weights_is_valid(
+    candidate: object,
+    expected_columns: set[str],
+    validation_index: pd.DatetimeIndex,
+    test_index: pd.DatetimeIndex,
+) -> bool:
+    """Return whether a cached candidate's weights are internally consistent.
+
+    ``_FoldCandidateWeights``'s own docstring says ``None`` fields mean this
+    candidate was skipped (insufficient warm-up) -- both fields must agree
+    on that: one ``None`` and the other a real DataFrame is not a state
+    this code ever produces itself, only a corrupted or hand-edited
+    checkpoint could, and trusting it risks silently mixing a skipped
+    candidate's missing weights into a scenario that expects them. When both
+    fields are present, each is checked with the same full-content rigor as
+    ``_target_frame_is_valid`` (exact symbol set, exact index against this
+    fold's own validation/test window, finite values) -- a right-shaped but
+    wrong-content frame (foreign dates, garbage columns, NaNs) is just as
+    unsafe to resume from as a missing one.
+    """
+    if not isinstance(candidate, _FoldCandidateWeights):
+        return False
+    if candidate.validation_weights is None and candidate.test_targets is None:
+        return True
+    return _target_frame_is_valid(
+        candidate.validation_weights, expected_columns, validation_index
+    ) and _target_frame_is_valid(candidate.test_targets, expected_columns, test_index)
+
+
 @dataclass
 class WalkForwardWeightCache:
     """Per-fold, per-candidate weights captured while selecting a baseline.
@@ -181,6 +259,13 @@ class WalkForwardWeightCache:
     test_window: int
     expanding: bool
     execution_delay: int
+    #: The config this cache's weights/candidates were actually computed
+    #: from -- rescore_with_costs() checks a scenario config against this,
+    #: not just documents the requirement, so a scenario that silently
+    #: also changes signals/universe/selection (not just execution costs)
+    #: is rejected instead of producing quietly wrong results from stale
+    #: cached weights.
+    base_config: ExperimentConfig
 
 
 def resolve_walk_forward_windows(config: ExperimentConfig) -> tuple[int, int, int]:
@@ -297,6 +382,66 @@ class WalkForwardValidator:
         target_pieces: list[pd.DataFrame] = []
 
         provenance: dict[str, Any] | None = None
+
+        def _validate_fold_state(state: Any, progress: int) -> bool:
+            # A structurally-plausible-but-incoherent checkpoint (right
+            # list count, wrong content) must never be resumed from: e.g. a
+            # `progress` that disagrees with the lists' own length, windows
+            # left over from a *different* run whose windows happen to
+            # share this one's length, or a target frame surviving from a
+            # completely different fold. Content, not just count, is
+            # checked -- windows must exactly match this run's own
+            # `prepared.windows` prefix, in order. The whole body is
+            # wrapped defensively: a checkpoint's *content* is untrusted
+            # data by definition (it can be replaced or hand-edited on
+            # disk), so any unexpected shape while inspecting it -- not
+            # only a failed check -- must resolve to "untrusted", the same
+            # philosophy `_read_payload` already applies to a malformed
+            # pickle, never propagate an exception into the caller.
+            try:
+                if not (isinstance(state, tuple) and len(state) == 4):
+                    return False
+                windows, parameters, scores, targets = state
+                if not all(isinstance(piece, list) for piece in state):
+                    return False
+                lengths = {len(piece) for piece in state}
+                if len(lengths) != 1:
+                    return False
+                count = lengths.pop()
+                if not (progress == count <= len(prepared.windows)):
+                    return False
+                if not all(
+                    isinstance(window, WalkForwardWindow)
+                    and _windows_match(window, prepared.windows[position])
+                    for position, window in enumerate(windows)
+                ):
+                    return False
+                # `params in prepared.combinations` (not just
+                # isinstance(dict)): a parameter dict that isn't actually
+                # one of this run's own grid candidates could only have
+                # come from a stale or unrelated checkpoint.
+                if not all(params in prepared.combinations for params in parameters):
+                    return False
+                if not all(
+                    isinstance(score, (int, float))
+                    and not isinstance(score, bool)
+                    and np.isfinite(score)
+                    for score in scores
+                ):
+                    return False
+                # A target frame's own columns/index/values matter here, not
+                # just its Python type -- the wrong symbol set, dates
+                # outside this fold's own test window (e.g. a stray 1900
+                # timestamp), or a non-finite value would otherwise silently
+                # corrupt the stitched OOS curve.
+                symbols = set(self.base_config.symbols)
+                return all(
+                    _target_frame_is_valid(target, symbols, window.test)
+                    for target, window in zip(targets, windows, strict=True)
+                )
+            except Exception:
+                return False
+
         if checkpoint_path is not None:
             provenance = compute_provenance(
                 self.base_config,
@@ -308,10 +453,12 @@ class WalkForwardValidator:
                 execution_delay=execution_delay,
                 parameter_grid={k: list(v) for k, v in parameter_grid.items()},
             )
-            checkpoint_state = load_checkpoint(checkpoint_path, provenance)
-            if checkpoint_state is not None:
-                fold_windows, fold_parameters, fold_scores, target_pieces = (
-                    checkpoint_state
+            checkpoint_result = load_checkpoint(
+                checkpoint_path, provenance, validate=_validate_fold_state
+            )
+            if checkpoint_result is not None:
+                (fold_windows, fold_parameters, fold_scores, target_pieces), _ = (
+                    checkpoint_result
                 )
                 logger.info(
                     "Resuming walk-forward from checkpoint: %d/%d folds already done.",
@@ -438,6 +585,64 @@ class WalkForwardValidator:
         cached_candidates: list[list[_FoldCandidateWeights]] = []
 
         provenance: dict[str, Any] | None = None
+
+        def _validate_cache_fold_state(state: Any, progress: int) -> bool:
+            # Same reasoning as the plain run()'s _validate_fold_state
+            # (including the defensive try/except -- checkpoint content is
+            # untrusted data by definition), for this method's own 5-list
+            # state shape (it additionally caches every candidate's
+            # test-block weights, not just the winner's).
+            try:
+                if not (isinstance(state, tuple) and len(state) == 5):
+                    return False
+                windows, parameters, scores, targets, cached = state
+                if not all(isinstance(piece, list) for piece in state):
+                    return False
+                lengths = {len(piece) for piece in state}
+                if len(lengths) != 1:
+                    return False
+                count = lengths.pop()
+                if not (progress == count <= len(prepared.windows)):
+                    return False
+                if not all(
+                    isinstance(window, WalkForwardWindow)
+                    and _windows_match(window, prepared.windows[position])
+                    for position, window in enumerate(windows)
+                ):
+                    return False
+                if not all(params in prepared.combinations for params in parameters):
+                    return False
+                if not all(
+                    isinstance(score, (int, float))
+                    and not isinstance(score, bool)
+                    and np.isfinite(score)
+                    for score in scores
+                ):
+                    return False
+                symbols = set(self.base_config.symbols)
+                if not all(
+                    _target_frame_is_valid(target, symbols, window.test)
+                    for target, window in zip(targets, windows, strict=True)
+                ):
+                    return False
+                # Every fold's cache must hold exactly one entry per
+                # candidate in this run's own grid -- a mismatched count
+                # means it was built against a different (or
+                # since-changed) parameter_grid.
+                return all(
+                    isinstance(fold_cache, list)
+                    and len(fold_cache) == len(prepared.combinations)
+                    and all(
+                        _candidate_weights_is_valid(
+                            candidate, symbols, window.validation, window.test
+                        )
+                        for candidate in fold_cache
+                    )
+                    for window, fold_cache in zip(windows, cached, strict=True)
+                )
+            except Exception:
+                return False
+
         if checkpoint_path is not None:
             provenance = compute_provenance(
                 self.base_config,
@@ -449,15 +654,20 @@ class WalkForwardValidator:
                 execution_delay=execution_delay,
                 parameter_grid={k: list(v) for k, v in parameter_grid.items()},
             )
-            checkpoint_state = load_checkpoint(checkpoint_path, provenance)
-            if checkpoint_state is not None:
+            checkpoint_result = load_checkpoint(
+                checkpoint_path, provenance, validate=_validate_cache_fold_state
+            )
+            if checkpoint_result is not None:
                 (
-                    fold_windows,
-                    fold_parameters,
-                    fold_scores,
-                    target_pieces,
-                    cached_candidates,
-                ) = checkpoint_state
+                    (
+                        fold_windows,
+                        fold_parameters,
+                        fold_scores,
+                        target_pieces,
+                        cached_candidates,
+                    ),
+                    _,
+                ) = checkpoint_result
                 logger.info(
                     "Resuming weight-cache build from checkpoint: %d/%d folds "
                     "already done.",
@@ -544,6 +754,7 @@ class WalkForwardValidator:
             test_window=test_window,
             expanding=expanding,
             execution_delay=prepared.delay,
+            base_config=self.base_config,
         )
         if checkpoint_path is not None:
             clear_checkpoint(checkpoint_path)
@@ -568,8 +779,29 @@ class WalkForwardValidator:
         built ``cache`` in execution-cost fields (commission/spread/
         slippage). Anything that would change signals, weights, the
         tradable universe or execution delay needs a fresh :meth:`run` or
-        :meth:`run_with_weight_cache` instead.
+        :meth:`run_with_weight_cache` instead -- enforced below, not just
+        documented: a mismatch on any other field raises rather than
+        silently rescoring against stale cached weights that don't actually
+        reflect what the scenario claims to be.
+
+        Raises:
+            InvalidConfigurationError: If ``scenario_config`` differs from
+                ``cache.base_config`` outside the ``execution`` section.
         """
+        base_dump = cache.base_config.model_dump(mode="json")
+        scenario_dump = scenario_config.model_dump(mode="json")
+        base_dump.pop("execution", None)
+        scenario_dump.pop("execution", None)
+        if base_dump != scenario_dump:
+            raise InvalidConfigurationError(
+                "rescore_with_costs() requires scenario_config to match the "
+                "config that built cache in every respect except execution "
+                "costs (commission/spread/slippage/slippage_model/"
+                "impact_coefficient) -- this scenario also changes something "
+                "that could change signals, weights, the tradable universe "
+                "or selection. Use run() or run_with_weight_cache() instead."
+            )
+
         started = time.perf_counter()
         periods_per_year = positive_int(
             scenario_config.periods_per_year, name="periods_per_year"
@@ -597,17 +829,29 @@ class WalkForwardValidator:
                 window.validation[0] : window.validation[-1]
             ]
             execution_model = build_execution_from_config(scenario_config, sliced)
+            tradable_mask = _tradable_mask_if_mixed_calendar(
+                scenario_config, pd.DatetimeIndex(asset_returns.index)
+            )
 
             best_score = -np.inf
             best_index: int | None = None
             for index, candidate in enumerate(row):
                 if candidate.validation_weights is None:
                     continue
+                aligned_tradable = (
+                    tradable_mask.reindex(
+                        index=candidate.validation_weights.index,
+                        columns=candidate.validation_weights.columns,
+                    ).fillna(True)
+                    if tradable_mask is not None
+                    else None
+                )
                 accounting = run_accounting(
                     candidate.validation_weights,
                     asset_returns,
                     execution_model,
                     scenario_config.initial_capital,
+                    tradable=aligned_tradable,
                 )
                 equity = M.equity_from_returns(accounting.net_returns)
                 score = scorer(
@@ -771,8 +1015,17 @@ class WalkForwardValidator:
                     "Walk-forward test blocks overlap; duplicate target dates: "
                     f"{list(duplicates[:5])}."
                 )
+            tradable_mask = _tradable_mask_if_mixed_calendar(
+                active_config, pd.DatetimeIndex(all_targets.index)
+            )
+            shared_calendar = uniform_calendar(
+                instrument.calendar for instrument in active_config.data.instruments
+            )
             all_weights = rebalance_and_cap_turnover(
-                all_targets, active_config.portfolio
+                all_targets,
+                active_config.portfolio,
+                tradable=tradable_mask,
+                calendar=shared_calendar,
             )
 
             # A target chosen on a rebalance bar becomes the executed position
@@ -780,6 +1033,7 @@ class WalkForwardValidator:
             schedule = compute_rebalance_dates(
                 pd.DatetimeIndex(all_weights.index),
                 active_config.portfolio.rebalance_frequency,
+                calendar=shared_calendar,
             )
             aligned_starts: list[pd.Timestamp] = []
             for window in fold_windows:
@@ -810,14 +1064,32 @@ class WalkForwardValidator:
             prices = price_matrix(tradable, adjusted=True)
             asset_returns = compute_asset_returns(prices).reindex(all_weights.index)
             execution_model = build_execution_from_config(active_config, data)
+            aligned_tradable_mask = (
+                tradable_mask.reindex(
+                    index=all_weights.index, columns=all_weights.columns
+                ).fillna(True)
+                if tradable_mask is not None
+                else None
+            )
             executed_weights = all_weights
             if delay > 0:
-                executed_weights = executed_weights.shift(delay).fillna(0.0)
+                if aligned_tradable_mask is not None:
+                    # A raw row-count shift would delay execution onto a
+                    # date a symbol can't actually trade on -- same bug the
+                    # mandatory look-ahead-barrier shift inside
+                    # run_accounting avoids, so the extra configured delay
+                    # must avoid it too.
+                    executed_weights = shift_respecting_tradability(
+                        executed_weights, delay, aligned_tradable_mask
+                    ).fillna(0.0)
+                else:
+                    executed_weights = executed_weights.shift(delay).fillna(0.0)
             accounting = run_accounting(
                 executed_weights,
                 asset_returns,
                 execution_model,
                 active_config.initial_capital,
+                tradable=aligned_tradable_mask,
             )
             oos_returns = accounting.net_returns
             oos_equity = accounting.equity
@@ -929,6 +1201,7 @@ class WalkForwardValidator:
             benchmark_data,
             pd.DatetimeIndex(accounting.net_returns.index),
             benchmark_symbol=active_config.benchmark_symbol,
+            benchmark_calendar=active_config.benchmark_calendar,
             first_asset_symbol=active_config.symbols[0],
             risk_free_rate=risk_free_rate,
             periods_per_year=periods_per_year,
@@ -952,6 +1225,9 @@ class WalkForwardValidator:
             "run_timestamp": datetime.now(UTC).isoformat(),
             "experiment_name": active_config.experiment_name,
             "strategy": active_config.strategy_name,
+            "allocator": active_config.portfolio.allocator,
+            "commission_bps": active_config.commission_bps,
+            "spread_bps": active_config.spread_bps,
             "symbols": active_config.symbols,
             "start_date": str(active_config.start_date),
             "end_date": str(active_config.end_date),
@@ -964,7 +1240,23 @@ class WalkForwardValidator:
             "git_dirty": _git_is_dirty(),
             "dependency_versions": _dependency_versions(),
             "code_hash": _source_hash(),
+            "generator_hash": _generator_hash(),
             "walk_forward_execution_delay": delay,
+            # Unlike BacktestEngine.run() (docs/api.md documents passing it
+            # a custom strategy/allocator/execution-model instance directly,
+            # see its own config_yaml_reflects_*), WalkForwardValidator never
+            # accepts one: every component is always built via
+            # build_strategy_from_config/build_allocator_from_config/
+            # build_execution_from_config(active_config, ...), so there is
+            # no possible mismatch to verify here -- these are unconditional
+            # facts about this code path, not a best-effort check. Without
+            # them, the HTML report's footer (which requires all three
+            # config_yaml_reflects_* keys) would treat every walk-forward
+            # result as unverified and never claim reproducibility, even
+            # though it always is.
+            "config_yaml_reflects_strategy": True,
+            "config_yaml_reflects_allocator": True,
+            "config_yaml_reflects_execution": True,
             # `metrics` (below) *are* the out-of-sample metrics — this result
             # is the stitched OOS series, not a full-sample fit. Mirrored
             # into metadata under this exact key because
@@ -982,6 +1274,19 @@ class WalkForwardValidator:
                 "expanding": expanding,
             },
         }
+        # Mirrored under these exact keys because
+        # `load_previous_walk_forward_robustness` (quantlab.backtesting.
+        # result) compares them to decide whether a later `quantlab report`
+        # can reuse this bundle's CSVs. Setting them here, not in any one
+        # CLI command, means every caller of this method gets them for free
+        # -- `bootstrap`/`stress-test`/`permutation-test`/`sensitivity` in
+        # walk-forward mode all save this exact `metadata` dict via `result
+        # IS wf.oos_result`, without routing through the dedicated
+        # `walk-forward` command's own code, so a per-command setter would
+        # leave `report` unable to recognise a still-valid bundle any of
+        # those other commands had just saved, and delete it.
+        metadata["walk_forward_config_snapshot"] = active_config.model_dump(mode="json")
+        metadata["walk_forward_run_timestamp"] = metadata["run_timestamp"]
 
         return BacktestResult(
             config=active_config,
@@ -1220,6 +1525,29 @@ def _grid_combinations(
     ]
 
 
+def _tradable_mask_if_mixed_calendar(
+    config: ExperimentConfig, index: pd.DatetimeIndex
+) -> pd.DataFrame | None:
+    """Per-symbol tradability mask, only when a raw shift could be wrong.
+
+    ``None`` when every instrument shares one calendar (a raw shift is
+    already exactly correct, no closure can occur) or the frequency isn't
+    daily (closure semantics are only well-defined at daily granularity, see
+    :mod:`quantlab.data.closures`). Shared by every accounting call site
+    (fold-level candidate scoring, cost-only rescoring, final OOS stitching)
+    so parameter *selection* is never scored under a different execution
+    timing than the *finalised* result it selects for.
+    """
+    if config.data.frequency != DAILY_FREQUENCY:
+        return None
+    symbol_calendars = {
+        instrument.symbol: instrument.calendar for instrument in config.data.instruments
+    }
+    if uniform_calendar(symbol_calendars.values()) is not None:
+        return None
+    return tradable_mask_for(index, config.symbols, symbol_calendars)
+
+
 def _slice_between(
     data: pd.DataFrame, start: pd.Timestamp, end: pd.Timestamp
 ) -> pd.DataFrame:
@@ -1287,8 +1615,22 @@ def _weights_and_returns_for_validation(
     prices = price_matrix(tradable, adjusted=True)
     asset_returns = compute_asset_returns(prices).loc[window_start:window_end]
     execution_model = build_execution_from_config(config, sliced)
+    tradable_mask = _tradable_mask_if_mixed_calendar(
+        config, pd.DatetimeIndex(window_weights.index)
+    )
+    aligned_tradable = (
+        tradable_mask.reindex(
+            index=window_weights.index, columns=window_weights.columns
+        ).fillna(True)
+        if tradable_mask is not None
+        else None
+    )
     accounting = run_accounting(
-        window_weights, asset_returns, execution_model, config.initial_capital
+        window_weights,
+        asset_returns,
+        execution_model,
+        config.initial_capital,
+        tradable=aligned_tradable,
     )
     return window_weights, accounting.net_returns
 

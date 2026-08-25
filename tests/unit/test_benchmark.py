@@ -150,16 +150,23 @@ def test_loader_fetches_extra_data_only_for_symbol_benchmark() -> None:
     base = {
         "experiment_name": "benchmark_fetch",
         "data": {
-            "source": "csv",
-            "symbols": ["AAA", "BBB"],
+            "instruments": [
+                {"symbol": s, "source": "csv", "calendar": "XNYS"}
+                for s in ["AAA", "BBB"]
+            ],
             "start_date": "2024-01-01",
             "end_date": "2024-02-01",
-            "market_calendar": "XNYS",
         },
         "strategy": {"name": "buy_and_hold"},
     }
     symbol_cfg = ExperimentConfig.from_dict(
-        {**base, "backtest": {"benchmark_kind": "symbol", "benchmark_symbol": "SPY"}}
+        {
+            **base,
+            "backtest": {
+                "benchmark_kind": "symbol",
+                "benchmark": {"symbol": "SPY", "source": "csv", "calendar": "XNYS"},
+            },
+        }
     )
     equal_weight_cfg = ExperimentConfig.from_dict(
         {**base, "backtest": {"benchmark_kind": "equal_weight"}}

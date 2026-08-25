@@ -23,11 +23,12 @@ def _result(tmp_seed: int = 1) -> BacktestResult:
         {
             "experiment_name": "report_test",
             "data": {
-                "source": "csv",
-                "symbols": ["SPY", "QQQ", "TLT"],
+                "instruments": [
+                    {"symbol": s, "source": "csv", "calendar": "XNYS"}
+                    for s in ["SPY", "QQQ", "TLT"]
+                ],
                 "start_date": "2019-01-01",
                 "end_date": "2020-12-01",
-                "market_calendar": "XNYS",
             },
             "strategy": {
                 "name": "cross_sectional_momentum",
@@ -43,7 +44,10 @@ def _result(tmp_seed: int = 1) -> BacktestResult:
                 "spread_bps": 3.0,
                 "slippage_bps": 2.0,
             },
-            "backtest": {"initial_capital": 100_000, "benchmark_symbol": "SPY"},
+            "backtest": {
+                "initial_capital": 100_000,
+                "benchmark": {"symbol": "SPY", "source": "csv", "calendar": "XNYS"},
+            },
         }
     )
     return run_backtest_from_config(data, cfg)

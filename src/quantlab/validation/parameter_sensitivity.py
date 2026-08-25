@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any
@@ -99,6 +100,68 @@ def run_parameter_sensitivity(
     return pd.DataFrame(rows)
 
 
+_SENSITIVITY_CELL_METRIC_COLUMNS = (
+    "sharpe",
+    "cagr",
+    "max_drawdown",
+    "turnover",
+    "num_trades",
+)
+
+
+def _values_equal(a: Any, b: Any) -> bool:
+    """Compare two candidate values without requiring them to be scalar.
+
+    ``a`` comes from an untrusted checkpoint, so ``a == b`` itself is not
+    safe to trust blindly: a scalar sentinel like ``pd.NA`` compares equal
+    to nothing (``bool(pd.NA)`` raises ``TypeError: boolean value of NA is
+    ambiguous`` rather than returning ``False``), and an arbitrary corrupted
+    value could make ``==`` raise outright (e.g. comparing against a type
+    that doesn't support it). Either way, that only means "not a match" --
+    it must never propagate out and abort a checkpoint validation that
+    otherwise exists precisely to catch corrupted input like this.
+    """
+    try:
+        equal = a == b
+        if isinstance(equal, (np.ndarray, pd.Series)):
+            return bool(np.asarray(equal).all())
+        return bool(equal)
+    except Exception:
+        return False
+
+
+def _sensitivity_cell_row_is_consistent(row: dict[str, Any]) -> bool:
+    """Return whether a checkpointed cell's status, metrics and error agree.
+
+    Mirrors the two shapes the loop below actually produces: ``status ==
+    "ok"`` means every metric is a finite number and ``error`` is ``None``;
+    ``status == "failed"`` means every metric is NaN and ``error`` is a real
+    (non-empty) message. A cell claiming success while carrying NaN metrics,
+    or failure while carrying finite ones and no error, is corrupted
+    regardless of whether its schema and parameter values already checked
+    out.
+    """
+    status = row.get("status")
+    error = row.get("error")
+    metric_values = [row.get(name) for name in _SENSITIVITY_CELL_METRIC_COLUMNS]
+    if status == "ok":
+        if error is not None:
+            return False
+        return all(
+            isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and math.isfinite(value)
+            for value in metric_values
+        )
+    if status == "failed":
+        if not (isinstance(error, str) and error):
+            return False
+        return all(
+            isinstance(value, float) and math.isnan(value) for value in metric_values
+        )
+    return False
+
+
 def run_walk_forward_parameter_sensitivity(
     data: pd.DataFrame,
     base_config: ExperimentConfig,
@@ -161,6 +224,44 @@ def run_walk_forward_parameter_sensitivity(
 
     rows: list[dict[str, Any]] = []
     provenance: dict[str, Any] | None = None
+    completed_cells = 0
+
+    expected_cell_keys = {
+        parameter_x,
+        parameter_y,
+        *_SENSITIVITY_CELL_METRIC_COLUMNS,
+        "status",
+        "error",
+    }
+
+    def _validate_cell_state(state: Any, progress: int) -> bool:
+        # One row per cell, in lockstep with `progress` (unlike the
+        # scenario-block checkpoints elsewhere, where one unit can append
+        # several rows at once) -- so an exact length match is meaningful
+        # here, not just an upper bound. A structurally-plausible but
+        # incoherent checkpoint (right length, wrong content -- e.g. a
+        # single-cell state of `["garbage"]`, or a row carrying some other
+        # cell's parameter values) must never be resumed from: it would
+        # silently corrupt the sweep with a mismatched or malformed row.
+        if not (0 <= progress <= total_cells and isinstance(state, list)):
+            return False
+        if len(state) != progress:
+            return False
+        if not all(
+            isinstance(row, dict) and row.keys() == expected_cell_keys for row in state
+        ):
+            return False
+        # Each row's own (x, y) must match the combination actually assigned
+        # to its position -- the same order the loop below resumes from
+        # (`combinations[completed_cells:]`), so a resumed row can never be
+        # silently attributed to the wrong cell.
+        for row, (x, y) in zip(state, combinations[:progress], strict=True):
+            x_matches = _values_equal(row[parameter_x], x)
+            y_matches = _values_equal(row[parameter_y], y)
+            if not (x_matches and y_matches):
+                return False
+        return all(_sensitivity_cell_row_is_consistent(row) for row in state)
+
     if checkpoint_path is not None:
         provenance = compute_provenance(
             base_config,
@@ -170,16 +271,17 @@ def run_walk_forward_parameter_sensitivity(
             parameter_y=parameter_y,
             values_y=list(values_y),
         )
-        checkpoint_state = load_checkpoint(checkpoint_path, provenance)
-        if checkpoint_state is not None:
-            rows = checkpoint_state
+        checkpoint_result = load_checkpoint(
+            checkpoint_path, provenance, validate=_validate_cell_state
+        )
+        if checkpoint_result is not None:
+            rows, completed_cells = checkpoint_result
             logger.info(
                 "Resuming walk-forward sensitivity from checkpoint: %d/%d "
                 "cells already done.",
-                len(rows),
+                completed_cells,
                 total_cells,
             )
-    completed_cells = len(rows)
     if on_progress is not None:
         on_progress(completed_cells, total_cells)
 
@@ -272,6 +374,39 @@ def sensitivity_heatmap_data(
         raise ValueError(f"{metric} must not contain infinite values.")
     selected = selected.assign(**{metric: metric_values})
     return selected.pivot(index=parameter_y, columns=parameter_x, values=metric)
+
+
+#: Columns a sensitivity result always carries besides its two swept
+#: parameters -- whatever's left after excluding these is the axis pair.
+_SENSITIVITY_METRIC_COLUMNS = frozenset(
+    {"sharpe", "cagr", "max_drawdown", "turnover", "num_trades", "status", "error"}
+)
+
+
+def infer_sensitivity_parameter_columns(sensitivity: pd.DataFrame) -> tuple[str, str]:
+    """Return the two swept-parameter columns a sensitivity result carries.
+
+    A sensitivity DataFrame self-describes which two parameters it was
+    computed for (whatever columns aren't one of the fixed metric columns);
+    reading them back off the DataFrame itself, rather than trusting a
+    caller's separately-tracked "current" axis selection, is what keeps a
+    live UI (e.g. the dashboard) from rendering a stale result under axis
+    labels that no longer match what was actually computed -- the picker
+    widgets can drift after the run without the displayed result becoming
+    wrong or crashing on a missing column.
+    """
+    parameter_columns = [
+        column
+        for column in sensitivity.columns
+        if column not in _SENSITIVITY_METRIC_COLUMNS
+    ]
+    if len(parameter_columns) != 2:
+        raise ValueError(
+            "sensitivity must have exactly two swept-parameter columns; found "
+            f"{parameter_columns}."
+        )
+    parameter_x, parameter_y = parameter_columns
+    return parameter_x, parameter_y
 
 
 def _validate_parameter_axes(

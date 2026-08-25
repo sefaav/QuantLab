@@ -3,9 +3,10 @@
 experiment_name: btc_trend_following
 
 data:
-  source: binance
-  symbols:
-    - BTCUSDT
+  instruments:
+    - symbol: BTCUSDT
+      source: binance
+      calendar: "24/7"
   start_date: "2018-01-01"
   end_date: "2025-12-31"
   frequency: "1d"
@@ -34,7 +35,10 @@ execution:
 
 backtest:
   initial_capital: 100000
-  benchmark_symbol: BTCUSDT
+  benchmark:
+    symbol: BTCUSDT
+    source: binance
+    calendar: "24/7"
   risk_free_rate: 0.0
   periods_per_year: 365   # crypto trades every calendar day
 

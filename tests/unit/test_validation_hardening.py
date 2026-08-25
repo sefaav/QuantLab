@@ -55,11 +55,13 @@ def _config(*, benchmark: str | None = None) -> ExperimentConfig:
         {
             "experiment_name": "validation_hardening",
             "data": {
-                "source": "csv",
-                "symbols": ["AAA", "BBB", "CCC"],
+                "instruments": [
+                    {"symbol": "AAA", "source": "csv", "calendar": "XNYS"},
+                    {"symbol": "BBB", "source": "csv", "calendar": "XNYS"},
+                    {"symbol": "CCC", "source": "csv", "calendar": "XNYS"},
+                ],
                 "start_date": "2020-01-01",
                 "end_date": "2020-12-31",
-                "market_calendar": "XNYS",
             },
             "strategy": {
                 "name": "cross_sectional_momentum",
@@ -69,7 +71,13 @@ def _config(*, benchmark: str | None = None) -> ExperimentConfig:
                     "top_fraction": 0.3,
                 },
             },
-            "backtest": {"benchmark_symbol": benchmark},
+            "backtest": {
+                "benchmark": (
+                    {"symbol": benchmark, "source": "csv", "calendar": "XNYS"}
+                    if benchmark is not None
+                    else None
+                )
+            },
         }
     )
 
@@ -135,11 +143,15 @@ def test_default_walk_forward_grid_covers_each_builtin_strategy_with_valid_combi
         {
             "experiment_name": f"grid_{strategy_name}",
             "data": {
-                "source": "csv",
-                "symbols": ["AAA", "BBB", "CCC", "DDD", "EEE"],
+                "instruments": [
+                    {"symbol": "AAA", "source": "csv", "calendar": "XNYS"},
+                    {"symbol": "BBB", "source": "csv", "calendar": "XNYS"},
+                    {"symbol": "CCC", "source": "csv", "calendar": "XNYS"},
+                    {"symbol": "DDD", "source": "csv", "calendar": "XNYS"},
+                    {"symbol": "EEE", "source": "csv", "calendar": "XNYS"},
+                ],
                 "start_date": "2010-01-01",
                 "end_date": "2020-12-31",
-                "market_calendar": "XNYS",
             },
             "strategy": {"name": strategy_name, "parameters": parameters},
             "portfolio": portfolio,
@@ -163,11 +175,15 @@ def test_default_cross_sectional_long_short_grid_remains_disjoint() -> None:
         {
             "experiment_name": "grid_cross_sectional_long_short",
             "data": {
-                "source": "csv",
-                "symbols": ["AAA", "BBB", "CCC", "DDD", "EEE"],
+                "instruments": [
+                    {"symbol": "AAA", "source": "csv", "calendar": "XNYS"},
+                    {"symbol": "BBB", "source": "csv", "calendar": "XNYS"},
+                    {"symbol": "CCC", "source": "csv", "calendar": "XNYS"},
+                    {"symbol": "DDD", "source": "csv", "calendar": "XNYS"},
+                    {"symbol": "EEE", "source": "csv", "calendar": "XNYS"},
+                ],
                 "start_date": "2010-01-01",
                 "end_date": "2020-12-31",
-                "market_calendar": "XNYS",
             },
             "strategy": {
                 "name": "cross_sectional_momentum",
@@ -223,11 +239,12 @@ def _pairs_walk_forward_config() -> ExperimentConfig:
         {
             "experiment_name": "pairs_warmup",
             "data": {
-                "source": "csv",
-                "symbols": ["AAA", "BBB"],
+                "instruments": [
+                    {"symbol": "AAA", "source": "csv", "calendar": "XNYS"},
+                    {"symbol": "BBB", "source": "csv", "calendar": "XNYS"},
+                ],
                 "start_date": "2020-01-01",
                 "end_date": "2025-12-31",
-                "market_calendar": "XNYS",
             },
             "strategy": {
                 "name": "pairs_trading",
@@ -357,7 +374,7 @@ def test_random_sign_test_centres_on_risk_free_return() -> None:
     ppy = 252
     risk_free_rate = 0.05
     excess = pd.Series([0.01, -0.004, 0.006, -0.002] * 25)
-    shifted = excess + risk_free_rate / ppy
+    shifted = excess.add(risk_free_rate / ppy)
     zero_rate = monte_carlo_permutation(
         excess, n_iterations=200, seed=7, periods_per_year=ppy
     )
@@ -624,11 +641,12 @@ def _holdout_config(**validation_overrides: object) -> ExperimentConfig:
         {
             "experiment_name": "holdout_hardening",
             "data": {
-                "source": "csv",
-                "symbols": ["AAA", "BBB"],
+                "instruments": [
+                    {"symbol": "AAA", "source": "csv", "calendar": "XNYS"},
+                    {"symbol": "BBB", "source": "csv", "calendar": "XNYS"},
+                ],
                 "start_date": "2020-01-01",
                 "end_date": "2020-12-31",
-                "market_calendar": "XNYS",
             },
             "strategy": {"name": "buy_and_hold", "parameters": {}},
             "portfolio": {"allocator": "equal_weight"},
@@ -644,7 +662,7 @@ def test_holdout_report_summary_table_lists_train_validation_and_test() -> None:
     report = run_holdout_report(data, config, result)
     assert report is not None
     table = report.summary_table()
-    assert list(table["Block"]) == ["Train", "Validation", "Test (out-of-sample)"]
+    assert list(table["Block"]) == ["Train", "Validation", "Test"]
     assert {"Start", "End", "CAGR", "Sharpe", "Max Drawdown"} <= set(table.columns)
 
 
@@ -656,7 +674,7 @@ def test_holdout_report_summary_table_omits_an_absent_validation_block() -> None
     assert report is not None
     assert not report.has_validation_block
     table = report.summary_table()
-    assert list(table["Block"]) == ["Train", "Test (out-of-sample)"]
+    assert list(table["Block"]) == ["Train", "Test"]
     assert "validation_metrics" not in report.to_metadata()
 
 
@@ -797,6 +815,26 @@ def test_validation_package_exports_fold_result() -> None:
 
     assert "FoldResult" in validation.__all__
     assert validation.FoldResult is FoldResult
+
+
+def test_validation_package_exports_walk_forward_robustness_functions() -> None:
+    """run_walk_forward_stress_tests/run_walk_forward_parameter_sensitivity
+    are public functionality used by the CLI/dashboard, so they must be
+    reachable from the package root like every other public entry point
+    here, not only via their own submodule."""
+    import quantlab.validation as validation
+    from quantlab.validation.parameter_sensitivity import (
+        run_walk_forward_parameter_sensitivity,
+    )
+    from quantlab.validation.robustness import run_walk_forward_stress_tests
+
+    assert "run_walk_forward_stress_tests" in validation.__all__
+    assert validation.run_walk_forward_stress_tests is run_walk_forward_stress_tests
+    assert "run_walk_forward_parameter_sensitivity" in validation.__all__
+    assert (
+        validation.run_walk_forward_parameter_sensitivity
+        is run_walk_forward_parameter_sensitivity
+    )
 
 
 def test_walk_forward_rejects_an_unsupported_optimization_metric(

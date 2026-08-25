@@ -23,7 +23,9 @@ def test_unknown_strategy_name_rejected_at_config_load() -> None:
             {
                 "experiment_name": "x",
                 "data": {
-                    "symbols": ["A"],
+                    "instruments": [
+                        {"symbol": "A", "source": "csv", "calendar": "XNYS"},
+                    ],
                     "start_date": "2020-01-01",
                     "end_date": "2021-01-01",
                 },
@@ -38,7 +40,9 @@ def test_unknown_strategy_parameter_rejected_at_config_load() -> None:
             {
                 "experiment_name": "x",
                 "data": {
-                    "symbols": ["A"],
+                    "instruments": [
+                        {"symbol": "A", "source": "csv", "calendar": "XNYS"},
+                    ],
                     "start_date": "2020-01-01",
                     "end_date": "2021-01-01",
                 },
@@ -55,7 +59,9 @@ def test_known_strategy_parameters_still_accepted() -> None:
         {
             "experiment_name": "x",
             "data": {
-                "symbols": ["A"],
+                "instruments": [
+                    {"symbol": "A", "source": "csv", "calendar": "XNYS"},
+                ],
                 "start_date": "2020-01-01",
                 "end_date": "2021-01-01",
             },
@@ -74,7 +80,9 @@ def test_var_keyword_catch_all_does_not_admit_bogus_parameters() -> None:
             {
                 "experiment_name": "x",
                 "data": {
-                    "symbols": ["A"],
+                    "instruments": [
+                        {"symbol": "A", "source": "csv", "calendar": "XNYS"},
+                    ],
                     "start_date": "2020-01-01",
                     "end_date": "2021-01-01",
                 },
@@ -89,7 +97,9 @@ def test_wrong_type_strategy_parameter_rejected() -> None:
             {
                 "experiment_name": "x",
                 "data": {
-                    "symbols": ["A"],
+                    "instruments": [
+                        {"symbol": "A", "source": "csv", "calendar": "XNYS"},
+                    ],
                     "start_date": "2020-01-01",
                     "end_date": "2021-01-01",
                 },
@@ -107,7 +117,10 @@ def test_pairs_trading_missing_required_parameter_rejected() -> None:
             {
                 "experiment_name": "x",
                 "data": {
-                    "symbols": ["AAA", "BBB"],
+                    "instruments": [
+                        {"symbol": "AAA", "source": "csv", "calendar": "XNYS"},
+                        {"symbol": "BBB", "source": "csv", "calendar": "XNYS"},
+                    ],
                     "start_date": "2020-01-01",
                     "end_date": "2021-01-01",
                 },
@@ -125,7 +138,9 @@ def test_mean_reversion_zero_lookback_rejected() -> None:
             {
                 "experiment_name": "x",
                 "data": {
-                    "symbols": ["A"],
+                    "instruments": [
+                        {"symbol": "A", "source": "csv", "calendar": "XNYS"},
+                    ],
                     "start_date": "2020-01-01",
                     "end_date": "2021-01-01",
                 },
@@ -143,7 +158,10 @@ def test_cross_sectional_momentum_out_of_range_top_fraction_rejected() -> None:
             {
                 "experiment_name": "x",
                 "data": {
-                    "symbols": ["A", "B"],
+                    "instruments": [
+                        {"symbol": "A", "source": "csv", "calendar": "XNYS"},
+                        {"symbol": "B", "source": "csv", "calendar": "XNYS"},
+                    ],
                     "start_date": "2020-01-01",
                     "end_date": "2021-01-01",
                 },
@@ -161,7 +179,9 @@ def test_time_series_momentum_unknown_signal_scaling_rejected() -> None:
             {
                 "experiment_name": "x",
                 "data": {
-                    "symbols": ["A"],
+                    "instruments": [
+                        {"symbol": "A", "source": "csv", "calendar": "XNYS"},
+                    ],
                     "start_date": "2020-01-01",
                     "end_date": "2021-01-01",
                 },
@@ -180,7 +200,9 @@ def test_int_accepted_for_float_strategy_parameter() -> None:
         {
             "experiment_name": "x",
             "data": {
-                "symbols": ["A"],
+                "instruments": [
+                    {"symbol": "A", "source": "csv", "calendar": "XNYS"},
+                ],
                 "start_date": "2020-01-01",
                 "end_date": "2021-01-01",
             },
@@ -498,8 +520,9 @@ def test_strategy_periods_per_year_injected_from_config() -> None:
         {
             "experiment_name": "test",
             "data": {
-                "source": "binance",
-                "symbols": ["BTCUSDT"],
+                "instruments": [
+                    {"symbol": "BTCUSDT", "source": "binance", "calendar": "24/7"},
+                ],
                 "start_date": "2020-01-01",
                 "end_date": "2020-06-01",
                 "frequency": "1d",
@@ -528,8 +551,9 @@ def test_explicit_strategy_periods_per_year_still_wins() -> None:
         {
             "experiment_name": "test",
             "data": {
-                "source": "binance",
-                "symbols": ["BTCUSDT"],
+                "instruments": [
+                    {"symbol": "BTCUSDT", "source": "binance", "calendar": "24/7"},
+                ],
                 "start_date": "2020-01-01",
                 "end_date": "2020-06-01",
                 "frequency": "1d",

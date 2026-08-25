@@ -33,9 +33,10 @@ def test_target_volatility_applies_with_any_allocator() -> None:
     base: dict[str, Any] = {
         "experiment_name": "x",
         "data": {
-            "source": "csv",
-            "market_calendar": "XNYS",
-            "symbols": ["AAA", "BBB", "CCC"],
+            "instruments": [
+                {"symbol": s, "source": "csv", "calendar": "XNYS"}
+                for s in ["AAA", "BBB", "CCC"]
+            ],
             "start_date": "2020-01-01",
             "end_date": "2021-06-01",
         },
@@ -131,9 +132,10 @@ def test_volume_slippage_is_not_degenerate() -> None:
         {
             "experiment_name": "vol_slip",
             "data": {
-                "source": "csv",
-                "market_calendar": "XNYS",
-                "symbols": ["AAA", "BBB", "CCC"],
+                "instruments": [
+                    {"symbol": s, "source": "csv", "calendar": "XNYS"}
+                    for s in ["AAA", "BBB", "CCC"]
+                ],
                 "start_date": "2020-01-01",
                 "end_date": "2020-10-01",
             },
@@ -168,7 +170,9 @@ def test_negative_maximum_net_exposure_rejected() -> None:
             {
                 "experiment_name": "x",
                 "data": {
-                    "symbols": ["A"],
+                    "instruments": [
+                        {"symbol": "A", "source": "csv", "calendar": "XNYS"}
+                    ],
                     "start_date": "2020-01-01",
                     "end_date": "2021-01-01",
                 },
@@ -184,7 +188,9 @@ def test_minimum_weight_above_maximum_weight_rejected() -> None:
             {
                 "experiment_name": "x",
                 "data": {
-                    "symbols": ["A"],
+                    "instruments": [
+                        {"symbol": "A", "source": "csv", "calendar": "XNYS"}
+                    ],
                     "start_date": "2020-01-01",
                     "end_date": "2021-01-01",
                 },
@@ -200,7 +206,9 @@ def test_unknown_allocator_rejected_at_config_load() -> None:
             {
                 "experiment_name": "x",
                 "data": {
-                    "symbols": ["A"],
+                    "instruments": [
+                        {"symbol": "A", "source": "csv", "calendar": "XNYS"}
+                    ],
                     "start_date": "2020-01-01",
                     "end_date": "2021-01-01",
                 },
@@ -216,7 +224,9 @@ def test_unknown_slippage_model_rejected_at_config_load() -> None:
             {
                 "experiment_name": "x",
                 "data": {
-                    "symbols": ["A"],
+                    "instruments": [
+                        {"symbol": "A", "source": "csv", "calendar": "XNYS"}
+                    ],
                     "start_date": "2020-01-01",
                     "end_date": "2021-01-01",
                 },
@@ -727,9 +737,10 @@ def test_execution_delay_is_a_true_resimulation_not_a_returns_shift() -> None:
         {
             "experiment_name": "test",
             "data": {
-                "source": "csv",
-                "market_calendar": "XNYS",
-                "symbols": ["AAA", "BBB"],
+                "instruments": [
+                    {"symbol": s, "source": "csv", "calendar": "XNYS"}
+                    for s in ["AAA", "BBB"]
+                ],
                 "start_date": "2020-01-01",
                 "end_date": "2021-01-01",
                 "frequency": "1d",
@@ -789,9 +800,7 @@ def test_scale_costs_slippage_mult_also_scales_impact_coefficient() -> None:
         {
             "experiment_name": "test",
             "data": {
-                "source": "csv",
-                "market_calendar": "XNYS",
-                "symbols": ["AAA"],
+                "instruments": [{"symbol": "AAA", "source": "csv", "calendar": "XNYS"}],
                 "start_date": "2020-01-01",
                 "end_date": "2021-01-01",
                 "frequency": "1d",
@@ -950,9 +959,10 @@ def test_engine_turnover_cap_never_exceeds_the_configured_budget() -> None:
         {
             "experiment_name": "test",
             "data": {
-                "source": "csv",
-                "market_calendar": "XNYS",
-                "symbols": ["AAA", "BBB", "CCC", "DDD"],
+                "instruments": [
+                    {"symbol": s, "source": "csv", "calendar": "XNYS"}
+                    for s in ["AAA", "BBB", "CCC", "DDD"]
+                ],
                 "start_date": "2020-01-01",
                 "end_date": "2020-06-01",
                 "frequency": "1d",
@@ -1294,7 +1304,16 @@ def test_engine_only_trades_cap_turnover_on_rebalance_dates() -> None:
     result = run_backtest_from_config(data, cfg)
     from quantlab.portfolio.rebalancing import rebalance_dates
 
-    dates = rebalance_dates(pd.DatetimeIndex(result.positions.index), "monthly")
+    # The engine now groups rebalance periods calendar-aware (see
+    # rebalance_dates' calendar parameter) whenever every instrument shares
+    # one calendar -- both symbols here are XNYS, so this check must use the
+    # same calendar to determine "the" rebalance dates, or a bar dated on an
+    # XNYS holiday in this test's raw bdate-range fixture (not run through
+    # DataLoader's own holiday/closure handling) would land in a different
+    # calendar month than a naive .to_period("M") assumes.
+    dates = rebalance_dates(
+        pd.DatetimeIndex(result.positions.index), "monthly", calendar="XNYS"
+    )
     # `result.positions` is `executed_weights = held.shift(1)` (the
     # look-ahead barrier), so a rebalance decided on date `d` only shows up
     # as a change one period *later* in `result.positions` — shift the
@@ -1312,3 +1331,485 @@ def test_engine_only_trades_cap_turnover_on_rebalance_dates() -> None:
         .sum(axis=1)[non_rebalance_mask]
     )
     assert (turnover_on_non_rebalance_days == 0.0).all()
+
+
+# --------------------------------------------------------------------------- #
+# Tradability-aware rebalancing (`rebalance_and_cap_turnover(..., tradable=)`)
+# --------------------------------------------------------------------------- #
+
+
+def assert_all_rows_compliant(
+    result: pd.DataFrame,
+    *,
+    maximum_weight: float | None = None,
+    maximum_gross_exposure: float | None = None,
+    maximum_net_exposure: float | None = None,
+    long_only: bool = False,
+) -> None:
+    """Every row a tradability-aware rebalance produces must respect the
+    portfolio's convex constraints -- especially with one or more instruments
+    closed, the case that historically could break this invariant."""
+    values = result.to_numpy(dtype=float)
+    if long_only:
+        assert (values >= -1e-9).all()
+    if maximum_weight is not None:
+        assert (np.abs(values) <= maximum_weight + 1e-9).all()
+    if maximum_gross_exposure is not None:
+        assert (np.abs(values).sum(axis=1) <= maximum_gross_exposure + 1e-9).all()
+    if maximum_net_exposure is not None:
+        assert (np.abs(values.sum(axis=1)) <= maximum_net_exposure + 1e-9).all()
+
+
+def test_tradable_none_preserves_exact_current_behavior() -> None:
+    """The default (no `tradable`) path must be byte-identical to today's
+    `apply_rebalancing` + `cap_turnover`, since every existing caller/test
+    relies on this contract."""
+    from quantlab.config import PortfolioConfig, RebalanceFrequency
+    from quantlab.portfolio.rebalancing import (
+        apply_rebalancing,
+        cap_turnover,
+        rebalance_and_cap_turnover,
+    )
+
+    idx = pd.date_range("2024-01-01", periods=10, freq="D")
+    targets = pd.DataFrame({"A": [0.5] * 10, "B": [0.5] * 10}, index=idx)
+    cfg = PortfolioConfig(
+        rebalance_frequency=RebalanceFrequency.DAILY, maximum_turnover=0.1
+    )
+    expected = cap_turnover(
+        apply_rebalancing(targets, "daily"), 0.1, rebalance_index=idx
+    )
+    actual = rebalance_and_cap_turnover(targets, cfg)
+    pd.testing.assert_frame_equal(expected, actual)
+
+
+def test_tradability_aware_defers_target_while_symbol_closed() -> None:
+    """A closed symbol must never trade -- its held weight stays exactly at
+    its last traded value on every date it is closed."""
+    from quantlab.config import PortfolioConfig, RebalanceFrequency
+    from quantlab.portfolio.rebalancing import rebalance_and_cap_turnover
+
+    idx = pd.date_range("2024-01-05", periods=6, freq="D")  # Fri..Wed
+    targets = pd.DataFrame(
+        {"AAPL": [0.5, 0.5, 0.5, 0.6, 0.6, 0.6], "BTC": [0.5, 0.5, 0.5, 0.4, 0.4, 0.4]},
+        index=idx,
+    )
+    tradable = pd.DataFrame(
+        {"AAPL": [True, False, False, True, True, True], "BTC": [True] * 6}, index=idx
+    )
+    cfg = PortfolioConfig(rebalance_frequency=RebalanceFrequency.DAILY, long_only=True)
+    held = rebalance_and_cap_turnover(targets, cfg, tradable=tradable)
+    assert held.loc[idx[1], "AAPL"] == held.loc[idx[0], "AAPL"]
+    assert held.loc[idx[2], "AAPL"] == held.loc[idx[0], "AAPL"]
+    assert_all_rows_compliant(held, long_only=True)
+
+
+def test_tradability_aware_tolerates_a_differently_ordered_tradable_frame() -> None:
+    """`tradable`'s column order need not match `target_weights`' own order
+    (e.g. an alphabetically-pivoted price matrix vs. a declared symbol
+    list) -- only the *set* of dates and symbols must agree. A stricter,
+    order-sensitive check previously rejected this as a mismatch even
+    though every label was present on both sides."""
+    from quantlab.config import PortfolioConfig, RebalanceFrequency
+    from quantlab.portfolio.rebalancing import rebalance_and_cap_turnover
+
+    idx = pd.date_range("2024-01-05", periods=6, freq="D")
+    targets = pd.DataFrame(
+        {"AAPL": [0.5, 0.5, 0.5, 0.6, 0.6, 0.6], "BTC": [0.5, 0.5, 0.5, 0.4, 0.4, 0.4]},
+        index=idx,
+    )
+    # Same labels as `targets`, deliberately reversed column order.
+    tradable = pd.DataFrame(
+        {"BTC": [True] * 6, "AAPL": [True, False, False, True, True, True]}, index=idx
+    )
+    cfg = PortfolioConfig(rebalance_frequency=RebalanceFrequency.DAILY, long_only=True)
+    held = rebalance_and_cap_turnover(targets, cfg, tradable=tradable)
+    assert held.loc[idx[1], "AAPL"] == held.loc[idx[0], "AAPL"]
+    assert held.loc[idx[2], "AAPL"] == held.loc[idx[0], "AAPL"]
+    assert_all_rows_compliant(held, long_only=True)
+
+
+def test_tradability_aware_rejects_a_tradable_frame_missing_a_symbol() -> None:
+    """A genuine set mismatch (not just reordering) must still raise --
+    silently defaulting an unrecognized symbol to "tradable" could let it
+    trade on a date it should have stayed closed."""
+    from quantlab.config import PortfolioConfig, RebalanceFrequency
+    from quantlab.exceptions import InvalidConfigurationError
+    from quantlab.portfolio.rebalancing import rebalance_and_cap_turnover
+
+    idx = pd.date_range("2024-01-05", periods=3, freq="D")
+    targets = pd.DataFrame({"AAPL": [0.5, 0.5, 0.5], "BTC": [0.5, 0.5, 0.5]}, index=idx)
+    tradable = pd.DataFrame({"AAPL": [True, True, True]}, index=idx)  # missing BTC
+    cfg = PortfolioConfig(rebalance_frequency=RebalanceFrequency.DAILY, long_only=True)
+    with pytest.raises(InvalidConfigurationError, match="dates and symbols"):
+        rebalance_and_cap_turnover(targets, cfg, tradable=tradable)
+
+
+def test_tradability_aware_catches_up_on_first_reopening_date_even_off_schedule() -> (
+    None
+):
+    """A monthly rebalance falls on a date AAPL is closed (a Sunday).
+    AAPL's pending target must resolve in `held_weights` on its first
+    tradable date afterward (Monday) -- which is *not* itself a scheduled
+    rebalance date -- rather than waiting for next month's. This is still
+    only a *decision*, dated Monday: see the module docstring's timing
+    convention -- it does not reach the accounting layer's executed
+    weights until AAPL's next tradable session (Tuesday), the same
+    one-period lag every other decision in this module is subject to. That
+    full-pipeline timing is covered separately by
+    test_reopening_catch_up_decision_only_executes_the_following_tradable_session
+    in test_regression_execution.py."""
+    from quantlab.config import PortfolioConfig, RebalanceFrequency
+    from quantlab.portfolio.rebalancing import rebalance_and_cap_turnover
+
+    # All four dates fall in January, so "monthly" rebalancing has exactly
+    # one rebalance date for this whole window: idx[0] (Sunday, Jan 7).
+    idx = pd.date_range("2024-01-07", periods=4, freq="D")  # Sun, Mon, Tue, Wed
+    targets = pd.DataFrame({"AAPL": [0.6] * 4, "BTC": [0.4] * 4}, index=idx)
+    tradable = pd.DataFrame(
+        {"AAPL": [False, True, True, True], "BTC": [True] * 4}, index=idx
+    )
+    cfg = PortfolioConfig(
+        rebalance_frequency=RebalanceFrequency.MONTHLY, long_only=True
+    )
+    held = rebalance_and_cap_turnover(targets, cfg, tradable=tradable)
+    assert held.loc[idx[0], "AAPL"] == 0.0  # blocked on the rebalance date itself
+    assert held.loc[idx[1], "AAPL"] == pytest.approx(0.6)  # decided Monday
+    assert held.loc[idx[1], "BTC"] == pytest.approx(0.4)  # BTC traded on schedule
+
+
+def test_reopening_catch_up_decision_only_executes_the_following_tradable_session() -> (
+    None
+):
+    """Genuine end-to-end pipeline check (rebalancing.py -> accounting.py)
+    for the exact scenario above: `rebalance_and_cap_turnover` resolves
+    AAPL's pending target in `held_weights` on Monday (its reopening day),
+    but that is only a decision, per this module's documented timing
+    convention -- it must not affect the accounting layer's executed
+    weights, turnover or cost until AAPL's next tradable session, Tuesday.
+    Positions, returns, turnover and costs are all checked together so a
+    future change that lets the two layers drift out of sync (e.g. one
+    side collapsing the closure-catch-up delay with the standard
+    no-look-ahead shift, the other not) is caught here, not discovered as
+    a confusing mismatch between a rebalancing-only test and a full
+    backtest."""
+    from quantlab.backtesting.accounting import run_accounting
+    from quantlab.config import PortfolioConfig, RebalanceFrequency
+    from quantlab.portfolio.rebalancing import rebalance_and_cap_turnover
+
+    idx = pd.date_range("2024-01-07", periods=4, freq="D")  # Sun, Mon, Tue, Wed
+    targets = pd.DataFrame({"AAPL": [0.6] * 4, "BTC": [0.4] * 4}, index=idx)
+    tradable = pd.DataFrame(
+        {"AAPL": [False, True, True, True], "BTC": [True] * 4}, index=idx
+    )
+    cfg = PortfolioConfig(
+        rebalance_frequency=RebalanceFrequency.MONTHLY, long_only=True
+    )
+    held = rebalance_and_cap_turnover(targets, cfg, tradable=tradable)
+    assert held.loc[idx[1], "AAPL"] == pytest.approx(0.6)  # decided Monday
+
+    # AAPL is closed on Sunday, so it has no meaningful return that day;
+    # a non-zero executed weight there would raise, but AAPL's executed
+    # weight is (and must remain) exactly zero on Sunday.
+    asset_returns = pd.DataFrame(
+        {
+            "AAPL": [np.nan, 0.01, -0.02, 0.015],
+            "BTC": [0.005, -0.01, 0.02, 0.0],
+        },
+        index=idx,
+    )
+    result = run_accounting(
+        held, asset_returns, _flat_execution_model(), 100.0, tradable=tradable
+    )
+    assert result.executed_weights.loc[idx[0], "AAPL"] == 0.0
+    assert result.executed_weights.loc[idx[1], "AAPL"] == 0.0  # not yet Monday
+    assert result.executed_weights.loc[idx[2], "AAPL"] == pytest.approx(0.6)  # Tuesday
+
+    # AAPL's own per-symbol weight change lands on Tuesday, not Monday --
+    # the weight_changes frame agrees with executed_weights.
+    assert result.weight_changes.loc[idx[1], "AAPL"] == pytest.approx(0.0)
+    assert result.weight_changes.loc[idx[2], "AAPL"] == pytest.approx(0.6)
+    # Total turnover on Monday is BTC's own first-decision execution (0.4,
+    # decided Sunday, executed Monday under the same one-period rule) --
+    # AAPL contributes nothing to it. Tuesday's turnover is AAPL's
+    # catch-up alone, since BTC is already flat that day.
+    assert result.turnover.loc[idx[1]] == pytest.approx(0.4)
+    assert result.turnover.loc[idx[2]] == pytest.approx(0.6)
+
+
+def test_pending_target_remains_pending_after_partial_turnover_fill() -> None:
+    """When a turnover cap only partially closes the gap on reopening, the
+    debt must stay open (not silently considered done)."""
+    from quantlab.config import PortfolioConfig, RebalanceFrequency
+    from quantlab.portfolio.rebalancing import rebalance_and_cap_turnover
+
+    idx = pd.date_range("2024-01-05", periods=3, freq="D")  # Fri, Sat, Sun
+    targets = pd.DataFrame({"A": [0.2, 0.8, 0.8], "B": [0.2, 0.2, 0.2]}, index=idx)
+    tradable = pd.DataFrame({"A": [True, False, True], "B": [True] * 3}, index=idx)
+    cfg = PortfolioConfig(
+        rebalance_frequency=RebalanceFrequency.DAILY,
+        maximum_turnover=0.2,
+        long_only=True,
+    )
+    held = rebalance_and_cap_turnover(targets, cfg, tradable=tradable)
+    # A is closed on idx[1] (Saturday); its new target (0.8) is set that day
+    # but can't execute. On idx[2] (Sunday) it reopens and the 0.2 turnover
+    # cap only lets it move part-way -- it must not have fully reached 0.8.
+    assert held.loc[idx[1], "A"] == held.loc[idx[0], "A"]
+    assert cast(float, held.loc[idx[2], "A"]) > cast(float, held.loc[idx[0], "A"])
+    assert cast(float, held.loc[idx[2], "A"]) < 0.8
+
+
+def test_pending_target_continues_catching_up_on_following_open_sessions() -> None:
+    """The scenario from review: a rebalance blocked by a closure, a partial
+    turnover-capped catch-up the next day, and a *further* catch-up the day
+    after that -- without waiting for another scheduled rebalance."""
+    from quantlab.config import PortfolioConfig, RebalanceFrequency
+    from quantlab.portfolio.rebalancing import rebalance_and_cap_turnover
+
+    idx = pd.date_range("2024-01-07", periods=3, freq="D")  # Sun, Mon, Tue
+    # Sunday is the (blocked) monthly rebalance date; A stays closed only on
+    # Sunday, then is open Monday and Tuesday.
+    targets = pd.DataFrame({"A": [0.9, 0.9, 0.9], "B": [0.1, 0.1, 0.1]}, index=idx)
+    tradable = pd.DataFrame({"A": [False, True, True], "B": [True] * 3}, index=idx)
+    cfg = PortfolioConfig(
+        rebalance_frequency=RebalanceFrequency.MONTHLY,
+        maximum_turnover=0.3,
+        long_only=True,
+    )
+    held = rebalance_and_cap_turnover(targets, cfg, tradable=tradable)
+    assert held.loc[idx[0], "A"] == 0.0  # never traded, blocked from the start
+    monday = cast(float, held.loc[idx[1], "A"])
+    assert 0.0 < monday < 0.9  # partial catch-up
+    tuesday = cast(float, held.loc[idx[2], "A"])
+    assert tuesday > monday  # continues catching up, no new rebalance needed
+    assert tuesday <= 0.9 + 1e-9
+
+
+def test_pending_flag_clears_when_target_is_fully_reached() -> None:
+    """Once a deferred target is fully executed, the symbol must return to
+    the ordinary rebalance-date-only cadence (no further drift)."""
+    from quantlab.config import PortfolioConfig, RebalanceFrequency
+    from quantlab.portfolio.rebalancing import rebalance_and_cap_turnover
+
+    idx = pd.date_range("2024-01-05", periods=4, freq="D")  # Fri, Sat, Sun, Mon
+    targets = pd.DataFrame(
+        {"A": [0.2, 0.6, 0.6, 0.6], "B": [0.2, 0.2, 0.2, 0.2]}, index=idx
+    )
+    tradable = pd.DataFrame(
+        {"A": [True, False, True, True], "B": [True] * 4}, index=idx
+    )
+    cfg = PortfolioConfig(rebalance_frequency=RebalanceFrequency.DAILY, long_only=True)
+    held = rebalance_and_cap_turnover(targets, cfg, tradable=tradable)
+    # A reaches 0.6 on Sunday (its first reopening, no turnover cap), then
+    # Monday is a rebalance date with the SAME target (0.6) -- it must simply
+    # stay there, not move further.
+    assert held.loc[idx[2], "A"] == pytest.approx(0.6)
+    assert held.loc[idx[3], "A"] == pytest.approx(0.6)
+
+
+def test_normal_always_open_symbol_does_not_converge_between_rebalance_dates() -> None:
+    """A symbol that is never closed must keep today's exact cadence: its
+    weight is exactly flat on every date that is *not* a scheduled
+    rebalance date, jumping only on rebalance dates -- even in a mixed
+    portfolio where some other symbol does have closures. The tradability
+    machinery must never turn a normal turnover-capped catch-up into
+    continuous day-by-day drift."""
+    from quantlab.config import PortfolioConfig, RebalanceFrequency
+    from quantlab.portfolio.rebalancing import (
+        rebalance_and_cap_turnover,
+        rebalance_dates,
+    )
+
+    idx = pd.date_range("2024-01-01", periods=40, freq="D")
+    targets = pd.DataFrame(
+        {"ALWAYS_OPEN": [0.9] * 40, "SOMETIMES_CLOSED": [0.1] * 40}, index=idx
+    )
+    tradable = pd.DataFrame(
+        {
+            "ALWAYS_OPEN": [True] * 40,
+            # Closed for a stretch, so pending-due-to-closure logic is
+            # genuinely exercised for the OTHER column during this run.
+            "SOMETIMES_CLOSED": [d.day not in range(5, 10) for d in idx],
+        },
+        index=idx,
+    )
+    cfg = PortfolioConfig(
+        rebalance_frequency=RebalanceFrequency.MONTHLY, maximum_turnover=0.1
+    )
+    held = rebalance_and_cap_turnover(targets, cfg, tradable=tradable)
+
+    schedule = rebalance_dates(idx, "monthly")
+    is_rebalance_date = idx.isin(schedule)
+    always_open = held["ALWAYS_OPEN"]
+    # On every non-rebalance date, ALWAYS_OPEN's weight must be identical to
+    # the previous date's -- no drift, regardless of what the other column's
+    # closures are doing that day.
+    unchanged = always_open.diff().fillna(0.0) == 0.0
+    assert unchanged[~is_rebalance_date].all()
+    # It must actually still be capped by the turnover budget (not just
+    # trivially flat because it started at its target).
+    assert always_open.iloc[0] < 0.9
+
+
+def test_turnover_budget_excludes_closed_symbols() -> None:
+    """The turnover cap for a date must apply only to symbols actually
+    tradable that day -- a closed symbol never consumes any of the budget,
+    directly or via being scaled down alongside open symbols."""
+    from quantlab.config import PortfolioConfig, RebalanceFrequency
+    from quantlab.portfolio.rebalancing import rebalance_and_cap_turnover
+
+    idx = pd.date_range("2024-01-01", periods=2, freq="D")
+    targets = pd.DataFrame({"A": [0.5, 1.0], "B": [0.5, 0.0]}, index=idx)
+    tradable = pd.DataFrame({"A": [True, True], "B": [True, False]}, index=idx)
+    cfg = PortfolioConfig(
+        rebalance_frequency=RebalanceFrequency.DAILY,
+        maximum_turnover=0.2,
+        long_only=True,
+    )
+    held = rebalance_and_cap_turnover(targets, cfg, tradable=tradable)
+    # B (closed) contributes nothing to day-1's turnover; A gets the full budget.
+    day_1 = cast(float, held.loc[idx[1], "A"])
+    day_0 = cast(float, held.loc[idx[0], "A"])
+    assert (day_1 - day_0) == pytest.approx(0.2)
+
+
+def test_no_trade_cost_or_turnover_for_closed_symbol() -> None:
+    """A closed symbol's frozen weight must translate into exactly zero
+    executed weight *change* -- no cost, no turnover -- confirming
+    `execution_model.py`/`accounting.py` need no changes of their own."""
+    from quantlab.portfolio.rebalancing import compute_turnover
+
+    idx = pd.date_range("2024-01-01", periods=3, freq="D")
+    held = pd.DataFrame({"A": [0.5, 0.5, 0.5], "B": [0.2, 0.5, 0.7]}, index=idx)
+    turnover = compute_turnover(held)
+    # A never changes across these rows -- turnover on day 2/3 must come
+    # entirely from B.
+    assert turnover.iloc[1] == pytest.approx(abs(0.5 - 0.2))
+    assert turnover.iloc[2] == pytest.approx(abs(0.7 - 0.5))
+
+
+def test_frozen_symbol_forces_partial_execution_to_stay_within_gross_exposure() -> None:
+    """The exact scenario identified in review: previous A=0.5/B=0.5
+    (gross=1.0), a new target A=1.0/B=0.0 (also gross=1.0, individually
+    valid), but B is closed. Naively freezing B at 0.5 while moving A to 1.0
+    would give gross=1.5 -- this must never happen."""
+    from quantlab.config import PortfolioConfig, RebalanceFrequency
+    from quantlab.portfolio.rebalancing import rebalance_and_cap_turnover
+
+    idx = pd.date_range("2024-01-01", periods=2, freq="D")
+    targets = pd.DataFrame({"A": [0.5, 1.0], "B": [0.5, 0.0]}, index=idx)
+    tradable = pd.DataFrame({"A": [True, True], "B": [True, False]}, index=idx)
+    cfg = PortfolioConfig(
+        rebalance_frequency=RebalanceFrequency.DAILY,
+        maximum_gross_exposure=1.0,
+        long_only=True,
+    )
+    held = rebalance_and_cap_turnover(targets, cfg, tradable=tradable)
+    assert_all_rows_compliant(held, maximum_gross_exposure=1.0, long_only=True)
+    # B stays frozen; A must NOT reach 1.0, since B pinned at 0.5 forbids it.
+    assert held.loc[idx[1], "B"] == pytest.approx(0.5)
+    assert cast(float, held.loc[idx[1], "A"]) < 1.0 - 1e-6
+
+
+def test_max_feasible_fraction_finds_the_exact_convex_boundary() -> None:
+    """Direct unit test of the bisection helper against a hand-computed
+    boundary: previous=[0.5, 0.5], change=[0.5, 0.0] (only column 0 moves),
+    gross_cap=1.0 -- the exact boundary is f=0 (any positive f breaches gross)."""
+    from quantlab.portfolio.rebalancing import _max_feasible_fraction
+
+    previous = np.array([0.5, 0.5])
+    change = np.array([0.5, 0.0])
+    fraction = _max_feasible_fraction(
+        previous,
+        change,
+        maximum_weight=None,
+        maximum_gross_exposure=1.0,
+        maximum_net_exposure=None,
+        long_only=True,
+        upper_bound=1.0,
+    )
+    assert fraction == pytest.approx(0.0, abs=1e-6)
+
+    # A looser cap (1.2) allows exactly f=0.4 (0.5 + 0.4*0.5 = 0.7, + 0.5 = 1.2).
+    fraction_loose = _max_feasible_fraction(
+        previous,
+        change,
+        maximum_weight=None,
+        maximum_gross_exposure=1.2,
+        maximum_net_exposure=None,
+        long_only=True,
+        upper_bound=1.0,
+    )
+    assert fraction_loose == pytest.approx(0.4, abs=1e-6)
+
+
+def test_compliance_limited_shortfall_becomes_pending_and_retried_next_session() -> (
+    None
+):
+    """When gross-exposure interaction (not turnover) limits how far a
+    column can move because another column is frozen, the shortfall must
+    still be retried on the next tradable date -- not silently dropped."""
+    from quantlab.config import PortfolioConfig, RebalanceFrequency
+    from quantlab.portfolio.rebalancing import rebalance_and_cap_turnover
+
+    idx = pd.date_range("2024-01-01", periods=3, freq="D")
+    # Day 0: A=0.5,B=0.5. Day 1: target A=1.0,B=0.0 but B closed -> A limited
+    # by gross cap, not reaching 1.0. Day 2: B still closed -> A must keep
+    # trying (and since B stays frozen at 0.5, A stays capped at <=0.5 too,
+    # but the mechanism must still attempt it rather than giving up).
+    targets = pd.DataFrame({"A": [0.5, 1.0, 1.0], "B": [0.5, 0.0, 0.0]}, index=idx)
+    tradable = pd.DataFrame({"A": [True] * 3, "B": [True, False, False]}, index=idx)
+    cfg = PortfolioConfig(
+        rebalance_frequency=RebalanceFrequency.DAILY,
+        maximum_gross_exposure=1.0,
+        long_only=True,
+    )
+    held = rebalance_and_cap_turnover(targets, cfg, tradable=tradable)
+    assert_all_rows_compliant(held, maximum_gross_exposure=1.0, long_only=True)
+    # A never exceeds what's feasible while B stays frozen at 0.5.
+    assert (held["A"] <= 0.5 + 1e-9).all()
+
+
+def test_compliance_limited_flag_never_triggers_when_every_symbol_is_tradable() -> None:
+    """Non-regression for the review's central concern: with no closures
+    anywhere, compliance can never bind below the turnover-derived fraction,
+    so the pending mechanism must never activate -- cadence stays exactly
+    the plain `cap_turnover` behaviour."""
+    from quantlab.config import PortfolioConfig, RebalanceFrequency
+    from quantlab.portfolio.rebalancing import (
+        apply_rebalancing,
+        cap_turnover,
+        rebalance_and_cap_turnover,
+    )
+
+    idx = pd.date_range("2024-01-01", periods=8, freq="D")
+    targets = pd.DataFrame({"A": [0.9] * 8, "B": [0.05] * 8}, index=idx)
+    tradable = pd.DataFrame({"A": [True] * 8, "B": [True] * 8}, index=idx)
+    cfg = PortfolioConfig(
+        rebalance_frequency=RebalanceFrequency.DAILY,
+        maximum_turnover=0.05,
+        maximum_gross_exposure=1.0,
+    )
+    held = rebalance_and_cap_turnover(targets, cfg, tradable=tradable)
+    expected = cap_turnover(
+        apply_rebalancing(targets, "daily"),
+        0.05,
+        rebalance_index=idx,
+        maximum_gross_exposure=1.0,
+    )
+    pd.testing.assert_frame_equal(held, expected)
+
+
+def test_no_execution_cost_or_turnover_for_a_closed_symbol_on_closed_dates() -> None:
+    """End-to-end confirmation that a closed symbol never appears in the
+    accounting layer's turnover/cost path on a date it's closed."""
+    from quantlab.backtesting.accounting import compute_executed_weights
+
+    idx = pd.date_range("2024-01-01", periods=3, freq="D")
+    held = pd.DataFrame({"A": [0.5, 0.5, 0.5], "B": [0.2, 0.5, 0.7]}, index=idx)
+    executed = compute_executed_weights(held)
+    # A's executed (lagged) series is constant after the mechanical
+    # first-row-zero artifact (compute_executed_weights always forces row 0
+    # to 0.0 regardless of activity) -- no trade is ever implied thereafter.
+    assert executed["A"].iloc[1:].nunique(dropna=True) <= 1

@@ -108,7 +108,10 @@ def test_report_command_skips_reinjection_when_config_differs(tmp_path: Path) ->
         {
             "experiment_name": "wf_experiment",
             "data": {
-                "symbols": ["C", "D"],  # different universe
+                "instruments": [
+                    {"symbol": "C", "source": "csv", "calendar": "XNYS"},
+                    {"symbol": "D", "source": "csv", "calendar": "XNYS"},
+                ],  # different universe
                 "start_date": "2020-01-01",
                 "end_date": "2021-01-01",
             },
@@ -124,10 +127,14 @@ def test_report_command_skips_reinjection_when_config_differs(tmp_path: Path) ->
     assert "walk_forward_oos_metrics" not in fake_result.metadata
 
 
-def test_report_command_missing_checksums_does_not_block_reuse(
+def test_report_command_missing_checksums_blocks_reuse(
     tmp_path: Path,
 ) -> None:
-    """Missing checksums alone are not evidence of an artefact mismatch."""
+    """Missing checksums can't verify artefact integrity, so they must not
+    be treated as a free pass to reuse anyway -- checksums are recorded
+    unconditionally at every save (see BacktestResult.save()), so their
+    absence here is itself a red flag (an incomplete or tampered
+    metadata.json), not proof of "nothing to check"."""
     import json as _json
 
     from quantlab.backtesting.result import load_previous_walk_forward_robustness
@@ -147,11 +154,56 @@ def test_report_command_missing_checksums_does_not_block_reuse(
         exp_dir,
         fake_result,  # type: ignore[arg-type]
     )
-    assert robustness is not None
-    assert fake_result.metadata["walk_forward_oos_metrics"] == {
-        "sharpe_ratio": 0.42,
-        "cagr": 0.05,
-    }
+    assert robustness is None
+    assert "walk_forward_oos_metrics" not in fake_result.metadata
+
+
+def test_report_command_refuses_reuse_for_malformed_metadata_json(
+    tmp_path: Path,
+) -> None:
+    """A hand-edited or partially-written metadata.json must be refused
+    gracefully, the same as a missing file or a mismatched hash -- not
+    crash reuse detection with a raw json.JSONDecodeError."""
+    from quantlab.backtesting.result import load_previous_walk_forward_robustness
+
+    exp_dir = tmp_path / "wf_experiment"
+    exp_dir.mkdir()
+    config = _wf_experiment_config()
+    _write_wf_artifacts(exp_dir, config)
+
+    (exp_dir / "metadata.json").write_text("{not valid json", encoding="utf-8")
+
+    fake_result = _FakeResult(config)
+    robustness = load_previous_walk_forward_robustness(
+        exp_dir,
+        fake_result,  # type: ignore[arg-type]
+    )
+    assert robustness is None
+    assert "walk_forward_oos_metrics" not in fake_result.metadata
+
+
+def test_load_previous_robustness_artifacts_refuses_reuse_for_malformed_metadata_json(
+    tmp_path: Path,
+) -> None:
+    """Same guarantee as load_previous_walk_forward_robustness, for the
+    holdout/plain-backtest robustness-artefact reuse path: a malformed
+    metadata.json must be refused gracefully, not crash with a raw
+    json.JSONDecodeError."""
+    from quantlab.backtesting.result import load_previous_robustness_artifacts
+
+    exp_dir = tmp_path / "wf_experiment"
+    exp_dir.mkdir()
+    config = _wf_experiment_config()
+    _write_wf_artifacts(exp_dir, config)
+
+    (exp_dir / "metadata.json").write_text("{not valid json", encoding="utf-8")
+
+    fake_result = _FakeResult(config)
+    artifacts = load_previous_robustness_artifacts(
+        exp_dir,
+        fake_result,  # type: ignore[arg-type]
+    )
+    assert artifacts == {}
 
 
 def test_config_dir_prefers_a_package_bundled_copy_when_present(
@@ -222,11 +274,12 @@ def test_cli_shipped_config_resolves_a_bundled_config_by_name(
     (bundled_dir / "demo_offline.yaml").write_text(
         "experiment_name: bundled_copy\n"
         "data:\n"
-        "  source: csv\n"
-        "  symbols: [AAA]\n"
+        "  instruments:\n"
+        "    - symbol: AAA\n"
+        "      source: csv\n"
+        "      calendar: XNYS\n"
         "  start_date: '2020-01-01'\n"
         "  end_date: '2021-01-01'\n"
-        "  market_calendar: XNYS\n"
         "strategy:\n"
         "  name: buy_and_hold\n",
         encoding="utf-8",
@@ -389,6 +442,13 @@ def test_cli_walk_forward_delegates_all_validation_csvs_to_result_save(
         folds=[object()],
         oos_returns=returns,
         oos_equity=equity,
+        # None here (not a full BacktestResult): exercises cli.py's
+        # documented fallback to oos_metrics() when oos_result is absent,
+        # same as this test's own intent -- it isn't testing OOS-metrics
+        # completeness (see test_saved_metadata_records_an_explicit_
+        # result_scope / the walk-forward metrics-reuse tests for that),
+        # only that the CLI delegates validation CSVs to result.save().
+        oos_result=None,
         summary_table=lambda: summary,
         oos_metrics=lambda periods_per_year, risk_free_rate: {
             "sharpe_ratio": 0.42,
@@ -469,16 +529,10 @@ def test_download_data_wrapper_reports_source_aware_persistence(
 ) -> None:
     import sys
 
-    from quantlab.config import DataSourceName
-
     wrapper: Any = _import_script("download_data")
     config_path = tmp_path / "experiment.yaml"
     config_path.write_text("unused: true\n", encoding="utf-8")
-    config = type(
-        "Config",
-        (),
-        {"data": type("Data", (), {"source": DataSourceName(source)})()},
-    )()
+    config = type("Config", (), {"data_source": source})()
     frame = pd.DataFrame({"symbol": ["AAA", "AAA"], "close": [1.0, 2.0]})
 
     monkeypatch.setattr(
@@ -582,6 +636,28 @@ def test_code_hash_changes_when_quantlab_source_changes(
     assert original != mutated
 
 
+def test_generator_hash_changes_when_generate_report_script_changes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """scripts/generate_report.py lives outside src/quantlab/ entirely, so
+    _hash_source_tree's own rglob scan can never reach it -- but it makes
+    the exact same walk-forward save/reuse decision as the CLI
+    (save_with_walk_forward_reuse), so its own content must still be
+    covered by _generator_hash(), the hash everything gating artifact
+    reuse is keyed on."""
+    from quantlab.backtesting import engine
+
+    fake_script = tmp_path / "generate_report.py"
+    fake_script.write_text("# v1\n", encoding="utf-8")
+    monkeypatch.setattr(engine, "_GENERATOR_SCRIPT", fake_script)
+
+    original = engine._generator_hash()
+    fake_script.write_text("# v2 -- edited\n", encoding="utf-8")
+    mutated = engine._generator_hash()
+
+    assert original != mutated
+
+
 def test_dependency_versions_tracks_statsmodels() -> None:
     from quantlab.backtesting.runner import run_backtest_from_config
 
@@ -590,6 +666,19 @@ def test_dependency_versions_tracks_statsmodels() -> None:
     versions = result.metadata["dependency_versions"]
     assert isinstance(versions, dict)
     assert "statsmodels" in versions
+
+
+def test_dependency_versions_tracks_pandas_market_calendars() -> None:
+    """pandas-market-calendars directly drives calendar/session/settlement
+    results (holidays, sessions, closures) -- a version bump can change
+    backtest output the same way a pandas/numpy bump can, so it must be
+    part of provenance too, not silently missing from it."""
+    from quantlab.backtesting.runner import run_backtest_from_config
+
+    data, cfg = _holdout_config()
+    result = run_backtest_from_config(data, cfg)
+    versions = result.metadata["dependency_versions"]
+    assert "pandas-market-calendars" in versions
 
 
 def test_git_dirty_state_is_recorded_alongside_commit_hash(
@@ -1047,9 +1136,9 @@ def test_run_backtest_script_flags_save_warnings_instead_of_plain_success(
     config = {
         "experiment_name": "run_backtest_script_save_warning_test",
         "data": {
-            "source": "csv",
-            "market_calendar": "XNYS",
-            "symbols": ["AAA"],
+            "instruments": [
+                {"symbol": "AAA", "source": "csv", "calendar": "XNYS"},
+            ],
             "start_date": "2020-01-01",
             "end_date": "2020-03-01",
         },
@@ -1101,9 +1190,9 @@ def test_generate_report_script_flags_save_warnings_instead_of_plain_success(
     config = {
         "experiment_name": "generate_report_script_save_warning_test",
         "data": {
-            "source": "csv",
-            "market_calendar": "XNYS",
-            "symbols": ["AAA"],
+            "instruments": [
+                {"symbol": "AAA", "source": "csv", "calendar": "XNYS"},
+            ],
             "start_date": "2020-01-01",
             "end_date": "2020-03-01",
         },
@@ -1153,9 +1242,9 @@ def test_saved_metrics_json_has_no_nan_or_infinity_tokens(
         {
             "experiment_name": "nan_json_test",
             "data": {
-                "source": "csv",
-                "market_calendar": "XNYS",
-                "symbols": ["AAA"],
+                "instruments": [
+                    {"symbol": "AAA", "source": "csv", "calendar": "XNYS"},
+                ],
                 "start_date": "2020-01-01",
                 "end_date": "2020-01-30",
             },
@@ -1193,9 +1282,9 @@ def test_cumulative_costs_chart_actually_appears_in_html_report() -> None:
         {
             "experiment_name": "cumulative_costs_html_test",
             "data": {
-                "source": "csv",
-                "market_calendar": "XNYS",
-                "symbols": ["AAA"],
+                "instruments": [
+                    {"symbol": "AAA", "source": "csv", "calendar": "XNYS"},
+                ],
                 "start_date": "2020-01-01",
                 "end_date": "2020-04-30",
             },
@@ -1220,9 +1309,9 @@ def test_save_warnings_surface_a_failed_report_chart(
         {
             "experiment_name": "chart_failure_test",
             "data": {
-                "source": "csv",
-                "market_calendar": "XNYS",
-                "symbols": ["AAA"],
+                "instruments": [
+                    {"symbol": "AAA", "source": "csv", "calendar": "XNYS"},
+                ],
                 "start_date": "2020-01-01",
                 "end_date": "2020-04-30",
             },
@@ -1243,3 +1332,43 @@ def test_save_warnings_surface_a_failed_report_chart(
     )
     html_text = (out / "report.html").read_text(encoding="utf-8")
     assert "drawdown" in html_text.lower()  # the other charts still rendered
+
+
+def test_saved_metadata_records_an_explicit_result_scope(tmp_path: Path) -> None:
+    """Different CLI commands in walk-forward mode save fundamentally
+    different result objects to the same experiment directory (a
+    full-sample result with OOS evidence only attached as metadata, vs the
+    OOS-stitched result itself) -- metadata.json must say explicitly which
+    one `self.metrics` is, so a bundle read later isn't ambiguous about
+    which methodology produced it."""
+    from quantlab.backtesting.runner import run_backtest_from_config
+
+    data = make_ohlcv(
+        "AAA", geometric_series(120, mu=0.0005, sigma=0.01, s0=100.0, seed=1)
+    )
+    cfg = ExperimentConfig.from_dict(
+        {
+            "experiment_name": "result_scope_test",
+            "data": {
+                "instruments": [
+                    {"symbol": "AAA", "source": "csv", "calendar": "XNYS"},
+                ],
+                "start_date": "2020-01-01",
+                "end_date": "2020-04-30",
+            },
+            "strategy": {"name": "buy_and_hold"},
+        }
+    )
+
+    full_sample = run_backtest_from_config(data, cfg)
+    out = full_sample.save(tmp_path / "full_sample")
+    metadata = json.loads((out / "metadata.json").read_text(encoding="utf-8"))
+    assert metadata["result_scope"] == "full_sample"
+
+    # Simulate a genuine wf.oos_result (see _attach_walk_forward_evidence /
+    # walk_forward.py's own construction): its metrics ARE the OOS series.
+    oos_scoped = run_backtest_from_config(data, cfg)
+    oos_scoped.metadata["walk_forward_oos_metrics"] = dict(oos_scoped.metrics)
+    out = oos_scoped.save(tmp_path / "oos_scoped")
+    metadata = json.loads((out / "metadata.json").read_text(encoding="utf-8"))
+    assert metadata["result_scope"] == "out-of-sample (walk-forward test folds only)"

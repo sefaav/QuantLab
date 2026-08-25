@@ -7,6 +7,13 @@ repos:
       - id: trailing-whitespace
       - id: end-of-file-fixer
       - id: check-yaml
+        # mkdocs.yml uses MkDocs' own YAML tags (e.g. !!python/name:... for
+        # markdown extension config) that a plain, generic YAML loader
+        # can't construct -- check-yaml's default safe_load rejects it even
+        # though the file is valid MkDocs config; `mkdocs build --strict`
+        # already validates it with the loader that actually understands
+        # those tags.
+        exclude: ^mkdocs\.yml$
       - id: check-toml
       - id: check-added-large-files
         args: ["--maxkb=1024"]
@@ -15,7 +22,7 @@ repos:
 
   - repo: https://github.com/astral-sh/ruff-pre-commit
     # Keep aligned with the Ruff version pinned in uv.lock and used by CI.
-    rev: v0.16.1
+    rev: v0.16.2
     hooks:
       - id: ruff
         args: ["--fix"]

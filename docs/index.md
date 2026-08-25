@@ -4,9 +4,11 @@
 
 QuantLab turns a financial hypothesis into a reproducible, bias-aware experiment:
 download data, clean and validate it, build features and signals, run a
-look-ahead-safe vectorised backtest with realistic costs, measure performance
-and risk, validate out-of-sample, and generate an honest research report — all
-driven by one YAML config.
+vectorised backtest — with a delayed-execution barrier that prevents common
+look-ahead leakage — with realistic costs, measure performance and risk,
+validate out-of-sample, and generate an honest research report — all driven
+by one YAML config. Custom strategies remain responsible for their own causal
+feature and signal construction.
 
 > This project is for **educational and research purposes only**. It is not
 > investment advice, and historical performance does not guarantee future
