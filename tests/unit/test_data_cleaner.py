@@ -6,6 +6,7 @@ import numpy as np
 import pandas as pd
 import pytest
 from tests.conftest import make_ohlcv
+from tests.regression_helpers import _UniformCalendar
 
 from quantlab.config import MissingValuePolicy
 from quantlab.constants import CLOSE, HIGH, LOW, SYMBOL, TIMESTAMP, VOLUME
@@ -122,14 +123,18 @@ def test_validator_detects_duplicates_strict() -> None:
     data = _simple("SPY")
     dup = pd.concat([data, data.iloc[[0]]], ignore_index=True)
     with pytest.raises(DataValidationError, match="duplicate"):
-        DataValidator().validate(dup, strict=True)
+        DataValidator(symbol_calendars=_UniformCalendar("XNYS")).validate(
+            dup, strict=True
+        )
 
 
 def test_validator_detects_negative_price_strict() -> None:
     data = _simple()
     data.loc[1, CLOSE] = -1.0
     with pytest.raises(DataValidationError, match="non-positive"):
-        DataValidator().validate(data, strict=True)
+        DataValidator(symbol_calendars=_UniformCalendar("XNYS")).validate(
+            data, strict=True
+        )
 
 
 def test_validator_detects_high_below_low() -> None:
@@ -137,7 +142,9 @@ def test_validator_detects_high_below_low() -> None:
     # Force an impossible bar: high < low.
     data.loc[2, HIGH] = 50.0
     data.loc[2, LOW] = 200.0
-    report = DataValidator().validate(data, strict=False)
+    report = DataValidator(symbol_calendars=_UniformCalendar("XNYS")).validate(
+        data, strict=False
+    )
     assert report.invalid_price_count > 0
     assert any("OHLC" in w for w in report.warnings)
 
@@ -145,14 +152,18 @@ def test_validator_detects_high_below_low() -> None:
 def test_validator_report_counts_missing_values() -> None:
     data = _simple()
     data.loc[1, CLOSE] = np.nan
-    report = DataValidator().validate(data, strict=False)
+    report = DataValidator(symbol_calendars=_UniformCalendar("XNYS")).validate(
+        data, strict=False
+    )
     assert report.missing_value_count.get(CLOSE) == 1
     assert report.row_count == len(data)
 
 
 def test_validator_flags_symbol_absent_via_empty() -> None:
     empty = _simple().iloc[0:0]
-    report = DataValidator().validate(empty, strict=False)
+    report = DataValidator(symbol_calendars=_UniformCalendar("XNYS")).validate(
+        empty, strict=False
+    )
     assert any("empty" in w.lower() for w in report.warnings)
 
 

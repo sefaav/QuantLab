@@ -48,7 +48,8 @@ class MarketDataSource(ABC):
     be in the canonical long OHLCV schema.
     """
 
-    #: Human-readable source identifier, matched against ``config.data.source``.
+    #: Human-readable source identifier, matched against an
+    #: :class:`~quantlab.config.InstrumentConfig`'s ``source``.
     name: str = "base"
 
     @abstractmethod
@@ -59,17 +60,20 @@ class MarketDataSource(ABC):
         end: date,
         frequency: str,
         *,
-        is_247_market: bool = False,
+        calendar: str = "XNYS",
     ) -> pd.DataFrame:
         """Download raw data and return it in canonical long OHLCV format.
 
         Args:
-            symbols: Tickers to download.
+            symbols: Tickers to download. The loader always calls this with
+                exactly one symbol; every symbol in a single call shares
+                ``calendar``.
             start: Inclusive start date.
             end: Inclusive end date.
             frequency: Bar frequency, e.g. ``"1d"``.
-            is_247_market: Whether bar settlement follows a continuous
-                calendar instead of exchange sessions.
+            calendar: Calendar bar settlement is measured against —
+                ``"24/7"`` for a continuous market, or a named exchange
+                calendar.
 
         Returns:
             A DataFrame with the columns of

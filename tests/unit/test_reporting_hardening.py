@@ -34,9 +34,9 @@ def _config(
         {
             "experiment_name": "reporting_hardening",
             "data": {
-                "source": "csv",
-                "market_calendar": "XNYS",
-                "symbols": ["AAA"],
+                "instruments": [
+                    {"symbol": "AAA", "source": "csv", "calendar": "XNYS"},
+                ],
                 "start_date": "2019-01-01",
                 "end_date": "2021-12-31",
                 "use_bundled_demo_data": demo_fallback,
@@ -146,6 +146,61 @@ def test_robustness_tables_format_percentage_columns() -> None:
     assert "0.42" in rendered
 
 
+def _sensitivity_frame() -> pd.DataFrame:
+    return pd.DataFrame(
+        {
+            "lookback_period": [60, 60, 120, 120],
+            "top_fraction": [0.3, 0.5, 0.3, 0.5],
+            "sharpe": [0.5, 0.8, 0.2, 0.6],
+            "cagr": [0.1, 0.15, 0.05, 0.12],
+            "max_drawdown": [-0.1, -0.12, -0.2, -0.15],
+            "turnover": [1.0, 1.0, 1.0, 1.0],
+            "num_trades": [10, 10, 10, 10],
+            "status": ["ok"] * 4,
+            "error": [None] * 4,
+        }
+    )
+
+
+def test_sensitivity_heatmap_chart_infers_swept_parameters() -> None:
+    """The two swept-parameter columns are whatever is left after excluding
+    the fixed metric/status columns every sensitivity table carries."""
+    figure = charts.sensitivity_heatmap_chart(_sensitivity_frame())
+    try:
+        assert figure.axes[0].get_xlabel() == "lookback_period"
+        assert figure.axes[0].get_ylabel() == "top_fraction"
+    finally:
+        figure.clear()
+
+
+def test_sensitivity_heatmap_chart_rejects_ambiguous_columns() -> None:
+    sensitivity = pd.DataFrame(
+        {"a": [1], "b": [2], "c": [3], "sharpe": [0.5], "status": ["ok"]}
+    )
+    with pytest.raises(ValueError, match="exactly two"):
+        charts.sensitivity_heatmap_chart(sensitivity)
+
+
+def test_render_robustness_embeds_sensitivity_heatmap() -> None:
+    rendered = _render_robustness({"sensitivity": _sensitivity_frame()})
+    assert '<img src="data:image/png;base64,' in rendered
+    assert "Parameter sensitivity heatmap" in rendered
+
+
+def test_render_robustness_sensitivity_heatmap_failure_does_not_crash_report() -> None:
+    """A malformed sensitivity table (here, only one swept-parameter column)
+    must not take down the whole report — same resilience as the other
+    charts (see report_figures)."""
+    malformed = pd.DataFrame(
+        {"lookback_period": [60], "sharpe": [0.5], "status": ["ok"]}
+    )
+    warnings: list[str] = []
+    rendered = _render_robustness({"sensitivity": malformed}, warnings)
+    assert "Chart unavailable" in rendered
+    assert warnings
+    assert "60" in rendered  # the raw table must still render
+
+
 def test_methodology_describes_volume_slippage_and_constraints() -> None:
     result: Any = SimpleNamespace(
         config=_config(volume_slippage=True),
@@ -220,6 +275,61 @@ def test_html_report_shows_chart_placeholders() -> None:
     rendered = _result().to_html(figures={})
     assert "Chart unavailable:" in rendered
     assert "Full-sample headline metrics" in rendered
+
+
+def test_html_report_footer_claims_reproducibility_when_config_matches() -> None:
+    """A run built entirely through the config-driven factory (the ordinary
+    CLI/dashboard path) always has config_yaml_reflects_strategy/allocator
+    True, so its footer may state the bundle is reproducible from
+    config.yaml."""
+    rendered = _result().to_html(figures={})
+    assert "reproducible from config.yaml" in rendered
+
+
+def test_html_report_footer_is_conditional_when_config_does_not_reflect_the_run() -> (
+    None
+):
+    """A direct-API run (docs/api.md) whose actual strategy object diverges
+    from config.yaml must not have its report footer unconditionally claim
+    the bundle is reproducible from config.yaml (see
+    BacktestEngine._build_metadata's config_yaml_reflects_strategy)."""
+    from quantlab.backtesting.engine import BacktestEngine
+    from quantlab.execution.execution_model import ExecutionModel
+    from quantlab.portfolio.allocator import EqualWeightAllocator
+    from quantlab.strategies.mean_reversion import MeanReversionStrategy
+
+    data = make_ohlcv(
+        "AAA",
+        geometric_series(180, mu=0.0004, sigma=0.01, s0=100.0, seed=7),
+        start="2020-01-01",
+    )
+    cfg = ExperimentConfig.from_dict(
+        {
+            "experiment_name": "footer_mismatch",
+            "data": {
+                "instruments": [{"symbol": "AAA", "source": "csv", "calendar": "XNYS"}],
+                "start_date": "2020-01-01",
+                "end_date": "2020-06-30",
+            },
+            "strategy": {
+                "name": "mean_reversion",
+                "parameters": {"lookback_period": 252},
+            },
+            "portfolio": {"allocator": "equal_weight"},
+            "backtest": {"initial_capital": 100_000},
+        }
+    )
+    result = BacktestEngine().run(
+        data,
+        MeanReversionStrategy(lookback_period=10),
+        EqualWeightAllocator(),
+        ExecutionModel.from_config(cfg.execution),
+        cfg,
+    )
+    assert result.metadata["config_yaml_reflects_strategy"] is False
+    rendered = result.to_html(figures={})
+    assert "reproducible from config.yaml given the same code" not in rendered
+    assert "config.yaml in this bundle may not exactly reflect" in rendered
 
 
 def test_data_quality_section_includes_counts_without_warnings() -> None:

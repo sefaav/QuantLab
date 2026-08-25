@@ -92,9 +92,11 @@ class HoldoutReport:
                     self.validation_end,
                 )
             )
-        blocks.append(
-            ("Test (out-of-sample)", self.test_metrics, self.test_start, self.test_end)
-        )
+        # Labeled plainly "Test", not "out-of-sample": whether this block is
+        # genuinely OOS depends on parameters having been fixed *before*
+        # looking at it, which is a property of the user's own workflow,
+        # not something this table can verify (see the module docstring).
+        blocks.append(("Test", self.test_metrics, self.test_start, self.test_end))
         return pd.DataFrame(
             [
                 {

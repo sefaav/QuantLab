@@ -20,6 +20,7 @@ from quantlab.execution.execution_model import ExecutionCosts, ExecutionModel
 from quantlab.execution.orders import executed_weights as compute_executed_weights
 from quantlab.execution.orders import weight_changes as compute_weight_changes
 from quantlab.logging_config import get_logger
+from quantlab.risk.exposure import average_gross_exposure, average_net_exposure
 
 logger = get_logger(__name__)
 
@@ -46,6 +47,26 @@ class AccountingResult:
     # Net-equity estimate used to size volume-dependent slippage. Reuse it in
     # the trade log to keep per-fill and aggregate costs consistent.
     equity_for_costs: pd.Series
+
+
+def portfolio_metrics_from_accounting(
+    accounting: AccountingResult, periods_per_year: int
+) -> dict[str, float]:
+    """Exposure and turnover metrics shared by every accounting consumer.
+
+    Shared by :class:`~quantlab.backtesting.engine.BacktestEngine` and
+    :class:`~quantlab.validation.walk_forward.WalkForwardValidator` so a
+    single-backtest ``BacktestResult`` and a stitched walk-forward
+    out-of-sample ``BacktestResult`` report these the same way.
+    """
+    turnover = accounting.turnover
+    return {
+        "annual_turnover": float(turnover.mean() * periods_per_year)
+        if len(turnover)
+        else 0.0,
+        "average_gross_exposure": average_gross_exposure(accounting.executed_weights),
+        "average_net_exposure": average_net_exposure(accounting.executed_weights),
+    }
 
 
 def compute_asset_returns(prices: pd.DataFrame) -> pd.DataFrame:
@@ -205,6 +226,8 @@ def run_accounting(
     asset_returns: pd.DataFrame,
     execution_model: ExecutionModel,
     initial_capital: float,
+    *,
+    tradable: pd.DataFrame | None = None,
 ) -> AccountingResult:
     """Run the vectorised accounting loop.
 
@@ -214,6 +237,14 @@ def run_accounting(
         asset_returns: Per-asset simple returns aligned to ``held_weights``.
         execution_model: Cost model.
         initial_capital: Starting equity.
+        tradable: When given, the mandatory look-ahead-barrier shift becomes
+            per-symbol tradability-aware (see
+            :func:`quantlab.execution.orders.executed_weights`): a decision
+            made right before a closure executes on that symbol's next real
+            tradable row, not the raw next row, so it is never misattributed
+            as trading during the closure itself (e.g. a weekend row that
+            only exists because another, always-open instrument shares the
+            same combined index).
 
     Returns:
         A populated :class:`AccountingResult`.
@@ -258,7 +289,29 @@ def run_accounting(
             f"{list(missing_symbols)[:5]})."
         )
 
+    if tradable is not None:
+        # Exact same *set* of dates and symbols, no missing values -- unlike
+        # asset_returns (which may legitimately come from a wider price
+        # matrix), tradable is only ever built internally from held_weights'
+        # own (date, symbol) grid, never user input. A mismatched set always
+        # means an upstream wiring bug, so it must raise loudly rather than
+        # silently default an unrecognized cell to "tradable" and risk
+        # trading a symbol that should have stayed closed. Axis *order*
+        # alone is not a mismatch: a caller may build tradable from a
+        # declared symbol list while held_weights comes from an
+        # alphabetically-pivoted price matrix.
+        if set(tradable.index) != set(held_weights.index) or set(
+            tradable.columns
+        ) != set(held_weights.columns):
+            raise BacktestError(
+                "tradable must have the same dates and symbols as held_weights."
+            )
+        if tradable.isna().to_numpy().any():
+            raise BacktestError("tradable must not contain missing values.")
+
     held = held_weights.sort_index()
+    if tradable is not None:
+        tradable = tradable.reindex(index=held.index, columns=held.columns)
     asset_returns = asset_returns.reindex_like(held)
     try:
         return_values = asset_returns.to_numpy(dtype=float)
@@ -272,8 +325,10 @@ def run_accounting(
             "asset_returns must not contain simple returns below -1.0 (-100%)."
         )
 
-    # Shift weights so period-t return uses weights chosen at t-1.
-    executed = compute_executed_weights(held)
+    # Shift weights so period-t return uses weights chosen at t-1. `tradable`
+    # was already validated above to share held_weights' exact axes and
+    # sorted alongside it, so it needs no further alignment here.
+    executed = compute_executed_weights(held, tradable=tradable)
 
     result = _solve_accounting(executed, asset_returns, execution_model, capital)
 

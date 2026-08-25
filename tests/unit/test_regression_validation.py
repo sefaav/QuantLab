@@ -41,9 +41,11 @@ def test_holdout_config_produces_attached_oos_metrics() -> None:
         {
             "experiment_name": "holdout",
             "data": {
-                "source": "csv",
-                "market_calendar": "XNYS",
-                "symbols": ["AAA", "BBB", "CCC"],
+                "instruments": [
+                    {"symbol": "AAA", "source": "csv", "calendar": "XNYS"},
+                    {"symbol": "BBB", "source": "csv", "calendar": "XNYS"},
+                    {"symbol": "CCC", "source": "csv", "calendar": "XNYS"},
+                ],
                 "start_date": "2020-01-01",
                 "end_date": "2021-06-01",
             },
@@ -70,8 +72,8 @@ def test_holdout_config_produces_attached_oos_metrics() -> None:
         }
     )
     result = run_backtest_from_config(data, cfg)
-    assert "holdout_oos_metrics" in result.metadata
-    assert "sharpe_ratio" in result.metadata["holdout_oos_metrics"]
+    assert "holdout_chronological_metrics" in result.metadata
+    assert "sharpe_ratio" in result.metadata["holdout_chronological_metrics"]
 
 
 def test_conclusion_never_claims_oos_without_artifact() -> None:
@@ -87,9 +89,10 @@ def test_conclusion_never_claims_oos_without_artifact() -> None:
         {
             "experiment_name": "plain",
             "data": {
-                "source": "csv",
-                "market_calendar": "XNYS",
-                "symbols": ["AAA", "BBB"],
+                "instruments": [
+                    {"symbol": "AAA", "source": "csv", "calendar": "XNYS"},
+                    {"symbol": "BBB", "source": "csv", "calendar": "XNYS"},
+                ],
                 "start_date": "2020-01-01",
                 "end_date": "2020-11-01",
             },
@@ -98,7 +101,7 @@ def test_conclusion_never_claims_oos_without_artifact() -> None:
         }
     )
     result = run_backtest_from_config(data, cfg)
-    assert "holdout_oos_metrics" not in result.metadata
+    assert "holdout_chronological_metrics" not in result.metadata
     assert "walk_forward_oos_metrics" not in result.metadata
     text = conclusion(result) + methodology(result)
     assert "out-of-sample" not in text.lower() or "full-sample" in text.lower()
@@ -162,7 +165,8 @@ def test_holdout_split_table_appears_in_html_report_without_manual_wiring() -> N
     data, cfg = _holdout_config()
     result = run_backtest_from_config(data, cfg)
     html = result.to_html()
-    assert "Test (out-of-sample)" in html
+    assert "Holdout Split" in html
+    assert "<td>Test</td>" in html
 
 
 def test_conclusion_cross_references_full_sample_and_oos_sharpe_by_name() -> None:
@@ -176,9 +180,145 @@ def test_conclusion_cross_references_full_sample_and_oos_sharpe_by_name() -> Non
     assert "out-of-sample" in text.lower()
     # The two Sharpe values must both be printed, not just one.
     full_sharpe = result.metrics["sharpe_ratio"]
-    oos_sharpe = result.metadata["holdout_oos_metrics"]["sharpe_ratio"]
+    oos_sharpe = result.metadata["holdout_chronological_metrics"]["sharpe_ratio"]
     assert f"{full_sharpe:.2f}" in text
     assert f"{oos_sharpe:.2f}" in text
+
+
+def test_conclusion_does_not_claim_separate_full_sample_for_walk_forward() -> None:
+    """A walk-forward OOS result's `metrics` *is* the stitched OOS series —
+    the conclusion must not present it a second time as a separate
+    "full-sample" figure alongside an identical "out-of-sample" one."""
+    from quantlab.reporting.research_summary import conclusion
+    from quantlab.validation.walk_forward import WalkForwardValidator
+
+    data, cfg = _rf_test_setup()
+    wf = WalkForwardValidator(cfg).run(
+        data, parameter_grid={}, train_window=200, validation_window=50, test_window=50
+    )
+    assert wf.oos_result is not None
+    text = conclusion(wf.oos_result)
+    assert "separate full-sample" not in text
+    oos_sharpe = wf.oos_result.metadata["walk_forward_oos_metrics"]["sharpe_ratio"]
+    formatted = f"{oos_sharpe:.2f}"
+    assert formatted in text
+    # Printed once, not once as "out-of-sample" and again as a duplicate
+    # "full-sample" figure that happens to be numerically identical.
+    assert text.count(formatted) == 1
+
+
+def test_out_of_sample_scope_distinguishes_walk_forward_from_holdout() -> None:
+    """Only a walk-forward OOS result's `metrics` themselves *are* the
+    out-of-sample series — a holdout result's `metrics` remain a genuine
+    full-sample fit even though OOS evidence is also attached separately,
+    so it must not be flagged the same way."""
+    from quantlab.backtesting.runner import run_backtest_from_config
+    from quantlab.reporting.research_summary import out_of_sample_scope
+    from quantlab.validation.walk_forward import WalkForwardValidator
+
+    data, cfg = _rf_test_setup()
+    wf = WalkForwardValidator(cfg).run(
+        data, parameter_grid={}, train_window=200, validation_window=50, test_window=50
+    )
+    assert wf.oos_result is not None
+    assert (
+        out_of_sample_scope(wf.oos_result)
+        == "out-of-sample (walk-forward test folds only)"
+    )
+
+    holdout_data, holdout_cfg = _holdout_config()
+    holdout_result = run_backtest_from_config(holdout_data, holdout_cfg)
+    assert "holdout_chronological_metrics" in holdout_result.metadata
+    assert out_of_sample_scope(holdout_result) is None
+
+    plain_result = run_backtest_from_config(data, cfg)
+    assert out_of_sample_scope(plain_result) is None
+
+
+def test_limitations_caveats_the_holdout_blocks_out_of_sample_label() -> None:
+    """A holdout split is only "out-of-sample" if strategy/parameter choices
+    were genuinely frozen before it was inspected -- QuantLab has no way to
+    verify that discipline was followed, so the report must say so rather
+    than silently presenting the label as an established fact. Walk-forward
+    doesn't need this caveat: its rolling-window discipline is baked into
+    the validation loop itself, not a promise from the user."""
+    from quantlab.backtesting.runner import run_backtest_from_config
+    from quantlab.reporting.research_summary import limitations
+    from quantlab.validation.walk_forward import WalkForwardValidator
+
+    holdout_data, holdout_cfg = _holdout_config()
+    holdout_result = run_backtest_from_config(holdout_data, holdout_cfg)
+    holdout_items = limitations(holdout_result)
+    assert any("out-of-sample" in item and "frozen" in item for item in holdout_items)
+
+    data, cfg = _rf_test_setup()
+    wf = WalkForwardValidator(cfg).run(
+        data, parameter_grid={}, train_window=200, validation_window=50, test_window=50
+    )
+    assert wf.oos_result is not None
+    wf_items = limitations(wf.oos_result)
+    assert not any("frozen" in item for item in wf_items)
+
+    plain_result = run_backtest_from_config(data, cfg)
+    plain_items = limitations(plain_result)
+    assert not any("frozen" in item for item in plain_items)
+
+
+def test_subperiod_table_labels_walk_forward_aggregate_as_out_of_sample() -> None:
+    """`subperiod_table`'s aggregate row must not call a walk-forward OOS
+    series "Full sample" — the opposite of what it is."""
+    from quantlab.reporting.tables import subperiod_table
+    from quantlab.validation.walk_forward import WalkForwardValidator
+
+    data, cfg = _rf_test_setup()
+    wf = WalkForwardValidator(cfg).run(
+        data, parameter_grid={}, train_window=200, validation_window=50, test_window=50
+    )
+    assert wf.oos_result is not None
+    table = subperiod_table(wf.oos_result)
+    periods = set(table["Period"])
+    assert "Out-of-sample" in periods
+    assert "Full sample" not in periods
+
+
+def test_html_report_labels_walk_forward_results_as_out_of_sample() -> None:
+    """The Results section headings and executive summary must say
+    out-of-sample (walk-forward), never the "Full-sample" wording that's
+    only accurate for a genuine full-sample fit."""
+    from quantlab.validation.walk_forward import WalkForwardValidator
+
+    data, cfg = _rf_test_setup()
+    wf = WalkForwardValidator(cfg).run(
+        data, parameter_grid={}, train_window=200, validation_window=50, test_window=50
+    )
+    assert wf.oos_result is not None
+    html = wf.oos_result.to_html()
+    assert "Out-of-sample (walk-forward) headline metrics" in html
+    assert "Full-sample" not in html
+    assert "These are out-of-sample (walk-forward test folds only) results" in html
+
+
+def test_walk_forward_oos_result_reports_config_yaml_reflects_everything() -> None:
+    """WalkForwardValidator never accepts a custom strategy/allocator/
+    execution-model instance the way BacktestEngine.run() does (docs/api.md)
+    -- every component is always built from active_config alone, so all
+    three config_yaml_reflects_* flags are unconditional facts here, not a
+    best-effort verification. Without them present and True, the HTML
+    report's footer (which requires all three) would treat every
+    walk-forward result as unverified and never claim reproducibility, even
+    though a walk-forward result always is."""
+    from quantlab.validation.walk_forward import WalkForwardValidator
+
+    data, cfg = _rf_test_setup()
+    wf = WalkForwardValidator(cfg).run(
+        data, parameter_grid={}, train_window=200, validation_window=50, test_window=50
+    )
+    assert wf.oos_result is not None
+    assert wf.oos_result.metadata["config_yaml_reflects_strategy"] is True
+    assert wf.oos_result.metadata["config_yaml_reflects_allocator"] is True
+    assert wf.oos_result.metadata["config_yaml_reflects_execution"] is True
+    html = wf.oos_result.to_html()
+    assert "reproducible from config.yaml given the same code" in html
 
 
 def test_holdout_test_ratio_without_validation_ratio_does_not_crash() -> None:
@@ -193,9 +333,10 @@ def test_holdout_test_ratio_without_validation_ratio_does_not_crash() -> None:
         {
             "experiment_name": "holdout_no_validation_block",
             "data": {
-                "source": "csv",
-                "market_calendar": "XNYS",
-                "symbols": ["AAA", "BBB"],
+                "instruments": [
+                    {"symbol": "AAA", "source": "csv", "calendar": "XNYS"},
+                    {"symbol": "BBB", "source": "csv", "calendar": "XNYS"},
+                ],
                 "start_date": "2020-01-01",
                 "end_date": "2021-06-01",
             },
@@ -216,7 +357,7 @@ def test_holdout_test_ratio_without_validation_ratio_does_not_crash() -> None:
     # "Validation" row for a zero-width synthesised validation period as if
     # it were a real row with metrics.
     html = result.to_html()
-    assert "Test (out-of-sample)" in html
+    assert "<td>Test</td>" in html
     assert "<td>Validation</td>" not in html
 
 
@@ -228,9 +369,9 @@ def test_holdout_empty_train_block_does_not_crash() -> None:
         {
             "experiment_name": "holdout_empty_train",
             "data": {
-                "source": "csv",
-                "market_calendar": "XNYS",
-                "symbols": ["AAA"],
+                "instruments": [
+                    {"symbol": "AAA", "source": "csv", "calendar": "XNYS"},
+                ],
                 "start_date": "2020-01-01",
                 "end_date": "2020-01-02",
             },
@@ -288,7 +429,10 @@ def test_report_command_detects_config_yaml_edited_after_walk_forward_run(
         {
             "experiment_name": "wf_experiment",
             "data": {
-                "symbols": ["NEW1", "NEW2"],
+                "instruments": [
+                    {"symbol": "NEW1", "source": "yahoo", "calendar": "XNYS"},
+                    {"symbol": "NEW2", "source": "yahoo", "calendar": "XNYS"},
+                ],
                 "start_date": "2020-01-01",
                 "end_date": "2021-01-01",
             },
@@ -329,18 +473,21 @@ def test_report_command_rejects_stale_walk_forward_when_data_hash_differs(
     assert "walk_forward_oos_metrics" not in fake_result.metadata
 
 
-def test_report_command_rejects_stale_walk_forward_when_code_hash_differs(
+def test_report_command_rejects_stale_walk_forward_when_generator_hash_differs(
     tmp_path: Path,
 ) -> None:
+    """generator_hash, not the narrower code_hash, gates reuse of a saved
+    bundle: it also covers cli.py's own orchestration of how the bundle
+    gets assembled, which code_hash deliberately excludes."""
     from quantlab.backtesting.result import load_previous_walk_forward_robustness
 
     exp_dir = tmp_path / "wf_experiment"
     exp_dir.mkdir()
     config = _wf_experiment_config()
-    _write_wf_artifacts(exp_dir, config)  # old metadata.json has _FAKE_CODE_HASH
+    _write_wf_artifacts(exp_dir, config)  # old metadata.json has _FAKE_GENERATOR_HASH
 
     fake_result = _FakeResult(config)
-    fake_result.metadata["code_hash"] = "a-completely-different-code-hash"
+    fake_result.metadata["generator_hash"] = "a-completely-different-generator-hash"
     robustness = load_previous_walk_forward_robustness(
         exp_dir,
         fake_result,  # type: ignore[arg-type]
@@ -349,7 +496,7 @@ def test_report_command_rejects_stale_walk_forward_when_code_hash_differs(
     assert "walk_forward_oos_metrics" not in fake_result.metadata
 
 
-def test_report_command_rejects_stale_walk_forward_when_code_hash_missing(
+def test_report_command_rejects_stale_walk_forward_when_generator_hash_missing(
     tmp_path: Path,
 ) -> None:
     from quantlab.backtesting.result import load_previous_walk_forward_robustness
@@ -360,7 +507,7 @@ def test_report_command_rejects_stale_walk_forward_when_code_hash_missing(
     _write_wf_artifacts(exp_dir, config)
 
     fake_result = _FakeResult(config)
-    fake_result.metadata["code_hash"] = None
+    fake_result.metadata["generator_hash"] = None
     robustness = load_previous_walk_forward_robustness(
         exp_dir,
         fake_result,  # type: ignore[arg-type]
@@ -369,9 +516,14 @@ def test_report_command_rejects_stale_walk_forward_when_code_hash_missing(
     assert "walk_forward_oos_metrics" not in fake_result.metadata
 
 
-def test_report_command_rejects_stale_walk_forward_when_git_commit_differs(
+def test_report_command_reuses_walk_forward_when_git_commit_differs(
     tmp_path: Path,
 ) -> None:
+    """generator_hash already hashes current file contents (uncommitted
+    changes included), so it alone gives the guarantee needed here --
+    a different git_commit (e.g. a rebase, or two checkouts of the exact
+    same tree state under different commit objects) must never refuse
+    reuse on its own once generator_hash matches."""
     from quantlab.backtesting.result import load_previous_walk_forward_robustness
 
     exp_dir = tmp_path / "wf_experiment"
@@ -385,26 +537,6 @@ def test_report_command_rejects_stale_walk_forward_when_git_commit_differs(
         exp_dir,
         fake_result,  # type: ignore[arg-type]
     )
-    assert robustness is None
-    assert "walk_forward_oos_metrics" not in fake_result.metadata
-
-
-def test_report_command_reuses_walk_forward_when_git_commit_unavailable(
-    tmp_path: Path,
-) -> None:
-    from quantlab.backtesting.result import load_previous_walk_forward_robustness
-
-    exp_dir = tmp_path / "wf_experiment"
-    exp_dir.mkdir()
-    config = _wf_experiment_config()
-    _write_wf_artifacts(exp_dir, config)
-
-    fake_result = _FakeResult(config)
-    fake_result.metadata["git_commit"] = None
-    robustness = load_previous_walk_forward_robustness(
-        exp_dir,
-        fake_result,  # type: ignore[arg-type]
-    )
     assert robustness is not None
     assert fake_result.metadata["walk_forward_oos_metrics"] == {
         "sharpe_ratio": 0.42,
@@ -412,9 +544,16 @@ def test_report_command_reuses_walk_forward_when_git_commit_unavailable(
     }
 
 
-def test_report_command_rejects_stale_walk_forward_when_tree_is_dirty(
+def test_report_command_reuses_walk_forward_when_tree_is_dirty(
     tmp_path: Path,
 ) -> None:
+    """The exact bug this test guards against: `git status`/git_dirty cover
+    the *whole* repository, not just the files generator_hash is scoped
+    to, so an ordinarily-uncommitted development session (or an unrelated
+    change elsewhere in the repo) must never refuse a `report`
+    regeneration when config/data/generator_hash/dependencies are all
+    still identical -- generator_hash alone already gives that guarantee,
+    uncommitted changes included."""
     from quantlab.backtesting.result import load_previous_walk_forward_robustness
 
     exp_dir = tmp_path / "wf_experiment"
@@ -428,8 +567,11 @@ def test_report_command_rejects_stale_walk_forward_when_tree_is_dirty(
         exp_dir,
         fake_result,  # type: ignore[arg-type]
     )
-    assert robustness is None
-    assert "walk_forward_oos_metrics" not in fake_result.metadata
+    assert robustness is not None
+    assert fake_result.metadata["walk_forward_oos_metrics"] == {
+        "sharpe_ratio": 0.42,
+        "cagr": 0.05,
+    }
 
 
 def test_report_command_rejects_stale_walk_forward_when_dependencies_differ(
@@ -547,6 +689,12 @@ def test_report_command_preserves_walk_forward_run_timestamp(
 def test_generate_report_preserves_walk_forward_artifacts(
     tmp_path: Path,
 ) -> None:
+    """`load_previous_walk_forward_robustness` reuse depends only on
+    config/data/generator_hash/dependency provenance, not on the ambient
+    repo's git-dirty state (see test_report_command_reuses_walk_forward_
+    when_tree_is_dirty) -- this test needs no git-state pinning to be
+    deterministic regardless of whatever the checkout's own working tree
+    looks like during a test run."""
     from quantlab.backtesting.result import save_with_walk_forward_reuse
     from quantlab.backtesting.runner import run_backtest_from_config
 
@@ -557,9 +705,9 @@ def test_generate_report_preserves_walk_forward_artifacts(
         {
             "experiment_name": "wf_generate_report_experiment",
             "data": {
-                "source": "csv",
-                "market_calendar": "XNYS",
-                "symbols": ["AAA"],
+                "instruments": [
+                    {"symbol": "AAA", "source": "csv", "calendar": "XNYS"},
+                ],
                 "start_date": "2020-01-01",
                 "end_date": "2020-10-27",
             },
@@ -660,6 +808,7 @@ def test_walk_forward_charges_entry_cost_at_the_first_fold_start() -> None:
             )
 
 
+@pytest.mark.slow
 def test_walk_forward_chains_accounting_state_across_fold_boundaries(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -673,9 +822,9 @@ def test_walk_forward_chains_accounting_state_across_fold_boundaries(
         {
             "experiment_name": "chain_test",
             "data": {
-                "source": "csv",
-                "market_calendar": "XNYS",
-                "symbols": ["AAA"],
+                "instruments": [
+                    {"symbol": "AAA", "source": "csv", "calendar": "XNYS"},
+                ],
                 "start_date": "2020-01-01",
                 "end_date": "2021-06-01",
             },
@@ -752,6 +901,7 @@ def test_walk_forward_chains_accounting_state_across_fold_boundaries(
     assert fold0_end < fold1_end  # sanity: folds are in chronological order
 
 
+@pytest.mark.slow
 def test_walk_forward_turnover_cap_chains_across_fold_boundaries(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -762,9 +912,9 @@ def test_walk_forward_turnover_cap_chains_across_fold_boundaries(
         {
             "experiment_name": "turnover_chain_test",
             "data": {
-                "source": "csv",
-                "market_calendar": "XNYS",
-                "symbols": ["AAA"],
+                "instruments": [
+                    {"symbol": "AAA", "source": "csv", "calendar": "XNYS"},
+                ],
                 "start_date": "2020-01-01",
                 "end_date": "2021-06-01",
             },
@@ -826,6 +976,7 @@ def test_walk_forward_turnover_cap_chains_across_fold_boundaries(
     )
 
 
+@pytest.mark.slow
 def test_walk_forward_oos_curve_starts_flat_at_the_very_first_bar(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -836,9 +987,9 @@ def test_walk_forward_oos_curve_starts_flat_at_the_very_first_bar(
         {
             "experiment_name": "first_bar_flat_test",
             "data": {
-                "source": "csv",
-                "market_calendar": "XNYS",
-                "symbols": ["AAA"],
+                "instruments": [
+                    {"symbol": "AAA", "source": "csv", "calendar": "XNYS"},
+                ],
                 "start_date": "2020-01-01",
                 "end_date": "2021-06-01",
             },
@@ -890,6 +1041,7 @@ def test_walk_forward_oos_curve_starts_flat_at_the_very_first_bar(
     assert result.oos_returns.iloc[1] < 0.0, "the entry cost must show up on day 2"
 
 
+@pytest.mark.slow
 def test_walk_forward_rejects_test_window_shorter_than_a_rebalance_cycle() -> None:
     from quantlab.validation.walk_forward import WalkForwardValidator
 
@@ -900,9 +1052,9 @@ def test_walk_forward_rejects_test_window_shorter_than_a_rebalance_cycle() -> No
         {
             "experiment_name": "too_short_fold_test",
             "data": {
-                "source": "csv",
-                "market_calendar": "XNYS",
-                "symbols": ["AAA"],
+                "instruments": [
+                    {"symbol": "AAA", "source": "csv", "calendar": "XNYS"},
+                ],
                 "start_date": "2020-01-01",
                 "end_date": "2021-06-01",
             },
@@ -936,9 +1088,9 @@ def test_walk_forward_fold_metrics_reflect_only_the_deployed_period() -> None:
         {
             "experiment_name": "aligned_fold_test",
             "data": {
-                "source": "csv",
-                "market_calendar": "XNYS",
-                "symbols": ["AAA"],
+                "instruments": [
+                    {"symbol": "AAA", "source": "csv", "calendar": "XNYS"},
+                ],
                 "start_date": "2020-01-01",
                 "end_date": "2021-06-01",
             },
@@ -1039,9 +1191,9 @@ def test_holdout_split_ignores_benchmark_calendar() -> None:
         {
             "experiment_name": "test",
             "data": {
-                "source": "csv",
-                "market_calendar": "XNYS",
-                "symbols": ["AAA"],
+                "instruments": [
+                    {"symbol": "AAA", "source": "csv", "calendar": "XNYS"},
+                ],
                 "start_date": "2020-01-11",
                 "end_date": "2020-01-20",
                 "frequency": "1d",
@@ -1049,7 +1201,9 @@ def test_holdout_split_ignores_benchmark_calendar() -> None:
             "strategy": {"name": "buy_and_hold", "parameters": {}},
             "portfolio": {"allocator": "equal_weight"},
             "execution": {},
-            "backtest": {"benchmark_symbol": "BENCH"},
+            "backtest": {
+                "benchmark": {"symbol": "BENCH", "source": "csv", "calendar": "XNYS"}
+            },
             "validation": {"method": "holdout", "test_ratio": 0.4},
             "reproducibility": {"random_seed": 42},
         }
@@ -1087,9 +1241,9 @@ def test_walk_forward_windows_ignore_benchmark_calendar() -> None:
         {
             "experiment_name": "test",
             "data": {
-                "source": "csv",
-                "market_calendar": "XNYS",
-                "symbols": ["AAA"],
+                "instruments": [
+                    {"symbol": "AAA", "source": "csv", "calendar": "XNYS"},
+                ],
                 "start_date": "2020-01-11",
                 "end_date": "2020-02-09",
                 "frequency": "1d",
@@ -1101,7 +1255,9 @@ def test_walk_forward_windows_ignore_benchmark_calendar() -> None:
             # so a 5-bar test_window trivially contains one.
             "portfolio": {"allocator": "equal_weight", "rebalance_frequency": "daily"},
             "execution": {},
-            "backtest": {"benchmark_symbol": "BENCH"},
+            "backtest": {
+                "benchmark": {"symbol": "BENCH", "source": "csv", "calendar": "XNYS"}
+            },
             "validation": {"method": "walk_forward"},
             "reproducibility": {"random_seed": 42},
         }
@@ -1128,7 +1284,13 @@ def test_stale_benchmark_and_holdout_artifacts_cleaned_up_on_resave(
     cfg_with = cfg_with.revalidated_copy(
         update={
             "backtest": cfg_with.backtest.revalidated_copy(
-                update={"benchmark_symbol": "AAA"}
+                update={
+                    "benchmark": {
+                        "symbol": "AAA",
+                        "source": "csv",
+                        "calendar": "XNYS",
+                    }
+                }
             )
         }
     )
@@ -1140,9 +1302,7 @@ def test_stale_benchmark_and_holdout_artifacts_cleaned_up_on_resave(
 
     cfg_without = cfg_with.revalidated_copy(
         update={
-            "backtest": cfg_with.backtest.revalidated_copy(
-                update={"benchmark_symbol": None}
-            ),
+            "backtest": cfg_with.backtest.revalidated_copy(update={"benchmark": None}),
             "validation": cfg_with.validation.revalidated_copy(
                 update={
                     "method": ValidationMethod.WALK_FORWARD,

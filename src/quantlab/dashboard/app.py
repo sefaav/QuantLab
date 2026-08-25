@@ -4,39 +4,72 @@ Run with:
 
     streamlit run src/quantlab/dashboard/app.py
 
-Lets a user configure an experiment in the sidebar, run the look-ahead-safe
-backtest, inspect metrics/charts/trades, run robustness checks and download an
-HTML research report.
+Lets a user configure an experiment in the sidebar, run the backtest (its
+delayed-execution barrier prevents common look-ahead leakage, though a custom
+strategy remains responsible for its own causal construction), inspect
+metrics/charts/trades, run robustness checks and download an HTML research
+report.
 """
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from datetime import date
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import pandas as pd
 import streamlit as st
 
+from quantlab.config import DataSourceName, compatible_frequencies_for_sources
 from quantlab.dashboard.components import (
     render_charts,
+    render_exposure_and_cost_charts,
+    render_gross_net_comparison,
     render_metric_cards,
+    render_sensitivity_heatmap,
     render_trade_table,
 )
 from quantlab.dashboard.state import (
     binance_trading_symbols,
     build_config_from_inputs,
     default_end_date,
+    detect_calendar,
+    detect_source,
+    estimate_walk_forward_backtest_count,
     run_dashboard_backtest,
+    run_dashboard_bootstrap,
+    run_dashboard_permutation_test,
+    run_dashboard_sensitivity,
     run_dashboard_stress_tests,
+    run_dashboard_walk_forward,
+    run_dashboard_walk_forward_sensitivity,
+    run_dashboard_walk_forward_stress_tests,
     yahoo_common_symbols,
 )
-from quantlab.logging_config import get_logger
-from quantlab.strategies.base import available_strategies
+from quantlab.logging_config import configure_logging, get_logger
+from quantlab.progress import ProgressReporter
+from quantlab.strategies.base import (
+    available_strategies,
+    strategy_parameter_names,
+    strategy_sweepable_parameter_names,
+)
+from quantlab.validation.parameter_grid import parse_parameter_grid_values
+from quantlab.validation.parameter_sensitivity import (
+    infer_sensitivity_parameter_columns,
+)
 
 if TYPE_CHECKING:
     from quantlab.backtesting.result import BacktestResult
     from quantlab.data.base import SymbolSuggestion
+    from quantlab.validation.walk_forward import WalkForwardResult
 
+# Streamlit runs this file in its own process (`quantlab dashboard` launches
+# it via `subprocess.run`; a user can also run `streamlit run` on it
+# directly), separate from any process that already called
+# configure_logging() -- without this call here too, the dashboard's own
+# logger has no handlers attached, so its exceptions/warnings are never
+# written to logs/quantlab.log.
+configure_logging()
 logger = get_logger(__name__)
 
 st.set_page_config(page_title="QuantLab", page_icon="📈", layout="wide")
@@ -87,12 +120,6 @@ _INCOMPLETE_LIST_NOTE = (
     "Not every symbol is suggested — if yours is missing, type its exact "
     "ticker and it'll still be accepted."
 )
-#: Shown whenever mixing symbols across markets is possible (csv and yahoo;
-#: Binance is exempt since every pair already shares the same 24/7 calendar).
-_MARKET_CALENDAR_NOTE = (
-    "One market calendar applies to the entire universe, so every symbol "
-    "must follow the same trading schedule."
-)
 
 
 def _symbols_picker(
@@ -101,7 +128,6 @@ def _symbols_picker(
     default_symbols: tuple[str, ...],
     *,
     accept_new_options: bool = False,
-    warn_market_calendar: bool = False,
 ) -> list[str]:
     """A single instant, client-side-filtered dropdown over a preloaded universe.
 
@@ -121,8 +147,6 @@ def _symbols_picker(
     )
     if accept_new_options:
         help_text += " " + _INCOMPLETE_LIST_NOTE
-    if warn_market_calendar:
-        help_text += " " + _MARKET_CALENDAR_NOTE
 
     if key not in st.session_state:
         st.session_state[key] = [
@@ -151,49 +175,122 @@ def _symbols_picker(
 
 
 def _binance_symbols_picker() -> list[str]:
-    return _symbols_picker(
-        _binance_universe_labels(), "binance_symbols", ("BTCUSDT", "ETHUSDT")
-    )
+    # Empty by default: all three pickers are visible simultaneously now, and
+    # a non-empty default here would immediately conflict with CSV's bundled
+    # demo default below (see `_combine_instrument_picks`).
+    return _symbols_picker(_binance_universe_labels(), "binance_symbols", ())
 
 
 def _yahoo_symbols_picker() -> list[str]:
     return _symbols_picker(
         _yahoo_universe_labels(),
         "yahoo_symbols",
-        ("SPY", "QQQ", "TLT", "GLD"),
+        (),
         accept_new_options=True,
-        warn_market_calendar=True,
     )
 
 
-def _symbol_selectbox(
-    label_by_symbol: dict[str, str],
-    key: str,
-    default_symbol: str,
-    help_text: str,
-    *,
-    accept_new_options: bool = False,
-) -> str:
-    """A single-symbol dropdown over an already-known ``{symbol: label}`` map."""
-    if accept_new_options:
-        help_text += " " + _INCOMPLETE_LIST_NOTE
-    options = list(label_by_symbol.values())
-    default_label = label_by_symbol.get(
-        default_symbol, options[0] if options else default_symbol
+def _csv_symbols_picker() -> list[str]:
+    raw = st.text_input(
+        "CSV symbols (comma-separated)",
+        "SPY, QQQ, TLT, GLD",
+        help=(
+            "Local files under data/raw, one CSV per symbol. When 'Allow "
+            "bundled synthetic demo data' below is enabled, QuantLab falls "
+            "back to its bundled SPY/QQQ/TLT/GLD demo files if every "
+            "requested local file is absent."
+        ),
     )
-    if key not in st.session_state:
-        st.session_state[key] = default_label
-    picked_label = st.selectbox(
-        "Benchmark symbol",
-        options=options,
-        key=key,
-        help=help_text,
-        accept_new_options=accept_new_options,
+    return _parse_symbols(raw)
+
+
+def _combine_instrument_picks(
+    yahoo_symbols: list[str],
+    binance_symbols: list[str],
+    csv_symbols: list[str],
+) -> tuple[list[str], dict[str, str], list[str]]:
+    """Merge the three pickers into one ordered, deduplicated symbol list.
+
+    Provenance is the picker a symbol actually came from — never a
+    heuristic — so the instrument table's Source default is always exact.
+    A symbol picked from two different pickers is a conflict: never
+    silently deduplicated (which source/calendar would even apply is
+    ambiguous), excluded from the returned symbol list and reported
+    separately so the caller can block submission.
+    """
+    picks: list[tuple[list[str], str]] = [
+        (yahoo_symbols, "yahoo"),
+        (binance_symbols, "binance"),
+        (csv_symbols, "csv"),
+    ]
+    seen_in: dict[str, list[str]] = {}
+    order: list[str] = []
+    for symbols, source_name in picks:
+        for symbol in symbols:
+            if symbol not in seen_in:
+                order.append(symbol)
+            seen_in.setdefault(symbol, []).append(source_name)
+    conflicts = [symbol for symbol in order if len(seen_in[symbol]) > 1]
+    conflict_set = set(conflicts)
+    provenance = {
+        symbol: seen_in[symbol][0] for symbol in order if symbol not in conflict_set
+    }
+    combined = [symbol for symbol in order if symbol not in conflict_set]
+    return combined, provenance, conflicts
+
+
+def _instrument_table(
+    symbols: list[str], provenance: dict[str, str]
+) -> list[dict[str, str]]:
+    """Editable Source/Calendar table, one row per selected symbol.
+
+    Source defaults to the picker the symbol came from (``provenance``) —
+    never the ``detect_source`` heuristic. Calendar defaults to
+    ``detect_calendar``'s best guess. Both are editable and rebuilt from
+    ``symbols`` on every render, so removing a symbol from a picker above
+    drops its row (and any prior edit) on the next run instead of leaving a
+    stale entry behind.
+    """
+    overrides: dict[str, dict[str, str]] = st.session_state.get(
+        "instrument_overrides", {}
     )
-    symbol_by_label = {label: symbol for symbol, label in label_by_symbol.items()}
-    if picked_label is None:
-        return ""
-    return symbol_by_label.get(picked_label, picked_label.strip().upper())
+    rows = []
+    for symbol in symbols:
+        saved = overrides.get(symbol, {})
+        default_source = saved.get("source") or provenance.get(symbol, "csv")
+        default_calendar = saved.get("calendar") or (
+            detect_calendar(symbol, DataSourceName(default_source)) or "XNYS"
+        )
+        rows.append(
+            {
+                "Instrument": symbol,
+                "Source": default_source,
+                "Calendar": default_calendar,
+            }
+        )
+    edited = st.data_editor(
+        pd.DataFrame(rows, columns=["Instrument", "Source", "Calendar"]),
+        column_config={
+            "Instrument": st.column_config.TextColumn(disabled=True),
+            "Source": st.column_config.SelectboxColumn(
+                options=["yahoo", "binance", "csv"], required=True
+            ),
+            "Calendar": st.column_config.TextColumn(
+                required=True,
+                help="'24/7' for a continuous market, or a pandas_market_calendars "
+                "name such as XNYS, XHKG, XLON.",
+            ),
+        },
+        hide_index=True,
+        width="stretch",
+        key="instrument_table_editor",
+    )
+    records = cast(list[dict[str, str]], edited.to_dict("records"))
+    st.session_state["instrument_overrides"] = {
+        row["Instrument"]: {"source": row["Source"], "calendar": row["Calendar"]}
+        for row in records
+    }
+    return records
 
 
 def _strategy_param_inputs(strategy_name: str, symbols: list[str]) -> dict:
@@ -562,9 +659,10 @@ with st.expander("About this platform"):
         """
         QuantLab turns a financial hypothesis into a reproducible, bias-aware
         experiment: **data → cleaning & validation → feature functions → signals →
-        allocation → execution costs → look-ahead-safe accounting → risk metrics
+        allocation → execution costs → delayed-execution accounting → risk metrics
         → validation → reporting**. Signals are strictly shifted before returns
-        to prevent look-ahead bias.
+        to prevent common look-ahead leakage; a custom strategy remains
+        responsible for its own causal construction.
 
         Source: [github.com/sefaav/QuantLab](https://github.com/sefaav/QuantLab)
         · [Report an issue](https://github.com/sefaav/QuantLab/issues)
@@ -572,23 +670,54 @@ with st.expander("About this platform"):
         """
     )
 
+mode = st.segmented_control(
+    "Mode",
+    ["Backtest", "Walk-forward"],
+    default="Backtest",
+    key="dashboard_mode",
+    help=(
+        "Backtest: a single run over the full sample, optionally with a "
+        "chronological holdout. Walk-forward: repeatedly select parameters "
+        "on a validation block and evaluate them out-of-sample on the "
+        "following test block, stitched across the whole history — this is "
+        "QuantLab's grid-search mechanism."
+    ),
+)
+if mode is None:
+    mode = "Backtest"
+
 # --------------------------------------------------------------------------- #
 # Sidebar configuration
 # --------------------------------------------------------------------------- #
 with st.sidebar:
     st.header("Experiment configuration")
-    source = st.selectbox(
-        "Data source",
-        ["csv", "yahoo", "binance"],
-        index=0,
-        help=(
-            "csv reads local files from data/raw. A separate opt-in below "
-            "allows QuantLab's bundled synthetic demo files when every "
-            "requested local file is absent. yahoo and binance download and "
-            "locally cache real market data, and need network access."
-        ),
+    st.subheader("Instruments")
+    st.caption(
+        "Pick symbols from any of the three sources below — they all "
+        "combine into one multi-market universe."
     )
-    if source == "csv":
+    with st.expander("Yahoo Finance", expanded=False):
+        yahoo_symbols = _yahoo_symbols_picker()
+    with st.expander("Binance", expanded=False):
+        binance_symbols = _binance_symbols_picker()
+    with st.expander("CSV (local files)", expanded=True):
+        csv_symbols = _csv_symbols_picker()
+
+    symbols, provenance, conflicts = _combine_instrument_picks(
+        yahoo_symbols, binance_symbols, csv_symbols
+    )
+    if conflicts:
+        st.error(
+            "Picked from more than one source, so source/calendar would be "
+            "ambiguous — remove the duplicate from one picker: "
+            + ", ".join(sorted(conflicts))
+        )
+    if not symbols:
+        st.warning("Pick at least one symbol above to configure an instrument.")
+
+    instrument_rows = _instrument_table(symbols, provenance)
+    use_bundled_demo_data = False
+    if any(row["Source"] == "csv" for row in instrument_rows):
         use_bundled_demo_data = st.toggle(
             "Allow bundled synthetic demo data",
             value=False,
@@ -599,22 +728,34 @@ with st.sidebar:
                 "symbols still fail explicitly."
             ),
         )
-    else:
-        use_bundled_demo_data = False
-    if source == "binance":
-        symbols = _binance_symbols_picker()
-    elif source == "yahoo":
-        symbols = _yahoo_symbols_picker()
-    else:
-        symbols_raw = st.text_input(
-            "Symbols (comma-separated)",
-            "SPY, QQQ, TLT, GLD",
-            help=(
-                "Tradable universe. pairs_trading needs at least two symbols "
-                f"here; its two legs are then picked below. {_MARKET_CALENDAR_NOTE}"
-            ),
+
+    instrument_calendars = {row["Calendar"] for row in instrument_rows}
+    periods_per_year: int | None = None
+    if len(instrument_calendars) > 1:
+        st.warning(
+            "Instruments span more than one calendar "
+            f"({', '.join(sorted(instrument_calendars))}), so QuantLab "
+            "cannot infer a single annualisation factor automatically — "
+            "set one explicitly."
         )
-        symbols = _parse_symbols(symbols_raw)
+        # Default to the 24/7 convention as soon as any instrument actually
+        # trades continuously -- a mixed portfolio that includes one is
+        # closer to a "always-open" annualisation than a pure business-day
+        # one, and 252 silently understates volatility/Sharpe for it.
+        default_periods_per_year = 365 if "24/7" in instrument_calendars else 252
+        periods_per_year = int(
+            st.number_input(
+                "Periods per year (annualisation factor)",
+                min_value=1,
+                value=default_periods_per_year,
+                step=1,
+                help=(
+                    "Used to annualise Sharpe, volatility and vol-targeting "
+                    "across the whole portfolio. 252 for a business-day "
+                    "equity convention, 365 for a continuous 24/7 one."
+                ),
+            )
+        )
 
     # Sidebar date fields need the full width to keep labels and values readable.
     start_date = st.date_input(
@@ -631,57 +772,96 @@ with st.sidebar:
         help="Requested end of the sample, same caveat as Start date above.",
     )
 
-    # Offer only frequencies supported by the selected backend.
-    frequency_options = (
-        ["1d", "1h", "1w"] if source == "binance" else ["1d", "1h", "1w", "1mo"]
+    # Offer only frequencies compatible with every selected instrument's
+    # source — the same intersection ExperimentConfig itself validates, so
+    # the picker can never offer something the config would then reject.
+    instrument_sources = {DataSourceName(row["Source"]) for row in instrument_rows}
+    frequency_options = sorted(compatible_frequencies_for_sources(instrument_sources))
+    # '1h' has no verified-closure handling for a mixed-calendar universe
+    # (that machinery only operates at daily frequency) -- offering it would
+    # let the config validator reject the run only after "Run backtest" is
+    # clicked, so it's excluded here too, matching what ExperimentConfig
+    # itself would refuse.
+    intraday_blocked_by_mixed_calendar = (
+        len(instrument_calendars) > 1 and "1h" in frequency_options
     )
+    if intraday_blocked_by_mixed_calendar:
+        frequency_options = [f for f in frequency_options if f != "1h"]
     frequency = st.selectbox(
         "Frequency",
         frequency_options,
-        index=0,
+        index=0 if frequency_options else None,
         help=(
             "Bar size requested from the data source; also sets the "
             "annualisation factor used by every risk metric."
         ),
     )
-    if source == "csv":
+    if not frequency_options:
+        st.error(
+            "No frequency is compatible with every selected source — remove "
+            "one of the conflicting sources above."
+        )
+    elif intraday_blocked_by_mixed_calendar:
+        st.caption(
+            "'1h' is unavailable for a mixed-calendar universe — verified "
+            "closures only work at daily frequency."
+        )
+    if any(row["Source"] == "csv" for row in instrument_rows):
         st.caption(
             "For CSV data, frequency controls annualisation and data-quality "
             "checks but does not resample the file. A mismatch with the "
             "observed timestamps is reported after the run."
         )
-    # Yahoo and CSV experiments select a supported calendar explicitly.
-    market_calendar: str | None
-    if source in {"csv", "yahoo"}:
-        market_calendar = st.selectbox(
-            "Market calendar",
-            ["XNYS", "24/7"],
+    with st.expander("Advanced data settings"):
+        missing_value_policy = st.selectbox(
+            "Missing value policy",
+            ["drop", "forward_fill", "raise", "none"],
             index=0,
             help=(
-                "Use 'XNYS' for US equities and ETFs, or '24/7' for continuous "
-                "markets such as crypto. This controls annualisation, settlement "
-                "and gap checks."
+                "How the cleaner treats missing canonical market data bars: "
+                "drop removes affected rows; forward_fill fills up to the "
+                "limit below; raise fails the run on any gap; none leaves "
+                "gaps as-is."
             ),
         )
-    else:
-        market_calendar = None
-        st.caption("Market calendar: implied by Binance (24/7).")
-    if source in {"csv", "yahoo"}:
-        st.warning(
-            "One calendar applies to every symbol. Do not mix markets with "
-            "different trading schedules (for example AAPL and 1211.HK); "
-            "run them as separate experiments."
-        )
+        if missing_value_policy == "forward_fill":
+            forward_fill_limit = st.number_input(
+                "Forward-fill limit (consecutive bars)",
+                min_value=1,
+                value=1,
+                step=1,
+                help=(
+                    "Maximum consecutive missing bars filled per symbol "
+                    "before the gap is left as-is."
+                ),
+            )
+        else:
+            forward_fill_limit = 1
+
+    strategy_options = available_strategies()
+    if mode == "Walk-forward":
+        # buy_and_hold has no parameters (BuyAndHoldStrategy._freeze_parameters()),
+        # so there is nothing for fold-by-fold validation-block selection to
+        # select — walk-forward would just repeat the same signal on every
+        # fold for no benefit over a single backtest.
+        strategy_options = [name for name in strategy_options if name != "buy_and_hold"]
     strategy_name = st.selectbox(
         "Strategy",
-        available_strategies(),
+        strategy_options,
         index=0,
         help=(
-            "Signal-generation method: buy_and_hold (no signal, baseline "
-            "exposure); time_series_momentum / cross_sectional_momentum "
-            "(trend continuation); trend_following (moving-average trend); "
-            "mean_reversion / pairs_trading (reversion to a trailing mean or "
-            "spread). Its own parameters appear below."
+            "Signal-generation method: time_series_momentum / "
+            "cross_sectional_momentum (trend continuation); trend_following "
+            "(moving-average trend); mean_reversion / pairs_trading "
+            "(reversion to a trailing mean or spread)."
+            + (
+                ""
+                if mode == "Walk-forward"
+                else " buy_and_hold (no signal, baseline exposure) is also "
+                "available here, but has no parameters to select, so it is "
+                "hidden in Walk-forward mode."
+            )
+            + " Its own parameters appear below."
         ),
     )
 
@@ -853,45 +1033,238 @@ with st.sidebar:
         target_volatility = None
         maximum_leverage = 1.0
 
+    if strategy_name == "pairs_trading":
+        target_minimum_weight = None
+        maximum_gross_exposure = None
+        maximum_net_exposure = None
+        target_maximum_positions = None
+        maximum_turnover = None
+        st.caption(
+            "Advanced portfolio constraints are disabled for pairs_trading: "
+            "a minimum position size, position count cap, or exposure cap "
+            "could drop one leg and break the pair hedge."
+        )
+    else:
+        # Set by the non-pairs_trading branch above whenever this branch runs.
+        assert maximum_weight is not None
+        with st.expander("Advanced portfolio constraints"):
+            if st.checkbox(
+                "Enable minimum position size",
+                value=False,
+                help=(
+                    "Reject any target weight smaller than this instead of "
+                    "holding a near-zero position."
+                ),
+            ):
+                target_minimum_weight = st.slider(
+                    "Minimum position size",
+                    0.0,
+                    maximum_weight,
+                    min(0.02, maximum_weight),
+                    0.01,
+                    help="Smallest allowed non-zero target weight per asset.",
+                )
+            else:
+                target_minimum_weight = None
+            if st.checkbox(
+                "Cap gross exposure",
+                value=False,
+                help=(
+                    "Limit total absolute exposure (sum of |weight|) across all assets."
+                ),
+            ):
+                maximum_gross_exposure = st.slider(
+                    "Max gross exposure",
+                    0.1,
+                    3.0,
+                    1.0,
+                    0.1,
+                    help="Ceiling on gross exposure, enforced on top of Max leverage.",
+                )
+            else:
+                maximum_gross_exposure = None
+            if st.checkbox(
+                "Cap net exposure",
+                value=False,
+                help="Limit net directional exposure (sum of signed weights).",
+            ):
+                maximum_net_exposure = st.slider(
+                    "Max net exposure",
+                    0.0,
+                    3.0,
+                    1.0,
+                    0.1,
+                    help="Ceiling on |long weight - short weight| across all assets.",
+                )
+            else:
+                maximum_net_exposure = None
+            if st.checkbox(
+                "Cap number of positions",
+                value=False,
+                help=(
+                    "Limit how many assets can be held with a non-zero "
+                    "target weight at once."
+                ),
+            ):
+                target_maximum_positions = st.number_input(
+                    "Max number of positions",
+                    min_value=1,
+                    value=min(10, max(1, len(symbols))),
+                    step=1,
+                    help="Largest number of simultaneously non-zero target weights.",
+                )
+            else:
+                target_maximum_positions = None
+            if st.checkbox(
+                "Cap turnover per rebalance",
+                value=False,
+                help=(
+                    "Limit how much total weight can change at each "
+                    "rebalance, spreading large shifts over several periods."
+                ),
+            ):
+                maximum_turnover = st.slider(
+                    "Max turnover per rebalance",
+                    0.05,
+                    2.0,
+                    0.5,
+                    0.05,
+                    help="Maximum L1 weight change allowed at each rebalance.",
+                )
+            else:
+                maximum_turnover = None
+
     st.subheader("Validation")
-    enable_holdout = st.checkbox(
-        "Chronological holdout (train / validation / test)",
-        value=False,
-        help=(
-            "Split one continuous backtest chronologically and report each "
-            "block separately. No fitting or parameter tuning happens here. "
-            "Treat the trailing test block as out-of-sample only if you fixed "
-            "the strategy and parameters before inspecting it; the headline "
-            "metric cards still describe the full sample."
-        ),
-    )
     validation_ratio: float | None = None
     test_ratio: float | None = None
-    if enable_holdout:
-        validation_ratio = st.slider(
-            "Validation fraction",
-            0.05,
-            0.4,
-            0.2,
-            0.05,
+    train_window = 500
+    validation_window = 126
+    test_window = 126
+    expanding = True
+    optimization_metric = "sharpe"
+    parameter_grid: dict[str, list] = {}
+    if mode == "Walk-forward":
+        st.caption(
+            "Select parameters on each fold's validation block and evaluate "
+            "them out-of-sample on the following test block, repeated and "
+            "stitched across the whole history. This mode's own Results "
+            "tab shows that stitched out-of-sample evidence, not a "
+            "full-sample fit."
+        )
+        train_window = st.number_input(
+            "Train window (periods)",
+            min_value=10,
+            value=500,
+            step=10,
+            help="Training periods per fold, used to fit the strategy state.",
+        )
+        validation_window = st.number_input(
+            "Validation window (periods)",
+            min_value=5,
+            value=126,
+            step=5,
+            help="Validation periods per fold, used to select parameters.",
+        )
+        test_window = st.number_input(
+            "Test window (periods)",
+            min_value=5,
+            value=126,
+            step=5,
+            help="Out-of-sample test periods per fold, stitched into the OOS series.",
+        )
+        expanding = st.toggle(
+            "Expanding training window",
+            value=True,
             help=(
-                "Middle chronological slice reported separately for manual "
-                "assessment. This dashboard backtest does not tune or select "
-                "parameters automatically."
+                "On: each fold's training block grows to include everything "
+                "before it. Off: training slides forward, always Train "
+                "window periods long."
             ),
         )
-        test_ratio = st.slider(
-            "Test fraction",
-            0.05,
-            0.4,
-            0.2,
-            0.05,
+        optimization_metric = st.selectbox(
+            "Optimization metric",
+            ["sharpe", "sortino", "calmar", "total_return"],
+            index=0,
+            help="Metric used to pick the best parameter combination on each fold.",
+        )
+        st.caption(
+            "Parameters to search below — leave empty to use a compact, "
+            "strategy-specific default grid at run time."
+        )
+        grid_param_names = sorted(strategy_parameter_names(strategy_name))
+        selected_grid_params = st.multiselect(
+            "Grid parameters",
+            grid_param_names,
+            help="Strategy parameters to vary across candidate values.",
+        )
+        for parameter_name in selected_grid_params:
+            raw_values = st.text_input(
+                f"Candidate values for {parameter_name} (comma-separated)",
+                key=f"wf_grid_{parameter_name}",
+            )
+            parameter_grid[parameter_name] = parse_parameter_grid_values(raw_values)
+        # A rough estimate only (used to warn about a slow configuration
+        # before data is loaded) -- treat the universe as 24/7 only when
+        # every instrument genuinely is, otherwise fall back to the
+        # business-day convention.
+        is_247_market = bool(instrument_rows) and all(
+            row["Calendar"] == "24/7" for row in instrument_rows
+        )
+        estimated_backtests = estimate_walk_forward_backtest_count(
+            start_date=start_date,
+            end_date=end_date or default_end_date(),
+            is_247_market=is_247_market,
+            train_window=train_window,
+            validation_window=validation_window,
+            test_window=test_window,
+            expanding=expanding,
+            parameter_grid=parameter_grid,
+        )
+        if estimated_backtests <= 0:
+            st.warning(
+                "No walk-forward fold fits the requested date range and "
+                "windows — widen the date range or shorten the windows.",
+                icon="⚠️",
+            )
+    else:
+        enable_holdout = st.checkbox(
+            "Chronological holdout (train / validation / test)",
+            value=False,
             help=(
-                "Final chronological slice held out as the out-of-sample "
-                "test block — its metrics are what the report calls "
-                "out-of-sample evidence."
+                "Split one continuous backtest chronologically and report "
+                "each block separately. No fitting or parameter tuning "
+                "happens here. Treat the trailing test block as "
+                "out-of-sample only if you fixed the strategy and "
+                "parameters before inspecting it; the headline metric "
+                "cards still describe the full sample."
             ),
         )
+        if enable_holdout:
+            validation_ratio = st.slider(
+                "Validation fraction",
+                0.05,
+                0.4,
+                0.2,
+                0.05,
+                help=(
+                    "Middle chronological slice reported separately for "
+                    "manual assessment. This dashboard backtest does not "
+                    "tune or select parameters automatically."
+                ),
+            )
+            test_ratio = st.slider(
+                "Test fraction",
+                0.05,
+                0.4,
+                0.2,
+                0.05,
+                help=(
+                    "Final chronological slice, reported separately as the "
+                    "'Test' block. Genuinely out-of-sample only if the "
+                    "strategy and parameters were fixed before it was ever "
+                    "inspected — this dashboard has no way to verify that."
+                ),
+            )
 
     st.subheader("Costs & capital")
     initial_capital = st.number_input(
@@ -933,36 +1306,60 @@ with st.sidebar:
             "configured risk-free rate."
         ),
     )
+    # The benchmark symbol is itself an instrument (source + calendar), with
+    # the same provenance rule as the table above: if it duplicates a
+    # tradable instrument, its source/calendar are reused verbatim rather
+    # than letting the user configure an inconsistency the config would
+    # reject anyway (source/calendar must match exactly when they overlap).
     if benchmark_kind == "symbol":
-        if source == "binance":
-            benchmark_symbol = _symbol_selectbox(
-                _binance_universe_labels(),
-                "binance_benchmark_symbol",
-                "BTCUSDT",
-                "External symbol to compare against — pick from Binance's "
-                "active spot pairs.",
-            )
-        elif source == "yahoo":
-            benchmark_symbol = _symbol_selectbox(
-                _yahoo_universe_labels(),
-                "yahoo_benchmark_symbol",
-                "SPY",
-                "External symbol to compare against — pick from the same "
-                "bundled list as Symbols above, or type an exact symbol "
-                f"not in the list. {_MARKET_CALENDAR_NOTE}",
-                accept_new_options=True,
-            )
-        else:
-            benchmark_symbol = st.text_input(
+        benchmark_symbol = (
+            st.text_input(
                 "Benchmark symbol",
                 "SPY",
-                help=(
-                    "External symbol to download and compare against, e.g. "
-                    f"SPY. {_MARKET_CALENDAR_NOTE}"
-                ),
+                help="External symbol to compare the strategy against.",
             )
+            .strip()
+            .upper()
+        )
+        matching_instrument = next(
+            (row for row in instrument_rows if row["Instrument"] == benchmark_symbol),
+            None,
+        )
+        if matching_instrument is not None:
+            benchmark_source = matching_instrument["Source"]
+            benchmark_calendar = matching_instrument["Calendar"]
+            st.caption(
+                f"{benchmark_symbol} is already a tradable instrument — its "
+                f"source ({benchmark_source}) and calendar "
+                f"({benchmark_calendar}) are reused as-is."
+            )
+        elif benchmark_symbol:
+            detected_source = detect_source(benchmark_symbol)
+            source_options = ["yahoo", "binance", "csv"]
+            benchmark_source = st.selectbox(
+                "Benchmark source",
+                source_options,
+                index=source_options.index(
+                    detected_source.value if detected_source else "csv"
+                ),
+                key="benchmark_source_select",
+                help="Data source for the external benchmark symbol.",
+            )
+            benchmark_calendar = st.text_input(
+                "Benchmark calendar",
+                detect_calendar(benchmark_symbol, DataSourceName(benchmark_source))
+                or "XNYS",
+                key="benchmark_calendar_input",
+                help="'24/7' for a continuous market, or a "
+                "pandas_market_calendars name such as XNYS, XHKG, XLON.",
+            )
+        else:
+            benchmark_source = "csv"
+            benchmark_calendar = "XNYS"
     else:
         benchmark_symbol = ""
+        benchmark_source = "csv"
+        benchmark_calendar = "XNYS"
         if benchmark_kind == "first_asset":
             first_symbol = symbols[0] if symbols else "the first universe symbol"
             st.caption(f"Benchmark asset: {first_symbol}")
@@ -993,21 +1390,157 @@ with st.sidebar:
         0.5,
         help=(
             "Additional execution cost beyond commission and spread, "
-            "modelling market impact. Constant here; a volume-based model "
-            "scaling with trade size is available via the Python API."
+            "modelling market impact under the constant slippage model "
+            "below."
         ),
     )
+    with st.expander("Advanced execution settings"):
+        slippage_model = st.selectbox(
+            "Slippage model",
+            ["constant", "volume"],
+            index=0,
+            help=(
+                "constant applies the slippage bps above uniformly to every "
+                "trade. volume instead scales slippage with each trade's "
+                "size relative to average daily volume, using the impact "
+                "coefficient below."
+            ),
+        )
+        if slippage_model == "volume":
+            impact_coefficient = st.number_input(
+                "Volume impact coefficient",
+                min_value=0.0,
+                value=0.1,
+                step=0.01,
+                help=(
+                    "Multiplies sqrt(order size / average daily volume) — "
+                    "added on top of the slippage bps above. For liquid "
+                    "instruments (e.g. SPY, QQQ) and a modest position size "
+                    "relative to their average daily volume, that square "
+                    "root is tiny, so even a large coefficient can leave "
+                    "results looking identical to the constant model — this "
+                    "term is built to matter for large orders in thin "
+                    "markets, not small ones in deep markets."
+                ),
+            )
+        else:
+            impact_coefficient = 0.1
 
-    run = st.button("Run backtest", type="primary", width="stretch")
+    submission_blocked = bool(conflicts) or not symbols or not frequency_options
+    if mode == "Walk-forward":
+        run = st.button(
+            "Run walk-forward",
+            type="primary",
+            width="stretch",
+            disabled=submission_blocked,
+        )
+    else:
+        run = st.button(
+            "Run backtest",
+            type="primary",
+            width="stretch",
+            disabled=submission_blocked,
+        )
+
+
+def _run_and_store(
+    session_key: str,
+    label: str,
+    compute: Callable[[Callable[[int, int], None]], Any],
+) -> None:
+    """Run one robustness technique, storing its result or showing the error.
+
+    Shared by every individual "Run X" button and the "Run all" button below
+    it, so there is exactly one place each technique's on-demand execution
+    happens — no separate logic path for the bulk button. ``compute``
+    receives a progress callback; functions that don't report progress
+    (bootstrap, permutation — genuinely fast, resampling only — and the
+    Backtest-mode plain sensitivity variant) simply ignore it, so the bar
+    sits at an indeterminate 0% for their duration instead of stepping
+    through counts.
+    """
+    st.session_state.pop(session_key, None)
+    st.session_state.pop("report_html", None)
+    st.session_state.pop("wf_report_html", None)
+    title = f"{label[0].upper()}{label[1:]}"
+    progress_bar = st.progress(0.0, text=f"{title}: starting…")
+    try:
+        st.session_state[session_key] = compute(
+            _make_progress_callback(progress_bar, title)
+        )
+    except Exception as exc:
+        logger.exception("Dashboard %s failed", label)
+        st.error(f"{title} failed: {exc}")
+    finally:
+        progress_bar.empty()
+
+
+def _make_progress_callback(
+    progress_bar: Any, title: str
+) -> Callable[[int, int], None]:
+    """Build an ``on_progress(done, total)`` callback driving a live progress bar.
+
+    Text/ETA come from a shared `ProgressReporter` (also used by the CLI's
+    terminal progress line, for the same estimate on both interfaces) — this
+    function only renders it into the Streamlit widget.
+    """
+    reporter = ProgressReporter(title)
+
+    def _on_progress(done: int, total: int) -> None:
+        progress_bar.progress(
+            reporter.fraction(done, total), text=reporter.text(done, total)
+        )
+
+    return _on_progress
+
+
+def _render_bootstrap_interpretation() -> None:
+    """Explain how to read the bootstrap summary table's columns."""
+    st.caption(
+        "How to read this: p05/p95 form a 90% interval across resamples of "
+        "these same, already-realised returns. If a statistic's p05 sits on "
+        "the wrong side of zero (e.g. a negative CAGR or Sharpe), ordinary "
+        "resampling variation in this exact history could plausibly have "
+        "produced a loss — the result isn't robust to resampling yet, "
+        "regardless of how good the point estimate looks."
+    )
+
+
+def _render_permutation_interpretation(n_iterations: int) -> None:
+    """Explain how to read the permutation test's p-value."""
+    floor = 1.0 / (n_iterations + 1)
+    st.caption(
+        "How to read this: the p-value is the fraction of random-sign "
+        "permutations whose Sharpe matched or beat the real one. Below "
+        "~0.05 is the conventional threshold for treating the result as "
+        f"unlikely under the no-edge null. With {n_iterations} iterations, "
+        f"the p-value can't go below {floor:.4f} — landing there just means "
+        "none of the permutations beat the real Sharpe, not that the edge "
+        "is certain; more iterations would refine the number further."
+    )
+
+
+def _expected_data_hash(result: BacktestResult) -> str:
+    """Return the displayed result's data hash, or fail loudly if missing."""
+    data_hash = result.metadata.get("data_hash")
+    if not isinstance(data_hash, str):
+        raise RuntimeError(
+            "The displayed result has no valid data hash. Run it again "
+            "before running this check."
+        )
+    return data_hash
 
 
 def _render_robustness_tab(result: BacktestResult) -> None:
-    """Render chronological holdout evidence and on-demand stress tests."""
+    """Render chronological holdout evidence and on-demand robustness checks."""
     holdout_report = result.metadata.get("holdout_report")
     st.markdown("#### Chronological holdout (train / validation / test)")
     if holdout_report:
-        # Two-way train/test holdouts omit the validation row.
-        blocks = [("Train", "train"), ("Test (out-of-sample)", "test")]
+        # Two-way train/test holdouts omit the validation row. Labeled
+        # plainly "Test", not "out-of-sample": whether it's genuinely OOS
+        # depends on parameters having been fixed before looking at it, a
+        # property of the user's own workflow this table can't verify.
+        blocks = [("Train", "train"), ("Test", "test")]
         if "validation_metrics" in holdout_report:
             blocks.insert(1, ("Validation", "validation"))
         rows = [
@@ -1059,22 +1592,13 @@ def _render_robustness_tab(result: BacktestResult) -> None:
         "report."
     )
     if st.button("Run stress tests"):
-        st.session_state.pop("stress_tests", None)
-        st.session_state.pop("report_html", None)
-        with st.spinner("Running stress-test scenarios…"):
-            try:
-                expected_data_hash = result.metadata.get("data_hash")
-                if not isinstance(expected_data_hash, str):
-                    raise RuntimeError(
-                        "The displayed result has no valid data hash. "
-                        "Run the backtest again before running stress tests."
-                    )
-                st.session_state["stress_tests"] = run_dashboard_stress_tests(
-                    result.config, expected_data_hash
-                )
-            except Exception as exc:
-                logger.exception("Dashboard stress tests failed")
-                st.error(f"Stress tests failed: {exc}")
+        _run_and_store(
+            "stress_tests",
+            "stress tests",
+            lambda progress: run_dashboard_stress_tests(
+                result.config, _expected_data_hash(result), on_progress=progress
+            ),
+        )
     stress = st.session_state.get("stress_tests")
     if stress is not None:
         st.dataframe(
@@ -1094,52 +1618,630 @@ def _render_robustness_tab(result: BacktestResult) -> None:
             },
         )
 
+    st.markdown("#### Bootstrap")
+    st.caption(
+        "Resamples the realised returns (block bootstrap) into a "
+        "distribution of plausible CAGR/Sharpe/drawdown/final-value "
+        "outcomes. Resamples already-realised returns only — no strategy "
+        "re-run, no parameter optimization."
+    )
+    bootstrap_n_iterations = st.number_input(
+        "Bootstrap iterations",
+        min_value=100,
+        value=1000,
+        step=100,
+        key="bt_bootstrap_n",
+    )
+    bootstrap_block_size = st.number_input(
+        "Block size",
+        min_value=1,
+        value=1,
+        step=1,
+        key="bt_bootstrap_block",
+        help="Consecutive-period block length; 1 resamples individual periods.",
+    )
+    if st.button("Run bootstrap"):
+        _run_and_store(
+            "bootstrap_summary",
+            "bootstrap",
+            lambda _progress: run_dashboard_bootstrap(
+                result.config,
+                result.returns,
+                n_iterations=bootstrap_n_iterations,
+                block_size=bootstrap_block_size,
+            ),
+        )
+    bootstrap_summary = st.session_state.get("bootstrap_summary")
+    if bootstrap_summary is not None:
+        st.dataframe(bootstrap_summary, width="stretch", hide_index=True)
+        _render_bootstrap_interpretation()
+
+    st.markdown("#### Permutation Monte Carlo")
+    st.caption(
+        "Randomly flips the sign of excess returns to test the realised "
+        "Sharpe against a no-edge random-sign null. A low p-value is "
+        "evidence against that specific null, not a probability of future "
+        "profitability."
+    )
+    permutation_n_iterations = st.number_input(
+        "Permutation iterations",
+        min_value=100,
+        value=1000,
+        step=100,
+        key="bt_permutation_n",
+    )
+    if st.button("Run permutation test"):
+        _run_and_store(
+            "permutation_test",
+            "permutation test",
+            lambda _progress: run_dashboard_permutation_test(
+                result.config, result.returns, n_iterations=permutation_n_iterations
+            ),
+        )
+    permutation = st.session_state.get("permutation_test")
+    if permutation is not None:
+        perm_cols = st.columns(2)
+        perm_cols[0].metric("Real Sharpe", f"{permutation['real_sharpe']:.2f}")
+        perm_cols[1].metric("p-value", f"{permutation['p_value']:.4f}")
+        _render_permutation_interpretation(int(permutation["n_iterations"]))
+
+    st.markdown("#### Parameter sensitivity")
+    st.caption(
+        "Re-runs the backtest across a 2-parameter grid to show how "
+        "sensitive the result is to the exact parameter choice. Boolean/"
+        "structural parameters (e.g. long_only) aren't offered — they "
+        "change which other parameters are even meaningful, so sweeping "
+        "them isn't well-defined for a 2D heatmap."
+    )
+    sensitivity_param_names = sorted(
+        strategy_sweepable_parameter_names(result.config.strategy_name)
+    )
+    sens_col1, sens_col2 = st.columns(2)
+    with sens_col1:
+        sensitivity_x = st.selectbox(
+            "Parameter (x-axis)", sensitivity_param_names, key="bt_sens_x"
+        )
+        sensitivity_x_values = st.text_input(
+            "Candidate values (x, comma-separated)", key="bt_sens_x_values"
+        )
+    with sens_col2:
+        remaining_params = [p for p in sensitivity_param_names if p != sensitivity_x]
+        sensitivity_y = st.selectbox(
+            "Parameter (y-axis)", remaining_params, key="bt_sens_y"
+        )
+        sensitivity_y_values = st.text_input(
+            "Candidate values (y, comma-separated)", key="bt_sens_y_values"
+        )
+    sensitivity_ready = bool(
+        sensitivity_x
+        and sensitivity_y
+        and sensitivity_x_values
+        and sensitivity_y_values
+    )
+
+    def _run_sensitivity() -> None:
+        _run_and_store(
+            "sensitivity",
+            "parameter sensitivity",
+            lambda _progress: run_dashboard_sensitivity(
+                result.config,
+                _expected_data_hash(result),
+                sensitivity_x,
+                parse_parameter_grid_values(sensitivity_x_values),
+                sensitivity_y,
+                parse_parameter_grid_values(sensitivity_y_values),
+            ),
+        )
+
+    if st.button("Run parameter sensitivity", disabled=not sensitivity_ready):
+        _run_sensitivity()
+    sensitivity = st.session_state.get("sensitivity")
+    if sensitivity is not None:
+        # Read the axes back off the result itself, not the (possibly since
+        # changed) sidebar selection above -- otherwise changing the axis
+        # pickers after a run without re-running would render a stale
+        # result under mismatched labels, or crash pivoting on a column the
+        # stored result never had.
+        used_x, used_y = infer_sensitivity_parameter_columns(sensitivity)
+        if (used_x, used_y) != (sensitivity_x, sensitivity_y):
+            st.caption(
+                f"Showing the last run's axes ({used_x} / {used_y}) — "
+                "the pickers above have changed since. Run again to update."
+            )
+        render_sensitivity_heatmap(st, sensitivity, used_x, used_y)
+
+    st.divider()
+    if st.button("Run all robustness tests", type="secondary"):
+        _run_and_store(
+            "stress_tests",
+            "stress tests",
+            lambda progress: run_dashboard_stress_tests(
+                result.config, _expected_data_hash(result), on_progress=progress
+            ),
+        )
+        _run_and_store(
+            "bootstrap_summary",
+            "bootstrap",
+            lambda _progress: run_dashboard_bootstrap(
+                result.config,
+                result.returns,
+                n_iterations=bootstrap_n_iterations,
+                block_size=bootstrap_block_size,
+            ),
+        )
+        _run_and_store(
+            "permutation_test",
+            "permutation test",
+            lambda _progress: run_dashboard_permutation_test(
+                result.config, result.returns, n_iterations=permutation_n_iterations
+            ),
+        )
+        if sensitivity_ready:
+            _run_sensitivity()
+        else:
+            st.caption(
+                "Skipped parameter sensitivity: pick both parameters and "
+                "candidate values above first."
+            )
+        st.rerun()
+
+
+def _render_walk_forward_robustness_tab(wf: WalkForwardResult) -> None:
+    """Render per-fold selection evidence and on-demand robustness checks.
+
+    Stress tests and parameter sensitivity here always re-run the whole
+    walk-forward selection process per scenario/cell
+    (``run_dashboard_walk_forward_stress_tests`` /
+    ``run_dashboard_walk_forward_sensitivity``) rather than reuse Backtest
+    mode's plain-backtest variants — this tab must never silently show
+    numbers from a different validation method than the one in effect.
+    """
+    oos_result = wf.oos_result
+    assert oos_result is not None  # guarded by _execute_walk_forward
+
+    st.markdown("#### Fold summary")
+    st.caption(
+        "Selected parameters and realised metrics for each walk-forward "
+        "fold's out-of-sample test block."
+    )
+    st.dataframe(
+        wf.summary_table(),
+        width="stretch",
+        hide_index=True,
+        column_config={
+            "test_return": st.column_config.NumberColumn(format="percent"),
+            "test_sharpe": st.column_config.NumberColumn(format="%.2f"),
+            "validation_score": st.column_config.NumberColumn(format="%.3f"),
+        },
+    )
+
+    st.markdown("#### Parameter stability across folds")
+    stability = wf.parameter_stability()
+    if stability:
+        st.caption(
+            "Coefficient of variation of each selected numeric parameter "
+            "across folds — lower means walk-forward selection was more "
+            "consistent, though this alone does not establish robustness."
+        )
+        st.dataframe(
+            pd.DataFrame(
+                {
+                    "parameter": list(stability),
+                    "coefficient_of_variation": list(stability.values()),
+                }
+            ),
+            width="stretch",
+            hide_index=True,
+            column_config={
+                "coefficient_of_variation": st.column_config.NumberColumn(
+                    format="%.3f"
+                ),
+            },
+        )
+    else:
+        st.info(
+            "Not enough numeric parameter selections across folds to "
+            "compute stability (e.g. a single fold, or no grid parameters)."
+        )
+
+    st.markdown("#### Stress tests")
+    st.caption(
+        "**Commission x2/x5 and slippage x2** re-select parameters under "
+        "the new costs from a per-candidate weight cache built once for "
+        "all three — cheap to re-score since signals and portfolio "
+        "allocation never depend on execution costs, but this still "
+        "genuinely re-selects, it does not just rescale the baseline's "
+        "fixed weights. **Execution delay +1** and — with more than 2 "
+        "symbols — **reduced universe** instead re-run the whole "
+        "walk-forward process (every fold's validation-block selection, "
+        "then OOS reconstruction) from scratch, since delay changes the "
+        "weights themselves and a reduced universe changes signal "
+        "generation; substantially slower than the three cost-only "
+        "scenarios. **Best 10 days removed** does not re-run anything — "
+        "it directly zeroes the 10 best days already in the baseline OOS "
+        "returns above, since removing realised returns changes no "
+        "configuration to re-select against."
+    )
+    if st.button("Run stress tests", key="wf_run_stress"):
+        _run_and_store(
+            "wf_stress_tests",
+            "stress tests",
+            lambda progress: run_dashboard_walk_forward_stress_tests(
+                oos_result.config,
+                wf,
+                _expected_data_hash(oos_result),
+                on_progress=progress,
+            ),
+        )
+    wf_stress = st.session_state.get("wf_stress_tests")
+    if wf_stress is not None:
+        st.dataframe(
+            wf_stress,
+            width="stretch",
+            hide_index=True,
+            column_config={
+                "scenario": st.column_config.TextColumn("Scenario"),
+                "total_return": st.column_config.NumberColumn(
+                    "Total return", format="percent"
+                ),
+                "cagr": st.column_config.NumberColumn("CAGR", format="percent"),
+                "sharpe": st.column_config.NumberColumn("Sharpe", format="%.2f"),
+                "max_drawdown": st.column_config.NumberColumn(
+                    "Max drawdown", format="percent"
+                ),
+            },
+        )
+
+    st.markdown("#### Bootstrap")
+    st.caption(
+        "Resamples the stitched out-of-sample returns (block bootstrap) — "
+        "resamples already-realised returns only, so this is exactly as "
+        "fast as in Backtest mode regardless of the walk-forward cost above."
+    )
+    wf_bootstrap_n_iterations = st.number_input(
+        "Bootstrap iterations",
+        min_value=100,
+        value=1000,
+        step=100,
+        key="wf_bootstrap_n",
+    )
+    wf_bootstrap_block_size = st.number_input(
+        "Block size", min_value=1, value=1, step=1, key="wf_bootstrap_block"
+    )
+    if st.button("Run bootstrap", key="wf_run_bootstrap"):
+        _run_and_store(
+            "wf_bootstrap_summary",
+            "bootstrap",
+            lambda _progress: run_dashboard_bootstrap(
+                oos_result.config,
+                oos_result.returns,
+                n_iterations=wf_bootstrap_n_iterations,
+                block_size=wf_bootstrap_block_size,
+            ),
+        )
+    wf_bootstrap_summary = st.session_state.get("wf_bootstrap_summary")
+    if wf_bootstrap_summary is not None:
+        st.dataframe(wf_bootstrap_summary, width="stretch", hide_index=True)
+        _render_bootstrap_interpretation()
+
+    st.markdown("#### Permutation Monte Carlo")
+    st.caption(
+        "Randomly flips the sign of the stitched OOS excess returns to "
+        "test the realised Sharpe against a no-edge random-sign null."
+    )
+    wf_permutation_n_iterations = st.number_input(
+        "Permutation iterations",
+        min_value=100,
+        value=1000,
+        step=100,
+        key="wf_permutation_n",
+    )
+    if st.button("Run permutation test", key="wf_run_permutation"):
+        _run_and_store(
+            "wf_permutation_test",
+            "permutation test",
+            lambda _progress: run_dashboard_permutation_test(
+                oos_result.config,
+                oos_result.returns,
+                n_iterations=wf_permutation_n_iterations,
+            ),
+        )
+    wf_permutation = st.session_state.get("wf_permutation_test")
+    if wf_permutation is not None:
+        wf_perm_cols = st.columns(2)
+        wf_perm_cols[0].metric("Real Sharpe", f"{wf_permutation['real_sharpe']:.2f}")
+        wf_perm_cols[1].metric("p-value", f"{wf_permutation['p_value']:.4f}")
+        _render_permutation_interpretation(int(wf_permutation["n_iterations"]))
+
+    st.markdown("#### Parameter sensitivity")
+    st.caption(
+        "Re-runs the **whole walk-forward process** for each grid cell "
+        "(the two swept parameters pinned, no further inner optimization) "
+        "— can be slow: every cell costs roughly a full walk-forward run. "
+        "Boolean/structural parameters (e.g. long_only) aren't offered — "
+        "they change which other parameters are even meaningful, so "
+        "sweeping them isn't well-defined for a 2D heatmap."
+    )
+    wf_sensitivity_param_names = sorted(
+        strategy_sweepable_parameter_names(oos_result.config.strategy_name)
+    )
+    wf_sens_col1, wf_sens_col2 = st.columns(2)
+    with wf_sens_col1:
+        wf_sensitivity_x = st.selectbox(
+            "Parameter (x-axis)", wf_sensitivity_param_names, key="wf_sens_x"
+        )
+        wf_sensitivity_x_values = st.text_input(
+            "Candidate values (x, comma-separated)", key="wf_sens_x_values"
+        )
+    with wf_sens_col2:
+        wf_remaining_params = [
+            p for p in wf_sensitivity_param_names if p != wf_sensitivity_x
+        ]
+        wf_sensitivity_y = st.selectbox(
+            "Parameter (y-axis)", wf_remaining_params, key="wf_sens_y"
+        )
+        wf_sensitivity_y_values = st.text_input(
+            "Candidate values (y, comma-separated)", key="wf_sens_y_values"
+        )
+    wf_sensitivity_ready = bool(
+        wf_sensitivity_x
+        and wf_sensitivity_y
+        and wf_sensitivity_x_values
+        and wf_sensitivity_y_values
+    )
+
+    def _run_wf_sensitivity() -> None:
+        _run_and_store(
+            "wf_sensitivity",
+            "parameter sensitivity",
+            lambda progress: run_dashboard_walk_forward_sensitivity(
+                oos_result.config,
+                _expected_data_hash(oos_result),
+                wf_sensitivity_x,
+                parse_parameter_grid_values(wf_sensitivity_x_values),
+                wf_sensitivity_y,
+                parse_parameter_grid_values(wf_sensitivity_y_values),
+                on_progress=progress,
+            ),
+        )
+
+    if st.button(
+        "Run parameter sensitivity",
+        key="wf_run_sensitivity",
+        disabled=not wf_sensitivity_ready,
+    ):
+        _run_wf_sensitivity()
+    wf_sensitivity = st.session_state.get("wf_sensitivity")
+    if wf_sensitivity is not None:
+        # See the Backtest-mode sensitivity section above for why the axes
+        # are read back off the result itself, not the sidebar's current
+        # (possibly since changed) selection.
+        used_x, used_y = infer_sensitivity_parameter_columns(wf_sensitivity)
+        if (used_x, used_y) != (wf_sensitivity_x, wf_sensitivity_y):
+            st.caption(
+                f"Showing the last run's axes ({used_x} / {used_y}) — "
+                "the pickers above have changed since. Run again to update."
+            )
+        render_sensitivity_heatmap(st, wf_sensitivity, used_x, used_y)
+
+    st.divider()
+    if st.button("Run all robustness tests", key="wf_run_all", type="secondary"):
+        _run_and_store(
+            "wf_stress_tests",
+            "stress tests",
+            lambda progress: run_dashboard_walk_forward_stress_tests(
+                oos_result.config,
+                wf,
+                _expected_data_hash(oos_result),
+                on_progress=progress,
+            ),
+        )
+        _run_and_store(
+            "wf_bootstrap_summary",
+            "bootstrap",
+            lambda _progress: run_dashboard_bootstrap(
+                oos_result.config,
+                oos_result.returns,
+                n_iterations=wf_bootstrap_n_iterations,
+                block_size=wf_bootstrap_block_size,
+            ),
+        )
+        _run_and_store(
+            "wf_permutation_test",
+            "permutation test",
+            lambda _progress: run_dashboard_permutation_test(
+                oos_result.config,
+                oos_result.returns,
+                n_iterations=wf_permutation_n_iterations,
+            ),
+        )
+        if wf_sensitivity_ready:
+            _run_wf_sensitivity()
+        else:
+            st.caption(
+                "Skipped parameter sensitivity: pick both parameters and "
+                "candidate values above first."
+            )
+        st.rerun()
+
+
+def _collect_backtest_robustness_evidence() -> tuple[
+    dict[str, object], tuple[object, ...]
+]:
+    """Gather every on-demand Backtest-mode robustness result for the report."""
+    evidence: dict[str, object] = {}
+    cache_parts: list[object] = []
+    for session_key, label in (
+        ("stress_tests", "stress_tests"),
+        ("bootstrap_summary", "bootstrap"),
+        ("permutation_test", "permutation_test"),
+        ("sensitivity", "sensitivity"),
+    ):
+        value = st.session_state.get(session_key)
+        cache_parts.append(id(value) if value is not None else None)
+        if value is not None:
+            evidence[label] = value
+    return evidence, tuple(cache_parts)
+
+
+def _collect_walk_forward_robustness_evidence(
+    wf: WalkForwardResult,
+) -> tuple[dict[str, object], tuple[object, ...]]:
+    """Gather fold evidence plus every on-demand Walk-forward robustness result."""
+    evidence: dict[str, object] = {"walk_forward": wf.summary_table()}
+    cache_parts: list[object] = [id(wf)]
+    for session_key, label in (
+        ("wf_stress_tests", "stress_tests"),
+        ("wf_bootstrap_summary", "bootstrap"),
+        ("wf_permutation_test", "permutation_test"),
+        ("wf_sensitivity", "sensitivity"),
+    ):
+        value = st.session_state.get(session_key)
+        cache_parts.append(id(value) if value is not None else None)
+        if value is not None:
+            evidence[label] = value
+    return evidence, tuple(cache_parts)
+
+
+def _render_report_tab(
+    result: BacktestResult,
+    robustness: dict[str, object] | None,
+    *,
+    cache_key_extra: object,
+    session_key: str,
+) -> None:
+    """Render the HTML report tab, shared by Backtest and Walk-forward modes."""
+    st.markdown("### Research report")
+    cache_key = (id(result), cache_key_extra)
+    cached_report = cast(
+        tuple[tuple[int, object], tuple[str, list[str]]] | None,
+        st.session_state.get(session_key),
+    )
+    if cached_report is not None and cached_report[0] == cache_key:
+        html, chart_warnings = cached_report[1]
+    else:
+        chart_warnings = []
+        html = result.to_html(robustness=robustness, warnings=chart_warnings)
+        st.session_state[session_key] = (cache_key, (html, chart_warnings))
+    if chart_warnings:
+        # Surface individual chart failures without discarding the report.
+        st.warning(
+            "Some charts could not be rendered into this report:\n"
+            + "\n".join(f"- {w}" for w in chart_warnings)
+        )
+    st.download_button(
+        "Download HTML report",
+        html.encode("utf-8"),
+        file_name=f"{result.config.experiment_name}_report.html",
+        mime="text/html",
+    )
+    st.iframe(html, height=800)
+
 
 # --------------------------------------------------------------------------- #
 # Run and results
 # --------------------------------------------------------------------------- #
 def _collect_inputs() -> dict:
     """Return the current sidebar values used to build the experiment config."""
-    return {
+    instruments = [
+        {
+            "symbol": row["Instrument"],
+            "source": row["Source"],
+            "calendar": row["Calendar"],
+        }
+        for row in instrument_rows
+    ]
+    benchmark = (
+        {
+            "symbol": benchmark_symbol,
+            "source": benchmark_source,
+            "calendar": benchmark_calendar,
+        }
+        if benchmark_kind == "symbol" and benchmark_symbol
+        else None
+    )
+    inputs: dict = {
         "experiment_name": f"dashboard_{strategy_name}",
-        "source": source,
+        "instruments": instruments,
         "use_bundled_demo_data": use_bundled_demo_data,
-        "symbols": symbols,
         "start_date": start_date,
         "end_date": end_date or default_end_date(),
         "frequency": frequency,
-        "market_calendar": market_calendar,
+        "missing_value_policy": missing_value_policy,
+        "forward_fill_limit": forward_fill_limit,
         "strategy_name": strategy_name,
         "strategy_parameters": strategy_parameters,
         "allocator": allocator,
         "maximum_weight": maximum_weight,
         "long_only": long_only,
+        "target_minimum_weight": target_minimum_weight,
+        "maximum_gross_exposure": maximum_gross_exposure,
+        "maximum_net_exposure": maximum_net_exposure,
+        "target_maximum_positions": target_maximum_positions,
+        "maximum_turnover": maximum_turnover,
         "target_volatility": target_volatility,
         "volatility_window": volatility_window,
         "maximum_leverage": maximum_leverage,
         "rebalance_frequency": rebalance_frequency,
-        "validation_ratio": validation_ratio,
-        "test_ratio": test_ratio,
         "initial_capital": initial_capital,
         "benchmark_kind": benchmark_kind,
-        "benchmark_symbol": benchmark_symbol,
+        "benchmark": benchmark,
+        "periods_per_year": periods_per_year,
         "risk_free_rate": risk_free_rate_percent / 100.0,
         "commission_bps": commission_bps,
         "spread_bps": spread_bps,
         "slippage_bps": slippage_bps,
+        "slippage_model": slippage_model,
+        "impact_coefficient": impact_coefficient,
     }
+    if mode == "Walk-forward":
+        inputs["validation_method"] = "walk_forward"
+        inputs["train_window"] = train_window
+        inputs["validation_window"] = validation_window
+        inputs["test_window"] = test_window
+        inputs["expanding"] = expanding
+        inputs["optimization_metric"] = optimization_metric
+        inputs["parameter_grid"] = parameter_grid
+    else:
+        inputs["validation_ratio"] = validation_ratio
+        inputs["test_ratio"] = test_ratio
+    return inputs
 
 
-def _clear_result_state() -> None:
+def _clear_backtest_result_state() -> None:
     """Remove artefacts that no longer describe a successful backtest."""
-    for key in ("result", "result_inputs", "warnings", "stress_tests", "report_html"):
+    for key in (
+        "result",
+        "result_inputs",
+        "warnings",
+        "stress_tests",
+        "bootstrap_summary",
+        "permutation_test",
+        "sensitivity",
+        "report_html",
+    ):
         st.session_state.pop(key, None)
 
 
-def _execute() -> None:
+def _clear_walk_forward_result_state() -> None:
+    """Remove artefacts that no longer describe a successful walk-forward run."""
+    for key in (
+        "wf_result",
+        "wf_result_inputs",
+        "wf_warnings",
+        "wf_stress_tests",
+        "wf_bootstrap_summary",
+        "wf_permutation_test",
+        "wf_sensitivity",
+        "wf_report_html",
+    ):
+        st.session_state.pop(key, None)
+
+
+def _execute_backtest() -> None:
     inputs = _collect_inputs()
-    _clear_result_state()
-    with st.spinner("Running look-ahead-safe backtest…"):
+    _clear_backtest_result_state()
+    with st.spinner("Running backtest…"):
         try:
             config = build_config_from_inputs(inputs)
             result, warnings = run_dashboard_backtest(config)
@@ -1153,79 +2255,151 @@ def _execute() -> None:
     st.session_state["warnings"] = warnings
 
 
-if run:
-    _execute()
-
-result = st.session_state.get("result")
-if result is None:
-    st.info("Configure an experiment in the sidebar and click **Run backtest**.")
-else:
-    # Warn when the current controls no longer describe the saved result.
-    if _collect_inputs() != st.session_state.get("result_inputs"):
-        st.warning(
-            "Sidebar configuration has changed since this result was "
-            "computed — click **Run backtest** to refresh it.",
-            icon="⚠️",
+def _execute_walk_forward() -> None:
+    inputs = _collect_inputs()
+    _clear_walk_forward_result_state()
+    progress_bar = st.progress(0.0, text="Walk-forward: starting…")
+    try:
+        config = build_config_from_inputs(inputs)
+        wf, warnings = run_dashboard_walk_forward(
+            config,
+            on_progress=_make_progress_callback(progress_bar, "Walk-forward"),
         )
-    data_warnings = st.session_state.get("warnings", [])
-    frequency_warnings = [
-        w for w in data_warnings if "does not match the declared frequency" in w
-    ]
-    other_warnings = [w for w in data_warnings if w not in frequency_warnings]
-    if frequency_warnings:
-        # Frequency mismatches invalidate all annualised metrics.
+    except Exception as exc:
+        logger.exception("Dashboard walk-forward failed")
+        st.error(f"Walk-forward failed: {exc}")
+        return
+    finally:
+        progress_bar.empty()
+    if wf.oos_result is None:
         st.error(
-            "**Frequency mismatch detected** — the metrics below use the "
-            "wrong annualisation factor and should not be trusted:\n"
-            + "\n".join(f"- {w}" for w in frequency_warnings),
-            icon="🚫",
+            "No walk-forward fold fit the requested date range and "
+            "windows — widen the date range or shorten the windows."
         )
-    for warning in other_warnings:
-        st.caption(f"⚠️ {warning}")
+        return
 
-    # Dynamic tabs render only the selected tab; the stable key also supports tests.
-    tab_results, tab_trades, tab_robustness, tab_report = st.tabs(
-        ["Results", "Trades", "Robustness", "Report"],
-        on_change="rerun",
-        key="dashboard_active_tab",
-    )
-    if tab_results.open:
-        with tab_results:
-            render_metric_cards(st, result)
-            render_charts(st, result)
-    if tab_trades.open:
-        with tab_trades:
-            render_trade_table(st, result)
-    if tab_robustness.open:
-        with tab_robustness:
-            _render_robustness_tab(result)
-    if tab_report.open:
-        with tab_report:
-            st.markdown("### Research report")
-            # Include current stress evidence and avoid rebuilding unchanged HTML.
-            stress = st.session_state.get("stress_tests")
-            robustness = {"stress_tests": stress} if stress is not None else None
-            cache_key = (id(result), id(stress) if stress is not None else None)
-            cached_report = cast(
-                tuple[tuple[int, int | None], tuple[str, list[str]]] | None,
-                st.session_state.get("report_html"),
+    st.session_state["wf_result"] = wf
+    st.session_state["wf_result_inputs"] = inputs
+    st.session_state["wf_warnings"] = warnings
+
+
+if run:
+    if mode == "Walk-forward":
+        _execute_walk_forward()
+    else:
+        _execute_backtest()
+
+if mode == "Walk-forward":
+    wf = st.session_state.get("wf_result")
+    if wf is None:
+        st.info(
+            "Configure an experiment in the sidebar and click **Run walk-forward**."
+        )
+    else:
+        oos_result = wf.oos_result
+        assert oos_result is not None  # guarded by _execute_walk_forward
+        if _collect_inputs() != st.session_state.get("wf_result_inputs"):
+            st.warning(
+                "Sidebar configuration has changed since this result was "
+                "computed — click **Run walk-forward** to refresh it.",
+                icon="⚠️",
             )
-            if cached_report is not None and cached_report[0] == cache_key:
-                html, chart_warnings = cached_report[1]
-            else:
-                chart_warnings = []
-                html = result.to_html(robustness=robustness, warnings=chart_warnings)
-                st.session_state["report_html"] = (cache_key, (html, chart_warnings))
-            if chart_warnings:
-                # Surface individual chart failures without discarding the report.
-                st.warning(
-                    "Some charts could not be rendered into this report:\n"
-                    + "\n".join(f"- {w}" for w in chart_warnings)
+        data_warnings = st.session_state.get("wf_warnings", [])
+        frequency_warnings = [
+            w for w in data_warnings if "does not match the declared frequency" in w
+        ]
+        other_warnings = [w for w in data_warnings if w not in frequency_warnings]
+        if frequency_warnings:
+            st.error(
+                "**Frequency mismatch detected** — the metrics below use "
+                "the wrong annualisation factor and should not be "
+                "trusted:\n" + "\n".join(f"- {w}" for w in frequency_warnings),
+                icon="🚫",
+            )
+        for warning in other_warnings:
+            st.caption(f"⚠️ {warning}")
+
+        tab_results, tab_trades, tab_robustness, tab_report = st.tabs(
+            ["Results", "Trades", "Robustness", "Report"],
+            on_change="rerun",
+            key="dashboard_active_tab",
+        )
+        if tab_results.open:
+            with tab_results:
+                render_metric_cards(st, oos_result)
+                render_charts(st, oos_result)
+                render_gross_net_comparison(st, oos_result)
+                render_exposure_and_cost_charts(st, oos_result)
+        if tab_trades.open:
+            with tab_trades:
+                render_trade_table(st, oos_result)
+        if tab_robustness.open:
+            with tab_robustness:
+                _render_walk_forward_robustness_tab(wf)
+        if tab_report.open:
+            with tab_report:
+                wf_robustness, wf_cache_parts = (
+                    _collect_walk_forward_robustness_evidence(wf)
                 )
-            st.download_button(
-                "Download HTML report",
-                html.encode("utf-8"),
-                file_name=f"{result.config.experiment_name}_report.html",
-                mime="text/html",
+                _render_report_tab(
+                    oos_result,
+                    wf_robustness,
+                    cache_key_extra=wf_cache_parts,
+                    session_key="wf_report_html",
+                )
+else:
+    result = st.session_state.get("result")
+    if result is None:
+        st.info("Configure an experiment in the sidebar and click **Run backtest**.")
+    else:
+        # Warn when the current controls no longer describe the saved result.
+        if _collect_inputs() != st.session_state.get("result_inputs"):
+            st.warning(
+                "Sidebar configuration has changed since this result was "
+                "computed — click **Run backtest** to refresh it.",
+                icon="⚠️",
             )
-            st.iframe(html, height=800)
+        data_warnings = st.session_state.get("warnings", [])
+        frequency_warnings = [
+            w for w in data_warnings if "does not match the declared frequency" in w
+        ]
+        other_warnings = [w for w in data_warnings if w not in frequency_warnings]
+        if frequency_warnings:
+            # Frequency mismatches invalidate all annualised metrics.
+            st.error(
+                "**Frequency mismatch detected** — the metrics below use "
+                "the wrong annualisation factor and should not be "
+                "trusted:\n" + "\n".join(f"- {w}" for w in frequency_warnings),
+                icon="🚫",
+            )
+        for warning in other_warnings:
+            st.caption(f"⚠️ {warning}")
+
+        # Dynamic tabs render only the selected tab; the stable key also
+        # supports tests.
+        tab_results, tab_trades, tab_robustness, tab_report = st.tabs(
+            ["Results", "Trades", "Robustness", "Report"],
+            on_change="rerun",
+            key="dashboard_active_tab",
+        )
+        if tab_results.open:
+            with tab_results:
+                render_metric_cards(st, result)
+                render_charts(st, result)
+                render_gross_net_comparison(st, result)
+                render_exposure_and_cost_charts(st, result)
+        if tab_trades.open:
+            with tab_trades:
+                render_trade_table(st, result)
+        if tab_robustness.open:
+            with tab_robustness:
+                _render_robustness_tab(result)
+        if tab_report.open:
+            with tab_report:
+                bt_robustness, bt_cache_parts = _collect_backtest_robustness_evidence()
+                _render_report_tab(
+                    result,
+                    bt_robustness or None,
+                    cache_key_extra=bt_cache_parts,
+                    session_key="report_html",
+                )

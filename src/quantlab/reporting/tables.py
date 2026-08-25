@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING
 import numpy as np
 import pandas as pd
 
+from quantlab.reporting.research_summary import out_of_sample_scope
 from quantlab.risk.drawdown import max_drawdown
 from quantlab.risk.metrics import (
     annualized_volatility,
@@ -115,10 +116,14 @@ def yearly_returns_table(result: BacktestResult) -> pd.DataFrame:
 
 
 def subperiod_table(result: BacktestResult) -> pd.DataFrame:
-    """Full-sample and yearly performance, turnover and trade counts.
+    """Aggregate and yearly performance, turnover and trade counts.
 
-    ``Turnover (x)`` is the cumulative L1 turnover multiple within each row's
-    period; it is not annualised for the full-sample row.
+    The aggregate row is labelled "Out-of-sample" instead of "Full sample"
+    when ``result.metrics`` are themselves a walk-forward OOS series (see
+    ``research_summary.out_of_sample_scope``) — otherwise it would claim
+    the opposite of what that series actually is. ``Turnover (x)`` is the
+    cumulative L1 turnover multiple within each row's period; it is not
+    annualised for the aggregate row.
     """
     ppy = result.config.periods_per_year
     rf = result.config.backtest.risk_free_rate
@@ -127,7 +132,10 @@ def subperiod_table(result: BacktestResult) -> pd.DataFrame:
         result.turnover if result.turnover is not None else pd.Series(dtype=float)
     )
 
-    rows = [_subperiod_row("Full sample", rets, ppy, rf)]
+    aggregate_label = (
+        "Out-of-sample" if out_of_sample_scope(result) is not None else "Full sample"
+    )
+    rows = [_subperiod_row(aggregate_label, rets, ppy, rf)]
     for year, grp in rets.groupby(pd.DatetimeIndex(rets.index).year):
         rows.append(_subperiod_row(str(year), grp, ppy, rf))
 
@@ -136,7 +144,7 @@ def subperiod_table(result: BacktestResult) -> pd.DataFrame:
     trade_counts = []
     trades = result.trades
     for label in table["Period"]:
-        if label == "Full sample":
+        if label == aggregate_label:
             mask = pd.Series(True, index=rets.index)
         else:
             year_match = pd.DatetimeIndex(rets.index).year == int(label)
@@ -144,7 +152,7 @@ def subperiod_table(result: BacktestResult) -> pd.DataFrame:
         turnovers.append(float(turnover[mask].sum()) if len(turnover) else np.nan)
         if len(trades) and "timestamp" in trades.columns:
             ts = pd.to_datetime(trades["timestamp"])
-            if label == "Full sample":
+            if label == aggregate_label:
                 trade_counts.append(len(trades))
             else:
                 trade_counts.append(int((ts.dt.year == int(label)).sum()))

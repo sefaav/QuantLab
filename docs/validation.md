@@ -19,11 +19,16 @@ strategy and its parameters were fixed without consulting that block.
 `WalkForwardValidator.run(data, parameter_grid, train_window,
 validation_window, test_window, expanding=True)` performs these steps:
 
-1. Evaluate candidate parameters on each validation block.
+1. Evaluate candidate parameters on each validation block -- each candidate is
+   its own fresh backtest, restarted from cash on that block alone, not
+   chained to any other candidate or fold.
 2. Select the best finite score using `validation.optimization_metric`.
 3. Apply that choice to the untouched test block.
-4. Preserve portfolio, turnover and accounting state across fold boundaries.
-5. Stitch all test returns into one OOS curve.
+4. Stitch every fold's test-block returns into one continuous OOS curve,
+   preserving portfolio, turnover and accounting state *across fold
+   boundaries only* -- the OOS curve is one simulated run, but candidate
+   selection within a fold never sees that chained state.
+5. Report the stitched OOS curve as `WalkForwardResult.oos_result`.
 
 The Python API accepts an explicit `parameter_grid`. A YAML experiment can set
 the same candidates under `validation.parameter_grid`. The CLI and momentum
@@ -59,7 +64,16 @@ quantlab walk-forward --config configs/momentum_sp500.yaml
 ```
 
 This writes the walk-forward CSV artefacts and incorporates compatible evidence
-into the generated HTML report.
+into the generated HTML report. Progress (and an ETA) is shown live in the
+terminal or dashboard while it runs. An interruption (Ctrl+C, a crash, closing
+the terminal) is resumed automatically the next time the same command runs
+against the same experiment, config, data and code — only *completed* folds
+are skipped; whichever fold was still in progress at the moment of
+interruption is discarded and recomputed from its start, not resumed
+mid-fold. Pass `--fresh` to discard all saved progress and start over
+instead.
+The same applies to `stress-test`, `sensitivity` and `robustness` in
+walk-forward mode.
 
 ## Parameter sensitivity
 

@@ -34,11 +34,12 @@ def _config(strategy: dict, allocator: str = "equal_weight") -> ExperimentConfig
         {
             "experiment_name": "integration",
             "data": {
-                "source": "csv",
-                "symbols": ["AAA", "BBB", "CCC"],
+                "instruments": [
+                    {"symbol": s, "source": "csv", "calendar": "XNYS"}
+                    for s in ["AAA", "BBB", "CCC"]
+                ],
                 "start_date": "2019-01-01",
                 "end_date": "2021-06-01",
-                "market_calendar": "XNYS",
             },
             "strategy": strategy,
             "portfolio": {
@@ -54,7 +55,7 @@ def _config(strategy: dict, allocator: str = "equal_weight") -> ExperimentConfig
             },
             "backtest": {
                 "initial_capital": 100_000,
-                "benchmark_symbol": "AAA",
+                "benchmark": {"symbol": "AAA", "source": "csv", "calendar": "XNYS"},
                 "risk_free_rate": 0.02,
                 "periods_per_year": 252,
             },
@@ -127,6 +128,303 @@ def test_reproducible_same_inputs() -> None:
     assert r1.metrics["sharpe_ratio"] == r2.metrics["sharpe_ratio"]
 
 
+def test_direct_api_custom_execution_model_is_the_single_source_of_truth() -> None:
+    """docs/api.md recommends using BacktestEngine directly to supply a
+    custom execution-model instance. A config declaring 2 bps commission,
+    run instead with a custom ExecutionModel at 100 bps, must have its
+    equity curve, trade log and metadata/report all describe the *actual*
+    100 bps model, never a mix where accounting charges 100 bps but the
+    trade log or the report still claim the YAML's 2 bps."""
+    from quantlab.execution.costs import CommissionModel, SpreadModel
+    from quantlab.execution.slippage import ConstantSlippageModel
+    from quantlab.reporting.research_summary import methodology
+
+    data = _panel()
+    cfg = _config({"name": "buy_and_hold"})
+    assert cfg.commission_bps == 2.0  # confirms the YAML/actual values differ
+
+    custom_model = ExecutionModel(
+        commission=CommissionModel(100.0),
+        spread=SpreadModel(50.0),
+        slippage=ConstantSlippageModel(5.0),
+    )
+    result = BacktestEngine().run(
+        data,
+        BuyAndHoldStrategy(),
+        EqualWeightAllocator(),
+        custom_model,
+        cfg,
+    )
+
+    # Metadata must record the actual model, not the YAML's.
+    assert result.metadata["commission_bps"] == 100.0
+    assert result.metadata["spread_bps"] == 50.0
+    assert result.metadata["slippage_bps"] == 5.0
+
+    # The trade log's own per-fill commission must match: on any date with
+    # a real fill, commission = traded_notional * 100bps/10_000, not
+    # 2bps/10_000.
+    filled = result.trades.loc[result.trades["traded_notional"] > 0]
+    assert len(filled) > 0
+    implied_bps = (filled["commission"] / filled["traded_notional"]) * 10_000
+    assert implied_bps.round(6).unique().tolist() == [100.0]
+
+    # The report's methodology text must describe the actual model too.
+    text = methodology(result)
+    assert "commission 100.0 bps" in text
+    assert "50.0 bps full quoted spread" in text
+    assert "constant slippage 5.0 bps" in text
+    assert "2.0 bps" not in text
+
+
+def test_direct_api_records_the_actual_strategy_parameters_used() -> None:
+    """config.yaml in a saved bundle is still whatever config the caller
+    happened to pass alongside a custom strategy object -- it can declare
+    lookback_period=252 while the strategy actually used was built with
+    lookback_period=10. metadata must record the real, effective value and
+    flag that config.yaml doesn't reflect it, rather than leaving the only
+    persisted record of "what ran" silently wrong."""
+    from quantlab.strategies.mean_reversion import MeanReversionStrategy
+
+    data = _panel()
+    cfg = _config({"name": "mean_reversion", "parameters": {"lookback_period": 252}})
+    assert cfg.strategy.parameters["lookback_period"] == 252
+
+    mismatched = BacktestEngine().run(
+        data,
+        MeanReversionStrategy(lookback_period=10),
+        EqualWeightAllocator(),
+        ExecutionModel.from_config(cfg.execution),
+        cfg,
+    )
+    assert mismatched.metadata["strategy_parameters"]["lookback_period"] == 10
+    assert mismatched.metadata["config_yaml_reflects_strategy"] is False
+
+    matching = BacktestEngine().run(
+        data,
+        MeanReversionStrategy(lookback_period=252),
+        EqualWeightAllocator(),
+        ExecutionModel.from_config(cfg.execution),
+        cfg,
+    )
+    assert matching.metadata["strategy_parameters"]["lookback_period"] == 252
+    assert matching.metadata["config_yaml_reflects_strategy"] is True
+
+
+def test_direct_api_catches_a_mismatch_on_an_undeclared_default_parameter() -> None:
+    """config.yaml can omit a parameter entirely, leaving it at the
+    strategy's own constructor default (20 for mean_reversion's
+    lookback_period) -- comparing only *declared* config keys would never
+    even examine lookback_period here, silently missing a mismatch on the
+    exact parameter the config never mentions."""
+    from quantlab.strategies.mean_reversion import MeanReversionStrategy
+
+    data = _panel()
+    cfg = _config({"name": "mean_reversion", "parameters": {}})
+    assert "lookback_period" not in cfg.strategy.parameters
+
+    mismatched = BacktestEngine().run(
+        data,
+        MeanReversionStrategy(lookback_period=10),
+        EqualWeightAllocator(),
+        ExecutionModel.from_config(cfg.execution),
+        cfg,
+    )
+    assert mismatched.metadata["config_yaml_reflects_strategy"] is False
+
+    matching = BacktestEngine().run(
+        data,
+        MeanReversionStrategy(lookback_period=20),  # the constructor's own default
+        EqualWeightAllocator(),
+        ExecutionModel.from_config(cfg.execution),
+        cfg,
+    )
+    assert matching.metadata["config_yaml_reflects_strategy"] is True
+
+
+def test_direct_api_records_whether_config_yaml_reflects_the_allocator() -> None:
+    """Same guarantee as config_yaml_reflects_strategy, for the allocator: a
+    custom allocator instance can silently diverge from config.yaml's own
+    portfolio.allocator settings."""
+    from quantlab.portfolio.allocator import InverseVolatilityAllocator
+    from quantlab.strategies.buy_and_hold import BuyAndHoldStrategy
+
+    data = _panel()
+    # _config's own defaults: maximum_weight=0.6, volatility_window=40,
+    # backtest.periods_per_year=252.
+    cfg = _config({"name": "buy_and_hold"}, allocator="inverse_volatility")
+
+    mismatched = BacktestEngine().run(
+        data,
+        BuyAndHoldStrategy(),
+        InverseVolatilityAllocator(
+            volatility_window=10, maximum_weight=0.6, periods_per_year=252
+        ),
+        ExecutionModel.from_config(cfg.execution),
+        cfg,
+    )
+    assert mismatched.metadata["config_yaml_reflects_allocator"] is False
+
+    matching = BacktestEngine().run(
+        data,
+        BuyAndHoldStrategy(),
+        InverseVolatilityAllocator(
+            volatility_window=40, maximum_weight=0.6, periods_per_year=252
+        ),
+        ExecutionModel.from_config(cfg.execution),
+        cfg,
+    )
+    assert matching.metadata["config_yaml_reflects_allocator"] is True
+
+
+def test_direct_api_records_whether_config_yaml_reflects_execution() -> None:
+    """Same guarantee as config_yaml_reflects_strategy/_allocator, for the
+    execution model: a config declaring 2 bps commission, run instead with a
+    custom ExecutionModel at 100 bps, must have config_yaml_reflects_execution
+    report False -- and the HTML report's footer (see
+    test_reporting_hardening.py) must not claim reproducibility from
+    config.yaml when only this one of the three flags is false."""
+    from quantlab.execution.costs import CommissionModel, SpreadModel
+    from quantlab.execution.slippage import ConstantSlippageModel
+    from quantlab.strategies.buy_and_hold import BuyAndHoldStrategy
+
+    data = _panel()
+    cfg = _config({"name": "buy_and_hold"})
+    assert cfg.commission_bps == 2.0
+
+    mismatched = BacktestEngine().run(
+        data,
+        BuyAndHoldStrategy(),
+        EqualWeightAllocator(),
+        ExecutionModel(
+            commission=CommissionModel(100.0),
+            spread=SpreadModel(50.0),
+            slippage=ConstantSlippageModel(5.0),
+        ),
+        cfg,
+    )
+    assert mismatched.metadata["commission_bps"] == 100.0
+    assert mismatched.metadata["config_yaml_reflects_execution"] is False
+    # The other two components are untouched and still built correctly.
+    assert mismatched.metadata["config_yaml_reflects_strategy"] is True
+    assert mismatched.metadata["config_yaml_reflects_allocator"] is True
+
+    matching = BacktestEngine().run(
+        data,
+        BuyAndHoldStrategy(),
+        EqualWeightAllocator(),
+        ExecutionModel.from_config(cfg.execution),
+        cfg,
+    )
+    assert matching.metadata["config_yaml_reflects_execution"] is True
+
+
+def test_config_yaml_reflects_strategy_catches_a_behavior_overriding_subclass() -> None:
+    """A strategy subclass that overrides behaviour (here: always stays in
+    cash) without changing any constructor parameter is indistinguishable
+    from its base class by parameter comparison alone, or by an
+    `isinstance` check, or by `.name` (a class attribute the subclass
+    inherits unchanged) -- only exact class identity catches it."""
+    from quantlab.strategies.buy_and_hold import BuyAndHoldStrategy
+
+    class NeverBuys(BuyAndHoldStrategy):
+        def generate_signals(
+            self, data: pd.DataFrame, features: pd.DataFrame | None = None
+        ) -> pd.DataFrame:
+            return super().generate_signals(data, features) * 0.0
+
+    data = _panel()
+    cfg = _config({"name": "buy_and_hold"})
+
+    result = BacktestEngine().run(
+        data,
+        NeverBuys(),
+        EqualWeightAllocator(),
+        ExecutionModel.from_config(cfg.execution),
+        cfg,
+    )
+    assert result.metadata["config_yaml_reflects_strategy"] is False
+
+
+def test_config_yaml_reflects_allocator_catches_a_behavior_overriding_subclass() -> (
+    None
+):
+    """Same guarantee as the strategy case, for the allocator."""
+    from quantlab.strategies.buy_and_hold import BuyAndHoldStrategy
+
+    class AlwaysZeroAllocator(EqualWeightAllocator):
+        def allocate(self, signals, data):  # type: ignore[no-untyped-def]
+            return super().allocate(signals, data) * 0.0
+
+    data = _panel()
+    cfg = _config({"name": "buy_and_hold"})
+
+    result = BacktestEngine().run(
+        data,
+        BuyAndHoldStrategy(),
+        AlwaysZeroAllocator(),
+        ExecutionModel.from_config(cfg.execution),
+        cfg,
+    )
+    assert result.metadata["config_yaml_reflects_allocator"] is False
+
+
+def test_config_yaml_reflects_execution_catches_a_commission_subclass() -> None:
+    """A commission subclass that overrides the actual cost calculation
+    while still reporting the same `commission_bps` value is
+    indistinguishable by the numeric comparison alone -- only exact class
+    identity (`commission_class`) catches it."""
+    from quantlab.execution.costs import CommissionModel, SpreadModel
+    from quantlab.execution.slippage import ConstantSlippageModel
+    from quantlab.strategies.buy_and_hold import BuyAndHoldStrategy
+
+    class FreeCommission(CommissionModel):
+        def calculate(self, traded_notional: pd.DataFrame) -> pd.Series:
+            return super().calculate(traded_notional) * 0.0
+
+    data = _panel()
+    cfg = _config({"name": "buy_and_hold"})
+
+    result = BacktestEngine().run(
+        data,
+        BuyAndHoldStrategy(),
+        EqualWeightAllocator(),
+        ExecutionModel(
+            commission=FreeCommission(cfg.commission_bps),
+            spread=SpreadModel(cfg.execution.spread_bps),
+            slippage=ConstantSlippageModel(cfg.execution.slippage_bps),
+        ),
+        cfg,
+    )
+    assert result.metadata["config_yaml_reflects_execution"] is False
+
+
+def test_config_yaml_reflects_execution_catches_a_manipulated_volume_adv() -> None:
+    """Two volume-based slippage models with the same scalar parameters but
+    a different average_daily_volume must not compare as a match -- the
+    ADV itself is part of what actually drives the cost, via a deterministic
+    hash rather than embedding the whole matrix into metadata.json."""
+    from quantlab.strategies.buy_and_hold import BuyAndHoldStrategy
+
+    data = _panel()
+    base = _config({"name": "buy_and_hold"})
+    cfg = base.revalidated_copy(
+        update={
+            "execution": base.execution.revalidated_copy(
+                update={"slippage_model": "volume", "impact_coefficient": 0.1}
+            )
+        }
+    )
+
+    manipulated = ExecutionModel.from_config(
+        cfg.execution, average_daily_volume=999_999.0
+    )
+    result = BacktestEngine().run(
+        data, BuyAndHoldStrategy(), EqualWeightAllocator(), manipulated, cfg
+    )
+    assert result.metadata["config_yaml_reflects_execution"] is False
+
+
 @pytest.mark.parametrize(
     "benchmark_kind", ["symbol", "equal_weight", "first_asset", "cash"]
 )
@@ -135,7 +433,11 @@ def test_all_configured_benchmark_kinds_run_end_to_end(benchmark_kind: str) -> N
     cfg = _config({"name": "buy_and_hold"})
     benchmark_update = {
         "benchmark_kind": benchmark_kind,
-        "benchmark_symbol": "AAA" if benchmark_kind == "symbol" else None,
+        "benchmark": (
+            {"symbol": "AAA", "source": "csv", "calendar": "XNYS"}
+            if benchmark_kind == "symbol"
+            else None
+        ),
     }
     cfg = cfg.revalidated_copy(
         update={"backtest": cfg.backtest.revalidated_copy(update=benchmark_update)}
@@ -159,7 +461,7 @@ def test_equal_weight_benchmark_ignores_data_outside_configured_universe() -> No
     cfg = cfg.revalidated_copy(
         update={
             "backtest": cfg.backtest.revalidated_copy(
-                update={"benchmark_kind": "equal_weight", "benchmark_symbol": None}
+                update={"benchmark_kind": "equal_weight", "benchmark": None}
             )
         }
     )

@@ -6,8 +6,6 @@ the tests deterministic.
 
 from __future__ import annotations
 
-from datetime import date
-
 import numpy as np
 import pandas as pd
 import pytest
@@ -30,9 +28,7 @@ def test_yahoo_normalise_flat_columns() -> None:
         },
         index=pd.date_range("2020-01-01", periods=2, name="Date"),
     )
-    out = YahooFinanceDataSource._normalise(
-        raw, "spy", "1d", pd.Timestamp("2025-01-01"), date(2025, 1, 1)
-    )
+    out = YahooFinanceDataSource._normalise(raw, "spy", "1d")
     assert list(out["symbol"].unique()) == ["SPY"]
     assert out["close"].tolist() == [100.5, 101.5]
     assert out["timestamp"].is_monotonic_increasing
@@ -48,9 +44,7 @@ def test_yahoo_normalise_multiindex_columns() -> None:
         index=idx,
         columns=cols,
     )
-    out = YahooFinanceDataSource._normalise(
-        raw, "SPY", "1d", pd.Timestamp("2025-01-01"), date(2025, 1, 1)
-    )
+    out = YahooFinanceDataSource._normalise(raw, "SPY", "1d")
     assert len(out) == 2
     assert (out["close"] > 0).all()
 

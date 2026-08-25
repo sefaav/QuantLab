@@ -4,13 +4,22 @@
 experiment_name: mean_reversion_etfs
 
 data:
-  source: yahoo
-  symbols:
-    - SPY
-    - QQQ
-    - IWM
-    - EFA
-    - EEM
+  instruments:
+    - symbol: SPY
+      source: yahoo
+      calendar: XNYS
+    - symbol: QQQ
+      source: yahoo
+      calendar: XNYS
+    - symbol: IWM
+      source: yahoo
+      calendar: XNYS
+    - symbol: EFA
+      source: yahoo
+      calendar: XNYS
+    - symbol: EEM
+      source: yahoo
+      calendar: XNYS
   start_date: "2010-01-01"
   end_date: "2025-12-31"
   frequency: "1d"
@@ -38,7 +47,10 @@ execution:
 
 backtest:
   initial_capital: 100000
-  benchmark_symbol: SPY
+  benchmark:
+    symbol: SPY
+    source: yahoo
+    calendar: XNYS
   risk_free_rate: 0.02
   periods_per_year: 252
 
@@ -49,3 +61,16 @@ validation:
 
 reproducibility:
   random_seed: 42
+
+robustness:
+  stress_test:
+    enabled: true
+  bootstrap:
+    enabled: true
+  permutation_test:
+    enabled: true
+  sensitivity:
+    enabled: true
+    parameters:
+      lookback_period: [10, 20, 40]
+      entry_zscore: [1.5, 2.0, 2.5]

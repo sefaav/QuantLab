@@ -97,6 +97,32 @@ def strategy_parameter_names(name: str) -> set[str]:
     }
 
 
+def strategy_sweepable_parameter_names(name: str) -> set[str]:
+    """Return constructor keywords suitable for a 2-parameter sensitivity sweep.
+
+    Excludes boolean-defaulted parameters (structural switches such as
+    long_only/long_short/dynamic_hedge_ratio): sweeping one changes which
+    *other* parameters are even meaningful (e.g. bottom_fraction only
+    matters when long_short=True), and candidate values typed as text
+    (comma-separated) are easy to misparse as an int/str instead of a bool.
+    ``default_parameter_grid`` already treats these as fixed, not swept, for
+    walk-forward's own default grid — sensitivity applies the same rule.
+    """
+    registry_name = _registry_name(name)
+    if registry_name not in _REGISTRY:
+        raise StrategyError(
+            f"Unknown strategy '{registry_name}'. Registered: {sorted(_REGISTRY)}."
+        )
+    signature = inspect.signature(_REGISTRY[registry_name].__init__)
+    return {
+        parameter.name
+        for parameter in signature.parameters.values()
+        if parameter.name != "self"
+        and parameter.kind not in (parameter.VAR_POSITIONAL, parameter.VAR_KEYWORD)
+        and not isinstance(parameter.default, bool)
+    }
+
+
 def _unwrap_simple_type(annotation: Any) -> type | None:
     """Resolve plain and optional annotations used for early type checks."""
     if annotation is Any:

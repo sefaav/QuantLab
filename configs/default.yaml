@@ -3,10 +3,13 @@
 experiment_name: default_buy_and_hold
 
 data:
-  source: yahoo
-  symbols:
-    - SPY
-    - QQQ
+  instruments:
+    - symbol: SPY
+      source: yahoo
+      calendar: XNYS
+    - symbol: QQQ
+      source: yahoo
+      calendar: XNYS
   start_date: "2015-01-01"
   end_date: "2024-12-31"
   frequency: "1d"
@@ -31,8 +34,12 @@ backtest:
   initial_capital: 100000
   # symbol | equal_weight | first_asset | cash
   benchmark_kind: symbol
-  # Used only by the symbol benchmark.
-  benchmark_symbol: SPY
+  # Used only by the symbol benchmark. Matches the SPY instrument above
+  # exactly (same source/calendar), so its already-loaded data is reused.
+  benchmark:
+    symbol: SPY
+    source: yahoo
+    calendar: XNYS
   risk_free_rate: 0.0
   periods_per_year: 252
 
@@ -43,3 +50,15 @@ validation:
 
 reproducibility:
   random_seed: 42
+
+# `quantlab stress-test|bootstrap|permutation-test --config
+# configs/default.yaml` each run regardless of `enabled` below (only the
+# `robustness` orchestrator reads it). No `sensitivity` block: buy_and_hold
+# has no strategy parameters to sweep.
+robustness:
+  stress_test:
+    enabled: true
+  bootstrap:
+    enabled: true
+  permutation_test:
+    enabled: true

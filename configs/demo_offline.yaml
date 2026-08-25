@@ -4,18 +4,24 @@
 experiment_name: demo_offline_momentum
 
 data:
-  source: csv
-  symbols:
-    - SPY
-    - QQQ
-    - TLT
-    - GLD
+  # The synthetic symbols model US equity ETFs.
+  instruments:
+    - symbol: SPY
+      source: csv
+      calendar: XNYS
+    - symbol: QQQ
+      source: csv
+      calendar: XNYS
+    - symbol: TLT
+      source: csv
+      calendar: XNYS
+    - symbol: GLD
+      source: csv
+      calendar: XNYS
   start_date: "2019-01-01"
   end_date: "2023-10-30"
   frequency: "1d"
   missing_value_policy: "drop"
-  # The synthetic symbols model US equity ETFs.
-  market_calendar: XNYS
   # Allow the installed package to use its bundled synthetic demo files.
   use_bundled_demo_data: true
 
@@ -46,7 +52,10 @@ execution:
 
 backtest:
   initial_capital: 100000
-  benchmark_symbol: SPY
+  benchmark:
+    symbol: SPY
+    source: csv
+    calendar: XNYS
   risk_free_rate: 0.02
   periods_per_year: 252
 
@@ -60,3 +69,23 @@ validation:
 
 reproducibility:
   random_seed: 42
+
+# `quantlab stress-test|bootstrap|permutation-test|sensitivity --shipped-config
+# demo_offline` each run one technique regardless of `enabled` below (only
+# the `robustness` orchestrator reads it). Since validation.method is
+# walk_forward above, stress-test and sensitivity re-run the whole
+# walk-forward process per scenario/cell (slower, still fast offline on
+# this small bundled dataset); bootstrap and permutation-test just resample
+# the already-realised OOS returns.
+robustness:
+  stress_test:
+    enabled: true
+  bootstrap:
+    enabled: true
+  permutation_test:
+    enabled: true
+  sensitivity:
+    enabled: true
+    parameters:
+      lookback_period: [126, 189, 252]
+      top_fraction: [0.25, 0.50]

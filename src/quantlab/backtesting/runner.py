@@ -20,6 +20,7 @@ from quantlab.constants import (
     TRADING_DAYS_PER_YEAR,
 )
 from quantlab.data.base import price_matrix, volume_matrix
+from quantlab.data.calendar import is_247, uniform_calendar
 from quantlab.data.validator import DataQualityReport
 from quantlab.execution.execution_model import ExecutionModel
 from quantlab.portfolio.allocator import PortfolioAllocator, build_allocator
@@ -41,8 +42,11 @@ def build_allocator_from_config(config: ExperimentConfig) -> PortfolioAllocator:
             "periods_per_year": config.periods_per_year,
         }
     elif name == "volatility_targeting":
+        # PortfolioConfig._check_volatility_targeting_requires_target_volatility
+        # guarantees this is set -- never an implicit default.
+        assert config.portfolio.target_volatility is not None
         kwargs = {
-            "target_volatility": config.portfolio.target_volatility or 0.12,
+            "target_volatility": config.portfolio.target_volatility,
             "volatility_window": config.portfolio.volatility_window,
             "maximum_leverage": config.portfolio.maximum_leverage,
             "periods_per_year": config.periods_per_year,
@@ -72,21 +76,29 @@ def build_execution_from_config(
     shifted once so a fill never sees its own bar's volume. The configured
     frequency and market calendar determine the bars per day; an explicit
     metrics annualisation override does not alter this physical conversion.
+
+    When instruments trade on different calendars, this window falls back to
+    the equity (252-day, non-24/7) convention — a documented, accepted
+    approximation, since it only sizes a nominal liquidity window for
+    volume-based slippage rather than multiplying directly into reported
+    metrics the way ``periods_per_year`` does.
     """
     adv: pd.DataFrame | float | None = None
     if config.execution.slippage_model.lower() in {"volume", "volume_based"}:
         shares = volume_matrix(data)
         price = price_matrix(data, adjusted=False)
         bar_dollar_volume = shares * price
+        calendar = uniform_calendar(
+            instrument.calendar for instrument in config.data.instruments
+        )
+        market_is_247 = calendar is not None and is_247(calendar)
         frequency_table = (
             CRYPTO_FREQUENCY_TO_PERIODS_PER_YEAR
-            if config.data.is_247_market
+            if market_is_247
             else FREQUENCY_TO_PERIODS_PER_YEAR
         )
         days_per_year = (
-            CALENDAR_DAYS_PER_YEAR
-            if config.data.is_247_market
-            else TRADING_DAYS_PER_YEAR
+            CALENDAR_DAYS_PER_YEAR if market_is_247 else TRADING_DAYS_PER_YEAR
         )
         bars_per_day = frequency_table[str(config.frequency)] / days_per_year
         window = max(1, round(21 * bars_per_day))
@@ -137,7 +149,7 @@ def run_backtest_from_config(
 
         holdout = run_holdout_report(data, config, result)
         if holdout is not None:
-            result.metadata["holdout_oos_metrics"] = holdout.test_metrics
+            result.metadata["holdout_chronological_metrics"] = holdout.test_metrics
             result.metadata["holdout_report"] = holdout.to_metadata()
             result.holdout_test_returns = holdout.test_returns
             result.holdout_test_equity = holdout.test_equity

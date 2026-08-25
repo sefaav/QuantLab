@@ -73,7 +73,7 @@ def test_static_hedge_ratio_no_lookahead() -> None:
 
     # Changing future data must not change the beta value seen at earlier dates.
     b_changed_future = b.copy()
-    b_changed_future.iloc[15:] += 1000.0
+    b_changed_future.iloc[15:] = b_changed_future.iloc[15:].add(1000.0)
     beta_changed = _rolling_hedge_ratio(a, b_changed_future, window=5, dynamic=False)
     pd.testing.assert_series_equal(beta.iloc[:15], beta_changed.iloc[:15])
 
@@ -111,7 +111,7 @@ def test_slice_range_excludes_day_after_end() -> None:
 
     data = make_ohlcv("AAA", np.linspace(100, 110, 5), start="2020-01-01", freq="D")
     sliced = DataLoader._slice_range(
-        data, date(2020, 1, 1), date(2020, 1, 2), "1d", is_247_market=False
+        data, date(2020, 1, 1), date(2020, 1, 2), "1d", calendar="XNYS"
     )
     dates = sliced["timestamp"].dt.strftime("%Y-%m-%d").tolist()
     assert dates == ["2020-01-01", "2020-01-02"]
@@ -134,9 +134,10 @@ def test_benchmark_outside_universe_is_loaded_but_not_tradable(
         {
             "experiment_name": "bench_test",
             "data": {
-                "source": "csv",
-                "market_calendar": "XNYS",
-                "symbols": ["EWA", "EWC"],
+                "instruments": [
+                    {"symbol": "EWA", "source": "csv", "calendar": "XNYS"},
+                    {"symbol": "EWC", "source": "csv", "calendar": "XNYS"},
+                ],
                 "start_date": "2019-01-01",
                 "end_date": "2019-08-01",
             },
@@ -155,7 +156,10 @@ def test_benchmark_outside_universe_is_loaded_but_not_tradable(
                 "spread_bps": 3.0,
                 "slippage_bps": 2.0,
             },
-            "backtest": {"initial_capital": 100_000, "benchmark_symbol": "SPY"},
+            "backtest": {
+                "initial_capital": 100_000,
+                "benchmark": {"symbol": "SPY", "source": "csv", "calendar": "XNYS"},
+            },
         }
     )
     loader = DataLoader(
@@ -177,7 +181,9 @@ def test_unknown_validation_method_rejected() -> None:
             {
                 "experiment_name": "x",
                 "data": {
-                    "symbols": ["A"],
+                    "instruments": [
+                        {"symbol": "A", "source": "csv", "calendar": "XNYS"}
+                    ],
                     "start_date": "2020-01-01",
                     "end_date": "2021-01-01",
                 },
@@ -193,7 +199,9 @@ def test_unknown_optimization_metric_rejected_at_config_load() -> None:
             {
                 "experiment_name": "x",
                 "data": {
-                    "symbols": ["A"],
+                    "instruments": [
+                        {"symbol": "A", "source": "csv", "calendar": "XNYS"}
+                    ],
                     "start_date": "2020-01-01",
                     "end_date": "2021-01-01",
                 },
@@ -204,21 +212,23 @@ def test_unknown_optimization_metric_rejected_at_config_load() -> None:
 
 
 def test_crypto_monthly_annualises_at_12_not_252() -> None:
+    from quantlab.data.calendar import is_247
+
     cfg = ExperimentConfig.from_dict(
         {
             "experiment_name": "x",
             "data": {
-                "source": "csv",
-                "symbols": ["BTC"],
+                "instruments": [
+                    {"symbol": "BTC", "source": "csv", "calendar": "24/7"},
+                ],
                 "start_date": "2020-01-01",
                 "end_date": "2021-01-01",
                 "frequency": "1mo",
-                "market_calendar": "24/7",
             },
             "strategy": {"name": "buy_and_hold"},
         }
     )
-    assert cfg.data.is_247_market
+    assert is_247(cfg.data.instruments[0].calendar)
     assert cfg.periods_per_year == 12
 
 
@@ -262,7 +272,9 @@ def test_2x_hourly_mismatch_now_flagged() -> None:
 
     frame = _hourly_symbol_frame("2h", 40, "BTCUSDT")
     report = DataValidator(
-        expected_frequency="1h", min_coverage_rows=5, is_247_market=True
+        expected_frequency="1h",
+        min_coverage_rows=5,
+        symbol_calendars={"BTCUSDT": "24/7"},
     ).validate(frame)
     assert any("does not match the declared frequency" in w for w in report.warnings)
 
@@ -272,7 +284,9 @@ def test_2x_daily_mismatch_now_flagged() -> None:
 
     frame = _hourly_symbol_frame("2D", 40, "AAA")
     report = DataValidator(
-        expected_frequency="1d", min_coverage_rows=5, is_247_market=False
+        expected_frequency="1d",
+        min_coverage_rows=5,
+        symbol_calendars={"AAA": "XNYS"},
     ).validate(frame)
     assert any("does not match the declared frequency" in w for w in report.warnings)
 
@@ -298,7 +312,9 @@ def test_end_boundary_is_strictly_exclusive() -> None:
             "volume": 1000.0,
         }
     )
-    report = DataValidator(min_coverage_rows=1).validate(frame, end=date(2020, 1, 31))
+    report = DataValidator(
+        min_coverage_rows=1, symbol_calendars={"AAA": "XNYS"}
+    ).validate(frame, end=date(2020, 1, 31))
     assert any("rows after requested end" in w for w in report.warnings)
 
 
@@ -454,7 +470,12 @@ def test_source_hash_ttl_catches_a_mtime_preserving_edit(
 
     # Once the TTL has elapsed, the edit must be caught even though the
     # fingerprint never changed.
-    monkeypatch.setattr(engine, "_source_hash_computed_at", time.monotonic() - 61.0)
+    fingerprint, value, _computed_at = engine._source_hash_cache["source"]
+    monkeypatch.setitem(
+        engine._source_hash_cache,
+        "source",
+        (fingerprint, value, time.monotonic() - 61.0),
+    )
     mutated = engine._source_hash()
     assert mutated != original
 
@@ -481,7 +502,9 @@ def test_dotted_ticker_and_underscored_name_are_accepted() -> None:
     names commonly use underscores."""
     payload = _base_config_dict()
     payload["data"] = dict(payload["data"])
-    payload["data"]["symbols"] = ["BRK.B"]
+    payload["data"]["instruments"] = [
+        {"symbol": "BRK.B", "source": "csv", "calendar": "XNYS"}
+    ]
     payload["experiment_name"] = "my_experiment-2024.v1"
     cfg = ExperimentConfig.from_dict(payload)
     assert cfg.symbols == ["BRK.B"]
@@ -566,11 +589,11 @@ def test_safe_prevents_hash_shape_collision_end_to_end(tmp_path: Path) -> None:
             "volume": 0.0,
         }
     )
-    storage.write_symbol(first, "yahoo", "A=80", "1d")
-    storage.write_symbol(second, "yahoo", "A_80-5673847950", "1d")
+    storage.write_symbol(first, "yahoo", "A=80", "1d", calendar="XNYS")
+    storage.write_symbol(second, "yahoo", "A_80-5673847950", "1d", calendar="XNYS")
 
-    read_first = storage.read_symbol("yahoo", "A=80", "1d")
-    read_second = storage.read_symbol("yahoo", "A_80-5673847950", "1d")
+    read_first = storage.read_symbol("yahoo", "A=80", "1d", calendar="XNYS")
+    read_second = storage.read_symbol("yahoo", "A_80-5673847950", "1d", calendar="XNYS")
     assert read_first is not None
     assert read_second is not None
     assert (read_first["close"] == 1.1).all()
@@ -725,14 +748,14 @@ def test_slice_range_drops_a_look_ahead_hourly_bar() -> None:
     )
 
     narrow = DataLoader._slice_range(
-        data, date(2024, 1, 5), date(2024, 1, 5), "1h", is_247_market=True
+        data, date(2024, 1, 5), date(2024, 1, 5), "1h", calendar="24/7"
     )
     # The 22:30 bar's bucket (23:30) closes before the request's own end
     # boundary; the 23:30 bar's bucket (00:30 the next day) does not.
     assert list(narrow["timestamp"]) == [pd.Timestamp("2024-01-05 22:30")]
 
     wider = DataLoader._slice_range(
-        data, date(2024, 1, 5), date(2024, 1, 6), "1h", is_247_market=True
+        data, date(2024, 1, 5), date(2024, 1, 6), "1h", calendar="24/7"
     )
     assert len(wider) == 2
 
@@ -747,10 +770,10 @@ def test_trading_day_helpers_normalize_the_time_component() -> None:
     )
 
     assert last_trading_day_on_or_before(
-        pd.Timestamp("2024-01-06 15:30"), is_247_market=False
+        pd.Timestamp("2024-01-06 15:30"), calendar="XNYS"
     ) == pd.Timestamp("2024-01-05")
     assert first_trading_day_on_or_after(
-        pd.Timestamp("2024-01-07 15:30"), is_247_market=False
+        pd.Timestamp("2024-01-07 15:30"), calendar="XNYS"
     ) == pd.Timestamp("2024-01-08")
 
 

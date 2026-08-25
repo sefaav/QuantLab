@@ -56,9 +56,16 @@ src/quantlab/
   costs or accounting.
 - **The execution model computes costs** from weight *changes*, independent of
   which strategy or allocator produced them.
-- **The backtest engine is the only place** where signals, weights, costs and
-  returns are combined — and it does so in one fixed order, with the
-  weight-shift step as a hard, tested barrier against look-ahead bias.
+- **Signals, weights, costs and returns are combined in one fixed order**,
+  with the weight-shift step as a hard, tested barrier against look-ahead
+  bias. `BacktestEngine.run()` is that assembly for a single backtest.
+  `WalkForwardValidator._build_oos_result()` (`quantlab.validation.
+  walk_forward`) independently assembles the same stitched-OOS-series case,
+  reusing the same underlying accounting/trade-log/benchmark/metrics
+  functions in the same order rather than calling `BacktestEngine.run()`
+  itself — a fix that touches how that assembly step works (e.g. which
+  execution-model fields the trade log or metadata reads) currently needs
+  applying at both call sites, not one shared entry point.
 
 ## Data flow shapes
 

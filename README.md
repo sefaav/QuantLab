@@ -14,7 +14,9 @@ sensitivity and bootstrap.
 > results.
 
 The goal is **not** to claim a profitable strategy. It is to demonstrate a
-rigorous, reproducible research process with no information leakage.
+rigorous, reproducible research process, designed to prevent common
+look-ahead leakage through delayed execution. Custom strategies remain
+responsible for causal feature and signal construction.
 
 ---
 
@@ -27,9 +29,12 @@ rigorous, reproducible research process with no information leakage.
   interface.
 - **Realistic costs** — explicit commission, spread and (constant or
   volume-based) slippage; every result reports **gross vs net**.
-- **Look-ahead-safe engine** — signals are strictly shifted before returns; the
-  separation between *signal at t*, *position at t+1* and *realised return* is
-  enforced and unit-tested.
+- **Delayed-execution barrier** — signals are strictly shifted before returns;
+  the separation between *signal at t*, *position at t+1* and *realised
+  return* is enforced and unit-tested. This prevents the common look-ahead
+  leak of acting on a signal the same period it was formed — a custom
+  strategy that reads future rows directly remains responsible for its own
+  causal construction.
 - **Risk analytics** — Sharpe, Sortino, Calmar, max drawdown, VaR/CVaR,
   exposures, benchmark alpha/beta, and more, implemented from first principles.
 - **Walk-forward validation** — expanding/rolling windows, parameter selection
@@ -141,13 +146,38 @@ already covers the requested period.
 ## Command-line interface
 
 ```bash
-quantlab download      --config configs/momentum_sp500.yaml
-quantlab backtest      --config configs/momentum_sp500.yaml
-quantlab walk-forward  --config configs/momentum_sp500.yaml
-quantlab report        --experiment cross_sectional_momentum_etfs
+quantlab download          --config configs/momentum_sp500.yaml
+quantlab backtest          --config configs/momentum_sp500.yaml
+quantlab walk-forward      --config configs/momentum_sp500.yaml
+quantlab stress-test       --config configs/momentum_sp500.yaml
+quantlab bootstrap         --config configs/momentum_sp500.yaml
+quantlab permutation-test  --config configs/momentum_sp500.yaml
+quantlab sensitivity       --config configs/momentum_sp500.yaml
+quantlab robustness        --config configs/momentum_sp500.yaml
+quantlab report            --experiment cross_sectional_momentum_etfs
 quantlab dashboard
 quantlab --help
 ```
+
+`stress-test`/`bootstrap`/`permutation-test`/`sensitivity` each run one
+robustness technique (with a matching `--n-iterations`/`--block-size`/
+`--param-x` etc. override); `robustness` runs every technique enabled under
+a config's `robustness:` block in one pass. All five branch on
+`validation.method`: with `walk_forward`, each starts from the same
+walk-forward-stitched out-of-sample result rather than a single backtest, so
+the evidence never silently comes from a different validation method than
+the one configured. `stress-test` and `sensitivity` re-run the whole
+walk-forward selection process per scenario/candidate, since each one
+represents a different cost/methodology assumption or parameter to
+re-optimise under. `bootstrap` and `permutation-test` do not: they resample
+or permute the walk-forward's already-realised out-of-sample return series
+statistically, without re-running the selection process itself.
+
+`walk-forward`, `stress-test`, `sensitivity` and `robustness` show a live
+progress bar with an ETA in the terminal, and checkpoint their progress to
+disk as they go — an interruption (Ctrl+C, a crash, closing the terminal)
+resumes automatically on the next matching run instead of starting over.
+Pass `--fresh` to discard a checkpoint and start clean.
 
 Each backtest, walk-forward or report run writes a structured artefact
 folder under the generated-reports directory. In a source checkout this is
@@ -182,6 +212,18 @@ Regenerate them (after `quantlab download` for each config) with
 ```bash
 streamlit run src/quantlab/dashboard/app.py
 ```
+
+A **Backtest** / **Walk-forward** mode switch sits above the sidebar.
+Walk-forward mode runs the same train/validation/test parameter selection as
+`quantlab walk-forward`, with its own sidebar (windows, expanding mode,
+optimization metric, parameter-grid picker) and Results/Trades/Robustness/
+Report tabs built from the stitched out-of-sample result, driven by a live
+progress bar with an ETA while a run is in flight. Both modes' Robustness
+tab includes stress tests, block bootstrap, a Monte Carlo permutation test
+and a 2-parameter sensitivity heatmap,
+individually or via "Run all robustness tests" — in Walk-forward mode,
+stress tests and sensitivity re-run the whole selection process per
+scenario/cell rather than a single backtest.
 
 ![QuantLab dashboard results](reports/figures/dashboard_results.png)
 

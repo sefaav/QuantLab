@@ -41,6 +41,9 @@ _OPTIONAL_ARTIFACTS = (
     "walk_forward_oos_returns.csv",
     "walk_forward_oos_equity.csv",
     "stress_tests.csv",
+    "bootstrap_summary.csv",
+    "permutation_test.csv",
+    "sensitivity.csv",
 )
 
 _SAVE_IN_PROGRESS_MARKER = ".quantlab-save-in-progress"
@@ -50,8 +53,35 @@ _VALIDATION_ARTIFACT_INDEX = {
     "walk_forward_oos_returns.csv": True,
     "walk_forward_oos_equity.csv": True,
     "stress_tests.csv": False,
+    "bootstrap_summary.csv": False,
+    "permutation_test.csv": False,
+    "sensitivity.csv": False,
 }
 _VALIDATION_ARTIFACTS = frozenset(_VALIDATION_ARTIFACT_INDEX)
+
+#: The four on-demand robustness techniques, each normally run and saved by
+#: its own separate CLI command — the CSV filename each one's `robustness`
+#: dict key round-trips through, used by `load_previous_robustness_artifacts`
+#: to recover what a sibling command already saved.
+_ROBUSTNESS_ARTIFACT_FILES: dict[str, str] = {
+    "stress_tests": "stress_tests.csv",
+    "bootstrap": "bootstrap_summary.csv",
+    "permutation_test": "permutation_test.csv",
+    "sensitivity": "sensitivity.csv",
+}
+
+#: The subset of `_ROBUSTNESS_ARTIFACT_FILES` keys whose CLI command also
+#: records its own effective run parameters (n_iterations/block_size/etc.,
+#: including any CLI override) in `metadata.json` -- stress-test has no
+#: such override, so it has no entry here. Used by
+#: `load_previous_robustness_artifacts` to recover a sibling command's
+#: parameters alongside its CSV, not just the numbers with no record of
+#: what produced them.
+_ROBUSTNESS_RUN_PARAMS_KEYS: dict[str, str] = {
+    "bootstrap": "bootstrap_run_params",
+    "permutation_test": "permutation_test_run_params",
+    "sensitivity": "sensitivity_run_params",
+}
 
 
 def _bundle_lock_path(output_directory: Path) -> Path:
@@ -280,9 +310,13 @@ class BacktestResult:
                     holdout_meta["validation_period"],
                 )
             )
+        # Labeled plainly "Test", not "out-of-sample": whether it's
+        # genuinely OOS depends on parameters having been fixed before
+        # looking at it, a property of the user's workflow this table
+        # can't verify (see quantlab.validation.holdout's module docstring).
         blocks.append(
             (
-                "Test (out-of-sample)",
+                "Test",
                 holdout_meta["test_metrics"],
                 holdout_meta["test_period"],
             )
@@ -330,7 +364,11 @@ class BacktestResult:
                 already verified a file left by a *different* command still
                 describes this exact config/result (e.g. ``quantlab report``
                 reusing a still-valid prior ``walk-forward`` run's CSVs) and
-                will not be rewriting it itself this call.
+                will not be rewriting it itself this call. Prefer
+                :func:`save_with_walk_forward_reuse` or
+                :func:`save_with_robustness_reuse` over passing this
+                directly — both already implement the provenance check this
+                parameter exists to make safe.
             validation_artifacts: Walk-forward and stress-test CSV values to
                 write as part of this save. Their checksums are added to the
                 metadata only after the atomic file replacements succeed.
@@ -445,11 +483,18 @@ class BacktestResult:
                 out / name,
                 index=_VALIDATION_ARTIFACT_INDEX[name],
             )
-        if validation_artifacts:
-            self.metadata["walk_forward_csv_checksums"] = {
-                name: hashlib.sha256((out / name).read_bytes()).hexdigest()
-                for name in validation_artifacts
-            }
+        # Recomputed from whatever _VALIDATION_ARTIFACTS files actually exist
+        # in `out` now (freshly written above, or kept as-is via
+        # keep_artifacts), never merged with whatever this call started
+        # with -- otherwise a save that legitimately drops an artefact (not
+        # re-supplied and not kept) would leave a stale checksum in
+        # metadata.json for a file the pre-save cleanup above just deleted,
+        # even though nothing currently on disk matches it any more.
+        self.metadata["walk_forward_csv_checksums"] = {
+            name: hashlib.sha256((out / name).read_bytes()).hexdigest()
+            for name in _VALIDATION_ARTIFACTS
+            if (out / name).is_file()
+        }
 
         # Render once, then reuse the same images on disk and in the HTML.
         self.save_warnings = []
@@ -488,6 +533,20 @@ class BacktestResult:
             logger.warning(msg)
             self.save_warnings.append(msg)
 
+        # Explicit, persisted methodology marker: different CLI commands in
+        # walk-forward mode save fundamentally different `self` objects to
+        # the same experiment directory -- `quantlab walk-forward`'s own
+        # `report` handler saves a full-sample result with OOS evidence
+        # only attached as metadata, while `stress-test`/`bootstrap`/
+        # `permutation`/`sensitivity`/`robustness` save the OOS-stitched
+        # result itself (`wf.oos_result`) -- so metrics.json/metadata.json
+        # can mean two different things depending on which command ran
+        # last. Recording which one `self.metrics` actually is removes the
+        # ambiguity for anyone reading the bundle later, without needing to
+        # know the CLI's own save conventions.
+        from quantlab.reporting.research_summary import out_of_sample_scope
+
+        self.metadata["result_scope"] = out_of_sample_scope(self) or "full_sample"
         self.metadata["save_warnings"] = self.save_warnings
         _write_text_atomic(
             out / "metrics.json",
@@ -513,14 +572,46 @@ class BacktestResult:
         return out
 
 
+def _load_metadata_json(metadata_path: Path, *, exp_dir: Path) -> dict[str, Any] | None:
+    """Return a prior bundle's parsed ``metadata.json``, or ``None`` to refuse reuse.
+
+    A hand-edited or partially-written ``metadata.json`` must never crash
+    reuse detection with a raw ``json.JSONDecodeError`` -- malformed
+    metadata is exactly the case reuse must refuse, the same as a missing
+    file or a mismatched config/data/code hash.
+    """
+    try:
+        return dict(json.loads(metadata_path.read_text(encoding="utf-8")))
+    except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as exc:
+        logger.warning(
+            "Not reusing prior metadata in %s: %s could not be parsed as "
+            "valid JSON (%s).",
+            exp_dir,
+            metadata_path.name,
+            exc,
+        )
+        return None
+
+
 def load_previous_walk_forward_robustness(
     exp_dir: Path, result: BacktestResult
 ) -> dict[str, Any] | None:
     """Load prior walk-forward tables only when their provenance still matches.
 
-    Configuration, data, source, dependencies and available Git identity are
-    compared before reuse. Required CSVs must exist and match any recorded
-    checksums; otherwise the function logs why and returns ``None``.
+    Provenance is config + data_hash + generator_hash + dependency_versions,
+    not git_dirty/git_commit -- same reasoning as
+    `load_previous_robustness_artifacts`: `generator_hash` already hashes
+    current file contents, uncommitted changes included, so it alone gives
+    the guarantee needed here. A separate git_dirty/git_commit gate on top
+    would be strictly redundant once generator_hash matches, and actively
+    wrong: `git status`/`git_dirty` cover the *whole* repository, not just
+    the files generator_hash is scoped to, so an unrelated uncommitted
+    change elsewhere (docs, configs, tests, ...) would refuse a `report`
+    regeneration even though the exact same generator code, config and data
+    produced it -- exactly the ordinarily-uncommitted development session
+    this reuse mechanism exists to serve. Required CSVs must exist and
+    match any recorded checksums; otherwise the function logs why and
+    returns ``None``.
     """
     save_marker = exp_dir / _SAVE_IN_PROGRESS_MARKER
     if save_marker.exists() or save_marker.is_symlink():
@@ -535,8 +626,8 @@ def load_previous_walk_forward_robustness(
     metadata_path = exp_dir / "metadata.json"
     if not metadata_path.is_file():
         return None
-    old_metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-    if "walk_forward_oos_metrics" not in old_metadata:
+    old_metadata = _load_metadata_json(metadata_path, exp_dir=exp_dir)
+    if old_metadata is None or "walk_forward_oos_metrics" not in old_metadata:
         return None
 
     old_snapshot = old_metadata.get("walk_forward_config_snapshot")
@@ -561,38 +652,24 @@ def load_previous_walk_forward_robustness(
         )
         return None
 
-    old_code_hash = old_metadata.get("code_hash")
-    new_code_hash = result.metadata.get("code_hash")
-    if old_code_hash is None or old_code_hash != new_code_hash:
+    # generator_hash, not code_hash: this gates reuse of a *saved bundle*
+    # (walk-forward CSVs/metadata), so it must also catch a change to the
+    # CLI's own orchestration of how that bundle gets assembled or reused
+    # -- code_hash deliberately excludes cli.py (see
+    # `quantlab.backtesting.engine._source_hash`'s docstring) and would
+    # miss exactly that.
+    old_generator_hash = old_metadata.get("generator_hash")
+    new_generator_hash = result.metadata.get("generator_hash")
+    if old_generator_hash is None or old_generator_hash != new_generator_hash:
         logger.warning(
             "Not reusing walk-forward metadata for %s: the quantlab source "
             "code that produced it no longer matches the source code used "
-            "to regenerate this report (code_hash differs or is missing), "
-            "even though the config and data are unchanged.",
+            "to regenerate this report (generator_hash differs or is "
+            "missing), even though the config and data are unchanged.",
             exp_dir,
         )
         return None
 
-    if old_metadata.get("git_dirty") or result.metadata.get("git_dirty"):
-        logger.warning(
-            "Not reusing walk-forward metadata for %s: the working tree was "
-            "dirty at walk-forward time, at report time, or both — a commit "
-            "hash comparison can't be trusted when uncommitted changes may "
-            "not be reflected in it.",
-            exp_dir,
-        )
-        return None
-    old_commit = old_metadata.get("git_commit")
-    new_commit = result.metadata.get("git_commit")
-    if old_commit is not None and new_commit is not None and old_commit != new_commit:
-        logger.warning(
-            "Not reusing walk-forward metadata for %s: the code that "
-            "produced it no longer matches the code used to regenerate this "
-            "report (git_commit differs), even though the config and data "
-            "are unchanged.",
-            exp_dir,
-        )
-        return None
     old_deps = old_metadata.get("dependency_versions")
     new_deps = result.metadata.get("dependency_versions")
     if old_deps is None or old_deps != new_deps:
@@ -618,32 +695,42 @@ def load_previous_walk_forward_robustness(
         )
         return None
 
-    # Checksums detect edits or corruption after the original run.
+    # Checksums detect edits or corruption after the original run. Recorded
+    # unconditionally alongside walk_forward_oos_metrics at every save (see
+    # save()), so their absence here is itself a red flag -- an incomplete
+    # or tampered metadata.json -- not a free pass to skip verification.
     old_checksums = old_metadata.get("walk_forward_csv_checksums")
+    if not old_checksums:
+        logger.warning(
+            "Not reusing walk-forward metadata for %s: no CSV checksums "
+            "were recorded, so the required artefacts' integrity can't be "
+            "verified before reuse.",
+            exp_dir,
+        )
+        return None
     stress_path = exp_dir / "stress_tests.csv"
     # Stress results are optional but checked when present.
     checksummed = [*required, stress_path] if stress_path.is_file() else required
-    if old_checksums:
-        # A recorded stress checksum means the file existed originally.
-        if stress_path.name in old_checksums and not stress_path.is_file():
+    # A recorded stress checksum means the file existed originally.
+    if stress_path.name in old_checksums and not stress_path.is_file():
+        logger.warning(
+            "Not reusing walk-forward metadata for %s: stress_tests.csv "
+            "was present when its checksum was recorded but is missing "
+            "now (the file was deleted since).",
+            exp_dir,
+        )
+        return None
+    for path in checksummed:
+        actual = hashlib.sha256(path.read_bytes()).hexdigest()
+        if old_checksums.get(path.name) != actual:
             logger.warning(
-                "Not reusing walk-forward metadata for %s: stress_tests.csv "
-                "was present when its checksum was recorded but is missing "
-                "now (the file was deleted since).",
+                "Not reusing walk-forward metadata for %s: %s no longer "
+                "matches the checksum recorded at walk-forward time "
+                "(the file was modified or corrupted on disk since).",
                 exp_dir,
+                path.name,
             )
             return None
-        for path in checksummed:
-            actual = hashlib.sha256(path.read_bytes()).hexdigest()
-            if old_checksums.get(path.name) != actual:
-                logger.warning(
-                    "Not reusing walk-forward metadata for %s: %s no longer "
-                    "matches the checksum recorded at walk-forward time "
-                    "(the file was modified or corrupted on disk since).",
-                    exp_dir,
-                    path.name,
-                )
-                return None
 
     result.metadata["walk_forward_oos_metrics"] = old_metadata[
         "walk_forward_oos_metrics"
@@ -677,7 +764,15 @@ def load_previous_walk_forward_robustness(
 
 
 def save_with_walk_forward_reuse(result: BacktestResult, exp_dir: str | Path) -> Path:
-    """Save a result while preserving compatible walk-forward artefacts."""
+    """Save a result while preserving compatible walk-forward artefacts.
+
+    Also preserves compatible bootstrap/permutation-test/sensitivity
+    artefacts, exactly like `save_with_robustness_reuse` does for those
+    commands' own saves -- otherwise `quantlab report` (which calls this,
+    not that) would delete still-valid evidence a `bootstrap`/
+    `permutation-test`/`sensitivity` run had just saved, since neither of
+    those techniques is itself part of "walk-forward" evidence.
+    """
     exp_dir = Path(exp_dir)
     exp_dir.mkdir(parents=True, exist_ok=True)
     # Keep the provenance read and the following save under one lock; otherwise
@@ -693,11 +788,220 @@ def save_with_walk_forward_reuse(result: BacktestResult, exp_dir: str | Path) ->
             }
             if "stress_tests" in robustness:
                 keep_artifacts.add("stress_tests.csv")
+        # Sibling on-demand techniques (bootstrap/permutation-test/
+        # sensitivity), each saved by its own separate CLI command --
+        # `load_previous_walk_forward_robustness` only ever knows about
+        # walk-forward's own CSVs plus stress_tests, so a technique it
+        # doesn't recognise (e.g. bootstrap_summary.csv) would otherwise be
+        # silently deleted by this save's cleanup, even when still valid.
+        previous_robustness_artifacts = load_previous_robustness_artifacts(
+            exp_dir, result
+        )
+        # `robustness`'s own keys (from walk-forward reuse above) win on any
+        # overlap -- same precedence `save_with_robustness_reuse` gives a
+        # freshly-computed technique over a merely-recovered one.
+        merged_robustness = {**previous_robustness_artifacts, **(robustness or {})}
+        validation_artifacts: dict[str, pd.Series | pd.DataFrame] = {}
+        for key, frame in previous_robustness_artifacts.items():
+            filename = _ROBUSTNESS_ARTIFACT_FILES[key]
+            if filename not in keep_artifacts:
+                validation_artifacts[filename] = frame
         return result._save_locked(
             exp_dir,
-            robustness=robustness,
+            robustness=merged_robustness or None,
             keep_artifacts=keep_artifacts,
-            validation_artifacts={},
+            validation_artifacts=validation_artifacts,
+        )
+
+
+def load_previous_robustness_artifacts(
+    exp_dir: Path, result: BacktestResult
+) -> dict[str, Any]:
+    """Recover prior stress/bootstrap/permutation/sensitivity artefacts.
+
+    Each on-demand robustness technique is run and saved by its own CLI
+    command; without this, running `stress-test` then `bootstrap` against
+    the same experiment would silently delete `stress_tests.csv`, since
+    `result.save()`'s pre-save cleanup removes any `_OPTIONAL_ARTIFACTS`
+    file the current call doesn't re-supply. Applies to holdout/plain
+    backtests; walk-forward has its own, longer-lived
+    `load_previous_walk_forward_robustness`. Callers merge the result under
+    their own freshly computed values, so a stale entry never survives a
+    technique actually being recomputed.
+
+    Provenance is config + data_hash + generator_hash + dependency_versions,
+    not git_dirty/git_commit (unlike `load_previous_walk_forward_robustness`):
+    `generator_hash` already hashes current file contents including
+    uncommitted changes, so it alone gives the guarantee needed here,
+    without refusing reuse in an ordinarily-uncommitted working session.
+    Uses `generator_hash`, not the narrower `code_hash`, because this CSV
+    bundle's shape and reuse decision are themselves partly determined by
+    CLI orchestration code (`code_hash` deliberately excludes `cli.py`; see
+    `quantlab.backtesting.engine._source_hash`'s docstring).
+
+    Returns an empty dict, rather than raising, whenever provenance can't
+    be confirmed to still match ``result``.
+    """
+    save_marker = exp_dir / _SAVE_IN_PROGRESS_MARKER
+    if save_marker.exists() or save_marker.is_symlink():
+        logger.warning(
+            "Not reusing prior robustness artefacts in %s: a prior bundle "
+            "save did not complete (%s is still present).",
+            exp_dir,
+            save_marker.name,
+        )
+        return {}
+
+    metadata_path = exp_dir / "metadata.json"
+    config_path = exp_dir / "config.yaml"
+    if not metadata_path.is_file() or not config_path.is_file():
+        return {}
+    old_metadata = _load_metadata_json(metadata_path, exp_dir=exp_dir)
+    if old_metadata is None:
+        return {}
+
+    try:
+        old_config = ExperimentConfig.from_yaml(config_path)
+    except Exception as exc:
+        logger.warning(
+            "Not reusing prior robustness artefacts in %s: %s could not be "
+            "parsed as a valid config (%s).",
+            exp_dir,
+            config_path.name,
+            exc,
+        )
+        return {}
+    if old_config.model_dump(mode="json") != result.config.model_dump(mode="json"):
+        logger.warning(
+            "Not reusing prior robustness artefacts in %s: the config that "
+            "produced them no longer matches the config used for this run.",
+            exp_dir,
+        )
+        return {}
+
+    required_matches = (
+        ("data_hash", "the data used to produce them no longer matches this run's"),
+        (
+            "generator_hash",
+            "the quantlab source code that produced them no longer matches "
+            "this run's (generator_hash differs or is missing)",
+        ),
+        (
+            "dependency_versions",
+            "the dependency versions (numpy/pandas/etc.) that produced them "
+            "no longer match this run's",
+        ),
+    )
+    for key, reason in required_matches:
+        old_value = old_metadata.get(key)
+        if old_value is None or old_value != result.metadata.get(key):
+            logger.warning(
+                "Not reusing prior robustness artefacts in %s: %s.",
+                exp_dir,
+                reason,
+            )
+            return {}
+
+    # Checksums detect edits or corruption after the original run. Recorded
+    # unconditionally for every validation artefact at save time (see
+    # _save_locked) -- these robustness CSVs go through that same path --
+    # so their absence here is itself a red flag, not a free pass to skip
+    # verification, mirroring load_previous_walk_forward_robustness above.
+    old_checksums = old_metadata.get("walk_forward_csv_checksums") or {}
+    recovered: dict[str, Any] = {}
+    for key, filename in _ROBUSTNESS_ARTIFACT_FILES.items():
+        path = exp_dir / filename
+        if not path.is_file():
+            continue
+        recorded = old_checksums.get(filename)
+        if recorded is None:
+            logger.warning(
+                "Not reusing %s from %s: no checksum was recorded for it, "
+                "so its integrity can't be verified before reuse.",
+                filename,
+                exp_dir,
+            )
+            continue
+        actual = hashlib.sha256(path.read_bytes()).hexdigest()
+        if recorded != actual:
+            logger.warning(
+                "Not reusing %s from %s: it no longer matches the checksum "
+                "recorded when it was saved (the file was modified or "
+                "corrupted on disk since).",
+                filename,
+                exp_dir,
+            )
+            continue
+        try:
+            recovered[key] = pd.read_csv(path)
+        except Exception as exc:
+            logger.warning(
+                "Not reusing %s from %s: the file could not be read (%s).",
+                filename,
+                exp_dir,
+                exc,
+            )
+            continue
+        # Recover this technique's own effective run parameters alongside
+        # its CSV -- without this, e.g. bootstrap_summary.csv could survive
+        # a later permutation-test save while metadata.json's
+        # bootstrap_run_params (n_iterations, block_size, including any CLI
+        # override) silently disappears, leaving the surviving numbers with
+        # no record of what actually produced them. Never overwrites a key
+        # already present: when this technique is the one being freshly
+        # recomputed this run, its own fresh run params (set by the CLI
+        # command before this call) must win, exactly like `{**previous,
+        # **robustness}` already lets a fresh DataFrame win over a
+        # recovered one.
+        run_params_key = _ROBUSTNESS_RUN_PARAMS_KEYS.get(key)
+        if (
+            run_params_key is not None
+            and run_params_key in old_metadata
+            and run_params_key not in result.metadata
+        ):
+            result.metadata[run_params_key] = old_metadata[run_params_key]
+    return recovered
+
+
+def save_with_robustness_reuse(
+    result: BacktestResult,
+    exp_dir: str | Path,
+    *,
+    robustness: dict[str, Any],
+    validation_artifacts: Mapping[str, pd.Series | pd.DataFrame] | None = None,
+) -> Path:
+    """Save a result while preserving compatible sibling robustness artefacts.
+
+    Used by each individual robustness CLI command (stress-test, bootstrap,
+    permutation-test, sensitivity) instead of calling `result.save()`
+    directly, so that e.g. running `bootstrap` after `stress-test` on the
+    same experiment directory keeps the earlier stress-test evidence in the
+    regenerated report instead of silently deleting it. ``robustness`` and
+    ``validation_artifacts`` are this call's freshly computed results (using
+    the same `_ROBUSTNESS_ARTIFACT_FILES`/CSV-filename keys); a technique
+    genuinely being recomputed here always overrides whatever a prior save
+    left behind for that same technique.
+    """
+    exp_dir = Path(exp_dir)
+    exp_dir.mkdir(parents=True, exist_ok=True)
+    new_validation_artifacts = (
+        dict(validation_artifacts) if validation_artifacts else {}
+    )
+    # Keep the provenance read and the following save under one lock; otherwise
+    # another process could replace the reused CSVs between those two steps.
+    with _locked_bundle(exp_dir):
+        previous = load_previous_robustness_artifacts(exp_dir, result)
+        merged_robustness = {**previous, **robustness}
+        merged_validation_artifacts = dict(new_validation_artifacts)
+        for key, frame in previous.items():
+            filename = _ROBUSTNESS_ARTIFACT_FILES[key]
+            if filename not in merged_validation_artifacts:
+                merged_validation_artifacts[filename] = frame
+        return result._save_locked(
+            exp_dir,
+            robustness=merged_robustness or None,
+            keep_artifacts=set(),
+            validation_artifacts=merged_validation_artifacts,
         )
 
 

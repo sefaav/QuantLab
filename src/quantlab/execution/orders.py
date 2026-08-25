@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+from numbers import Integral
+
 import numpy as np
 import pandas as pd
+from pandas.api.types import is_bool_dtype
 
 from quantlab.exceptions import BacktestError
 
@@ -63,10 +66,91 @@ def equity_before_period(
     return previous
 
 
-def executed_weights(held_weights: pd.DataFrame) -> pd.DataFrame:
-    """Shift decisions by one period so period-t returns use t-1 weights."""
+def shift_respecting_tradability(
+    frame: pd.DataFrame, periods: int, tradable: pd.DataFrame
+) -> pd.DataFrame:
+    """Shift each column by ``periods`` steps among its own tradable rows.
+
+    A raw ``frame.shift(periods)`` treats every row as a valid execution
+    opportunity for every symbol -- wrong whenever a symbol is untradable on
+    some rows (a closed market on a mixed-calendar timeline): a decision
+    made on the last date a symbol was tradable must "execute" on that
+    symbol's *next real tradable opportunity*, not on the next raw row,
+    which may be a date the symbol can't actually trade on at all (e.g. a
+    weekend row that only exists because another, always-open instrument
+    shares the same combined index). For each column, a closed row repeats
+    the last value already produced for a tradable row (frozen, no
+    reallocation happens while closed); a tradable row takes the value from
+    ``periods`` tradable rows back for that column, never a raw row-count
+    lookback.
+    """
+    if isinstance(periods, (bool, np.bool_)) or not isinstance(periods, Integral):
+        raise BacktestError("periods must be a non-negative integer.")
+    if int(periods) < 0:
+        raise BacktestError("periods must be a non-negative integer.")
+    if not isinstance(tradable, pd.DataFrame):
+        raise BacktestError("tradable must be a pandas DataFrame.")
+    if not frame.index.equals(tradable.index) or not frame.columns.equals(
+        tradable.columns
+    ):
+        raise BacktestError(
+            "tradable must have exactly the same index and columns as frame, "
+            "in the same order."
+        )
+    non_bool_columns = [
+        column for column, dtype in tradable.dtypes.items() if not is_bool_dtype(dtype)
+    ]
+    if non_bool_columns:
+        raise BacktestError(
+            f"tradable must contain only boolean values; column(s) "
+            f"{non_bool_columns} are not boolean dtype (e.g. a string "
+            "'False' would otherwise silently coerce to True)."
+        )
+    result = pd.DataFrame(index=frame.index, columns=frame.columns, dtype=float)
+    for column in frame.columns:
+        values = frame[column].to_numpy(dtype=float)
+        mask = tradable[column].to_numpy(dtype=bool)
+        tradable_positions = np.flatnonzero(mask)
+        # A column's first `periods` tradable positions have no tradable
+        # row "behind" them to reference -- there is no prior decision,
+        # so (matching the same "start flat" convention as
+        # executed_weights' own row-0 override) this is 0.0, not NaN. Left
+        # as NaN, the ffill below would propagate NaN through every row
+        # before the column's first real shifted value -- e.g. a symbol
+        # closed on the very first rows of a mixed-calendar history that
+        # opens on, say, a Friday -- and executed_weights' row-0-only
+        # override can't reach those later rows to fix them.
+        shifted_at_tradable = np.zeros(len(tradable_positions))
+        if len(tradable_positions) > periods:
+            source = tradable_positions[: len(tradable_positions) - periods]
+            shifted_at_tradable[periods:] = values[source]
+        full = np.full(len(frame.index), np.nan)
+        full[tradable_positions] = shifted_at_tradable
+        column_result = pd.Series(full, index=frame.index)
+        # Same "no prior decision -> flat" convention for any row before a
+        # column's first tradable one (a symbol closed on the very first
+        # row(s) of the whole history): ffill alone cannot reach *leading*
+        # NaN, since there is nothing earlier to carry forward.
+        result[column] = column_result.ffill().fillna(0.0)
+    return result
+
+
+def executed_weights(
+    held_weights: pd.DataFrame, *, tradable: pd.DataFrame | None = None
+) -> pd.DataFrame:
+    """Shift decisions by one period so period-t returns use t-1 weights.
+
+    When ``tradable`` is given, the shift is per-symbol tradability-aware
+    (see :func:`shift_respecting_tradability`): a symbol's decision only
+    appears in the returned frame on its own next tradable row, not the raw
+    next row -- a decision made right before a closure (e.g. Friday, before
+    a weekend) is never misattributed as trading during the closure itself.
+    """
     held = validate_execution_frame(held_weights, name="held_weights")
-    executed = held.shift(1)
+    if tradable is not None:
+        executed = shift_respecting_tradability(held, 1, tradable)
+    else:
+        executed = held.shift(1)
     if len(executed):
         executed.iloc[0, :] = 0.0
     return executed

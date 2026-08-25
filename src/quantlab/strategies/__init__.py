@@ -12,6 +12,7 @@ from quantlab.strategies.base import (
     build_strategy,
     register_strategy,
     strategy_parameter_names,
+    strategy_sweepable_parameter_names,
     validate_strategy_parameters,
 )
 
@@ -43,5 +44,6 @@ __all__ = [
     "register_strategy",
     "rolling_hedge_parameters",
     "strategy_parameter_names",
+    "strategy_sweepable_parameter_names",
     "validate_strategy_parameters",
 ]

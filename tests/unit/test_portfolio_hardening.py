@@ -13,6 +13,7 @@ import pandas as pd
 import pytest
 
 import quantlab.portfolio as portfolio
+from quantlab.config import PortfolioConfig
 from quantlab.exceptions import InvalidConfigurationError
 from quantlab.portfolio.allocator import (
     InverseVolatilityAllocator,
@@ -31,6 +32,7 @@ from quantlab.portfolio.rebalancing import (
     apply_rebalancing,
     cap_turnover,
     compute_turnover,
+    rebalance_and_cap_turnover,
     rebalance_dates,
 )
 from quantlab.portfolio.volatility_targeting import (
@@ -143,6 +145,25 @@ def test_rebalance_dates_rejects_invalid_frequency_and_duplicate_index() -> None
         rebalance_dates(duplicate, "daily")
     with pytest.raises(InvalidConfigurationError, match="Unknown"):
         rebalance_dates(pd.date_range("2024-01-01", periods=2), "yearly")
+
+
+def test_rebalance_and_cap_turnover_rejects_a_non_boolean_tradable_mask() -> None:
+    """A `tradable` column carrying object-dtype values (e.g. the literal
+    string 'False') must be rejected explicitly -- a raw
+    `.to_numpy(dtype=bool)` conversion would otherwise silently coerce any
+    non-empty string, including 'False' itself, to True. Mirrors
+    quantlab.execution.orders.validate_execution_frame's identical guard."""
+    idx = pd.date_range("2024-01-01", periods=3, freq="D")
+    targets = pd.DataFrame({"A": [1.0, 1.0, 1.0], "B": [0.0, 0.0, 0.0]}, index=idx)
+    tradable = pd.DataFrame(
+        {"A": [True, True, True], "B": ["False", "False", "False"]},
+        index=idx,
+        dtype=object,
+    )
+    with pytest.raises(InvalidConfigurationError, match="boolean"):
+        rebalance_and_cap_turnover(
+            targets, PortfolioConfig(allocator="equal_weight"), tradable=tradable
+        )
 
 
 def test_turnover_functions_reject_non_finite_weights() -> None:

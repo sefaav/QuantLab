@@ -7,16 +7,31 @@
 experiment_name: cross_sectional_momentum_etfs
 
 data:
-  source: yahoo
-  symbols:
-    - SPY   # US large cap
-    - QQQ   # US tech / Nasdaq 100
-    - IWM   # US small cap
-    - EFA   # Developed ex-US
-    - EEM   # Emerging markets
-    - TLT   # Long US treasuries
-    - GLD   # Gold
-    - VNQ   # US real estate
+  instruments:
+    - symbol: SPY   # US large cap
+      source: yahoo
+      calendar: XNYS
+    - symbol: QQQ   # US tech / Nasdaq 100
+      source: yahoo
+      calendar: XNYS
+    - symbol: IWM   # US small cap
+      source: yahoo
+      calendar: XNYS
+    - symbol: EFA   # Developed ex-US
+      source: yahoo
+      calendar: XNYS
+    - symbol: EEM   # Emerging markets
+      source: yahoo
+      calendar: XNYS
+    - symbol: TLT   # Long US treasuries
+      source: yahoo
+      calendar: XNYS
+    - symbol: GLD   # Gold
+      source: yahoo
+      calendar: XNYS
+    - symbol: VNQ   # US real estate
+      source: yahoo
+      calendar: XNYS
   start_date: "2008-01-01"
   end_date: "2025-12-31"
   frequency: "1d"
@@ -50,7 +65,10 @@ execution:
 
 backtest:
   initial_capital: 100000
-  benchmark_symbol: SPY
+  benchmark:
+    symbol: SPY
+    source: yahoo
+    calendar: XNYS
   risk_free_rate: 0.02
   periods_per_year: 252
 
@@ -69,3 +87,21 @@ validation:
 
 reproducibility:
   random_seed: 42
+
+robustness:
+  stress_test:
+    enabled: true
+  bootstrap:
+    enabled: true
+    n_iterations: 1000
+    block_size: 5
+  permutation_test:
+    enabled: true
+    n_iterations: 1000
+  sensitivity:
+    enabled: true
+    # Signal timing vs selection breadth — distinct from the walk-forward
+    # grid above (lookback_period/skip_period), not a repeat of it.
+    parameters:
+      lookback_period: [126, 189, 252]
+      top_fraction: [0.10, 0.25, 0.50]

@@ -5,8 +5,6 @@ on:
     branches:
     - main
     - master
-    paths:
-    - .github/workflows/semgrep.yml
   schedule:
   # random HH:MM to avoid a load spike on GitHub Actions at 00:00
   - cron: 34 7 * * *
@@ -17,10 +15,15 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-    env:
-      SEMGREP_APP_TOKEN: ${{ secrets.SEMGREP_APP_TOKEN }}
     container:
       image: semgrep/semgrep
     steps:
-    - uses: actions/checkout@v6
-    - run: semgrep ci
+    - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+    # Standalone mode (no Semgrep AppSec Platform connection, no
+    # SEMGREP_APP_TOKEN): `semgrep ci` requires that token to actually be
+    # configured as a repo secret, and fails outright for a fork PR or a
+    # Dependabot PR either way (GitHub withholds secrets from both for
+    # security). `p/ci` is the same ruleset pre-commit's own semgrep hook
+    # already runs locally (see .pre-commit-config.yaml), so CI enforces
+    # exactly what a contributor's pre-commit run already checked.
+    - run: semgrep scan --config p/ci --error --skip-unknown-extensions .
