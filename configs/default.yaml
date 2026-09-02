@@ -18,6 +18,9 @@ data:
 strategy:
   name: buy_and_hold
   parameters: {}
+  # Price series the strategy's own generate_signals() reads. Execution/
+  # costs always use the raw close regardless of this setting.
+  signal_price_type: adjusted_close
 
 portfolio:
   allocator: equal_weight
@@ -60,5 +63,15 @@ robustness:
     enabled: true
   bootstrap:
     enabled: true
+    # Width of the reported p_lower/p_upper percentile band (0.90 -> the
+    # 5th/95th percentiles).
+    confidence_level: 0.90
   permutation_test:
     enabled: true
+
+# Where and what a run saves. Omit entirely for the default: reports/
+# generated/<experiment_name>/, both artefact toggles enabled.
+output:
+  # directory: reports/generated/default_buy_and_hold
+  save_html_report: true
+  save_figures: true

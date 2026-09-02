@@ -17,7 +17,8 @@ strategy and its parameters were fixed without consulting that block.
 ## Walk-forward validation
 
 `WalkForwardValidator.run(data, parameter_grid, train_window,
-validation_window, test_window, expanding=True)` performs these steps:
+validation_window, test_window, expanding=True, step=None)` performs these
+steps:
 
 1. Evaluate candidate parameters on each validation block -- each candidate is
    its own fresh backtest, restarted from cash on that block alone, not
@@ -29,6 +30,17 @@ validation_window, test_window, expanding=True)` performs these steps:
    boundaries only* -- the OOS curve is one simulated run, but candidate
    selection within a fold never sees that chained state.
 5. Report the stitched OOS curve as `WalkForwardResult.oos_result`.
+
+`step` controls how far each fold's train window advances relative to the
+previous one. It defaults to `test_window` (contiguous, non-overlapping test
+blocks -- the still-recommended default). A smaller `step` overlaps test
+blocks for denser evaluation (more folds, more compute); on an overlapping
+date the stitched OOS curve keeps the most recent fold's decision, and two
+folds whose test blocks collapse onto the same first execution date are
+rejected outright rather than silently misattributing observations. `step`
+must not exceed `test_window`: a larger step would leave gaps in the
+stitched OOS curve that CAGR/annualisation (which assume regularly spaced
+observations) cannot account for, so this is rejected at run time too.
 
 The Python API accepts an explicit `parameter_grid`. A YAML experiment can set
 the same candidates under `validation.parameter_grid`. The CLI and momentum
@@ -44,6 +56,7 @@ validation:
   train_window: 1000
   validation_window: 252
   test_window: 126
+  step: 126  # optional; defaults to test_window
   optimization_metric: sharpe
   parameter_grid:
     lookback_period: [126, 189, 252]
@@ -92,6 +105,12 @@ sampling retains dependence within each sampled block, but does not reproduce
 the complete time-series process. These are historical sampling estimates, not
 forecasts.
 
+`BootstrapResult.summary(confidence_level=0.90)` reports each statistic's
+median plus a `p_lower`/`p_upper` percentile band at the requested confidence
+level (0.90 -> the 5th/95th percentiles, the default). Set
+`robustness.bootstrap.confidence_level` in YAML to change it for a saved
+experiment's own bootstrap run.
+
 ## Random-sign test
 
 `monte_carlo_permutation` randomly flips the sign of per-period excess returns
@@ -103,10 +122,31 @@ strategy is genuine, profitable or likely to work in the future.
 
 ## Stress tests
 
-`run_stress_tests(data, config)` evaluates higher commissions and slippage, an
-extra execution-delay period, removal of the ten best days, and—when the
-universe is large enough—a reduced tradable universe. Expected scenario
-failures are retained in the table instead of being silently omitted.
+`run_stress_tests(data, config)` evaluates elevated commissions and
+slippage, an extra execution-delay period, removal of the best days, and a
+reduced tradable universe. Every scenario -- including one whose universe is
+too small to leave at least 2 tradable symbols, or that fails for any other
+reason -- keeps its own row in the table with `status="failed"` and an error
+message, rather than being silently omitted or aborting the whole run.
+
+Every scenario's magnitude comes from `robustness.stress_test` in YAML, each
+a list so more than one magnitude can be evaluated per scenario type (e.g.
+`execution_delays: [1, 2, 5]` adds a scenario row per delay); an empty list
+disables that scenario type entirely. `commission_multipliers`/
+`slippage_multipliers` must be strictly greater than 1.0 -- these model
+elevated, adverse costs, not a cheaper-than-baseline scenario. The default
+configuration evaluates:
+
+```yaml
+robustness:
+  stress_test:
+    enabled: true
+    commission_multipliers: [2.0, 5.0]
+    slippage_multipliers: [2.0]
+    execution_delays: [1]
+    best_days_removed: [10]
+    reduce_universe_by: [1]  # symbols dropped from the tail of the universe
+```
 
 ## What none of this proves
 

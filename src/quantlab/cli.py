@@ -176,6 +176,25 @@ def _load_config(config_path: Path) -> ExperimentConfig:
     return ExperimentConfig.from_yaml(config_path)
 
 
+def _resolve_output_directory(
+    cfg: ExperimentConfig, cli_override: Path | None = None
+) -> Path:
+    """Resolve the bundle directory: CLI flag > ``output.directory`` > default.
+
+    Every command below except ``backtest`` has no CLI flag of its own
+    (``cli_override`` stays ``None``), so for them this is just
+    :func:`~quantlab.backtesting.result.resolve_experiment_directory` --
+    the same resolution :meth:`~quantlab.backtesting.result.BacktestResult.
+    save` itself falls back to for callers (like ``backtest``) that pass
+    ``output_directory`` straight through instead of pre-resolving it here.
+    """
+    if cli_override is not None:
+        return cli_override
+    from quantlab.backtesting.result import resolve_experiment_directory
+
+    return resolve_experiment_directory(cfg, default_root=GENERATED_REPORTS_DIR)
+
+
 def _echo_data_warnings(report: DataQualityReport, *, limit: int = 10) -> None:
     """Print a limited number of data-quality warnings.
 
@@ -268,7 +287,9 @@ def _run_active_validation(
         )
 
         grid = _default_grid(cfg)
-        train_window, validation_window, test_window = resolve_walk_forward_windows(cfg)
+        train_window, validation_window, test_window, step = (
+            resolve_walk_forward_windows(cfg)
+        )
         _echo_step("Running walk-forward validation")
         _echo_parameter_grid(cfg.strategy_name, grid)
         wf = WalkForwardValidator(cfg).run(
@@ -278,6 +299,7 @@ def _run_active_validation(
             validation_window=validation_window,
             test_window=test_window,
             expanding=cfg.validation.expanding,
+            step=step,
             on_progress=_make_cli_progress_callback("Walk-forward"),
             checkpoint_path=checkpoint_path,
         )
@@ -313,6 +335,24 @@ def _walk_forward_validation_artifacts(
     }
 
 
+def _update_resolved_config(result: BacktestResult, **fields: Any) -> None:
+    """Merge fields into ``result.metadata["resolved_config"]``.
+
+    A single consolidated, always-current record of the CONCRETE values a
+    run actually used after applying every default/fallback (e.g. a walk-
+    forward window left unset in YAML, or the default parameter grid) --
+    for full reproducibility even as this project's own defaults change
+    over time. Additive only: never replaces the whole dict, since a
+    single ``robustness`` command run can populate this from several
+    independent techniques (stress-test, bootstrap, permutation-test,
+    sensitivity) on the same result. Does not replace or rename any of the
+    existing, narrower keys (``bootstrap_run_params``, ``walk_forward_
+    parameter_grid``, etc.) that other code already reads by their exact
+    name (e.g. ``load_previous_walk_forward_robustness``).
+    """
+    result.metadata.setdefault("resolved_config", {}).update(fields)
+
+
 def _attach_walk_forward_evidence(
     result: BacktestResult,
     wf: WalkForwardResult | None,
@@ -332,6 +372,41 @@ def _attach_walk_forward_evidence(
     # series to work from and so omits benchmark comparisons, gross/net,
     # turnover and every other metric the full pipeline already derived.
     result.metadata["walk_forward_oos_metrics"] = dict(result.metrics)
+
+
+def _strategy_diagnostics_robustness(
+    data: pd.DataFrame, cfg: ExperimentConfig
+) -> dict[str, object]:
+    """Return the current strategy's report diagnostics, keyed by section.
+
+    Returns ``{}`` when its Strategy Explorer profile declares none.
+    Generic by profile lookup (``quantlab.dashboard.explorer.profile``) --
+    no strategy name appears here, mirroring the dashboard's own dispatch.
+    Cheap relative to bootstrap/stress-test techniques, so always
+    recomputed fresh rather than persisted/reused across runs. A failed
+    computation still contributes a status note (never silently omitted --
+    the report would otherwise look identical to a strategy with no
+    diagnostics declared at all).
+    """
+    import quantlab.dashboard.explorer.profiles  # noqa: F401  (registration)
+    from quantlab.dashboard.explorer.profile import get_profile
+
+    profile = get_profile(cfg.strategy_name)
+    if profile is None or profile.results_diagnostics is None:
+        return {}
+    try:
+        diagnostics = profile.results_diagnostics.compute(data, cfg)
+        section = profile.results_diagnostics.report_section(diagnostics)
+    except Exception as exc:
+        logger.exception("Strategy Explorer results diagnostics failed")
+        import pandas as pd
+
+        from quantlab.reporting.sections import DiagnosticsSection
+
+        section = DiagnosticsSection(
+            table=pd.DataFrame({"Status": [f"Could not compute: {exc}"]}),
+        )
+    return {profile.results_diagnostics.key: section}
 
 
 def _compute_stress_tests(
@@ -361,6 +436,18 @@ def _compute_stress_tests(
     return run_stress_tests(
         data, cfg, on_progress=on_progress, checkpoint_path=checkpoint_path
     )
+
+
+def _stress_test_resolved_config(cfg: ExperimentConfig) -> dict[str, list[float | int]]:
+    """Return the stress-test magnitude lists this run actually used."""
+    settings = cfg.robustness.stress_test
+    return {
+        "commission_multipliers": list(settings.commission_multipliers),
+        "slippage_multipliers": list(settings.slippage_multipliers),
+        "execution_delays": list(settings.execution_delays),
+        "best_days_removed": list(settings.best_days_removed),
+        "reduce_universe_by": list(settings.reduce_universe_by),
+    }
 
 
 def _compute_bootstrap(
@@ -403,7 +490,16 @@ def _compute_bootstrap(
         "n_iterations": effective_n_iterations,
         "block_size": effective_block_size,
     }
-    return boot.summary()
+    _update_resolved_config(
+        result,
+        bootstrap={
+            "n_iterations": effective_n_iterations,
+            "block_size": effective_block_size,
+            "confidence_level": cfg.robustness.bootstrap.confidence_level,
+            "seed": cfg.random_seed,
+        },
+    )
+    return boot.summary(confidence_level=cfg.robustness.bootstrap.confidence_level)
 
 
 def _compute_permutation_test(
@@ -432,6 +528,13 @@ def _compute_permutation_test(
     result.metadata["permutation_test_run_params"] = {
         "n_iterations": effective_n_iterations,
     }
+    _update_resolved_config(
+        result,
+        permutation_test={
+            "n_iterations": effective_n_iterations,
+            "seed": cfg.random_seed,
+        },
+    )
     return outcome
 
 
@@ -625,7 +728,8 @@ def backtest(
         result = run_backtest_from_config(data, cfg, data_quality_report=report)
 
         _echo_step("Saving results")
-        out_dir = result.save(output)
+        robustness_extra = _strategy_diagnostics_robustness(data, cfg)
+        out_dir = result.save(output, robustness=robustness_extra or None)
 
         typer.echo("")
         typer.echo(result.summary())
@@ -659,7 +763,7 @@ def walk_forward(
             resolve_walk_forward_windows,
         )
 
-        out = GENERATED_REPORTS_DIR / cfg.experiment_name
+        out = _resolve_output_directory(cfg)
         wf_checkpoint = out / ".checkpoint_walk_forward.pkl"
         stress_checkpoint = out / ".checkpoint_stress_test.pkl"
         if fresh:
@@ -675,18 +779,21 @@ def walk_forward(
         grid = _default_grid(cfg)
         _echo_parameter_grid(cfg.strategy_name, grid)
         validator = WalkForwardValidator(cfg)
-        train_window, validation_window, test_window = resolve_walk_forward_windows(cfg)
+        train_window, validation_window, test_window, step = (
+            resolve_walk_forward_windows(cfg)
+        )
         if not (
             cfg.validation.train_window
             and cfg.validation.validation_window
             and cfg.validation.test_window
+            and cfg.validation.step
         ):
             # Apply the documented CLI defaults and make every fallback visible.
             typer.secho(
                 "  using default window(s) "
                 f"(train={train_window}, validation={validation_window}, "
-                f"test={test_window}) — set validation.train_window / "
-                "validation_window / test_window explicitly to override.",
+                f"test={test_window}, step={step}) — set validation.train_window / "
+                "validation_window / test_window / step explicitly to override.",
                 fg=typer.colors.YELLOW,
             )
         wf = validator.run(
@@ -696,6 +803,7 @@ def walk_forward(
             validation_window=validation_window,
             test_window=test_window,
             expanding=cfg.validation.expanding,
+            step=step,
             on_progress=_make_cli_progress_callback("Walk-forward"),
             checkpoint_path=wf_checkpoint,
         )
@@ -756,12 +864,20 @@ def walk_forward(
         # Save the numerical bundle and its validation artefacts under one marker
         # and cross-process lock. BacktestResult computes checksums only after each
         # CSV has been atomically replaced.
+        # No strategy-diagnostics section here (unlike `backtest`/`report`):
+        # each walk-forward fold can select different parameters than
+        # `cfg`'s own, and covers only that fold's slice of history -- a
+        # diagnostic computed once, on the full history with the base
+        # config's parameters, would not actually describe what any
+        # individual fold traded (see the dashboard's equivalent choice in
+        # `_render_walk_forward_diagnostics_note`).
+        robustness_extra: dict[str, Any] = {
+            "walk_forward": wf.summary_table(),
+            "stress_tests": stress,
+        }
         result.save(
             out,
-            robustness={
-                "walk_forward": wf.summary_table(),
-                "stress_tests": stress,
-            },
+            robustness=robustness_extra,
             validation_artifacts={
                 "walk_forward_results.csv": wf.summary_table(),
                 "walk_forward_oos_returns.csv": wf.oos_returns.rename("return"),
@@ -805,7 +921,7 @@ def stress_test(
         from quantlab.validation.checkpoint import clear_checkpoint
         from quantlab.validation.robustness import stress_test_checkpoint_paths
 
-        out = GENERATED_REPORTS_DIR / cfg.experiment_name
+        out = _resolve_output_directory(cfg)
         wf_checkpoint = out / ".checkpoint_walk_forward.pkl"
         stress_checkpoint = out / ".checkpoint_stress_test.pkl"
         if fresh:
@@ -834,6 +950,7 @@ def stress_test(
         _attach_walk_forward_evidence(
             result, wf, validation_artifacts, robustness_extra
         )
+        _update_resolved_config(result, stress_test=_stress_test_resolved_config(cfg))
 
         _echo_step("Saving results")
         from quantlab.backtesting.result import save_with_robustness_reuse
@@ -882,9 +999,7 @@ def bootstrap(
         from quantlab.data.loader import DataLoader
         from quantlab.validation.checkpoint import clear_checkpoint
 
-        wf_checkpoint = (
-            GENERATED_REPORTS_DIR / cfg.experiment_name / ".checkpoint_walk_forward.pkl"
-        )
+        wf_checkpoint = _resolve_output_directory(cfg) / ".checkpoint_walk_forward.pkl"
         if fresh:
             clear_checkpoint(wf_checkpoint)
 
@@ -911,12 +1026,14 @@ def bootstrap(
 
         out_dir = save_with_robustness_reuse(
             result,
-            GENERATED_REPORTS_DIR / cfg.experiment_name,
+            _resolve_output_directory(cfg),
             robustness=robustness_extra,
             validation_artifacts=validation_artifacts,
         )
+        from quantlab.reporting.tables import format_bootstrap_summary
+
         typer.echo("")
-        typer.echo(summary.to_string(index=False))
+        typer.echo(format_bootstrap_summary(summary).to_string(index=False))
         typer.echo("")
         _echo_save_outcome(result, f"Saved to {out_dir}")
     except QuantLabError as exc:
@@ -947,9 +1064,7 @@ def permutation_test(
         from quantlab.data.loader import DataLoader
         from quantlab.validation.checkpoint import clear_checkpoint
 
-        wf_checkpoint = (
-            GENERATED_REPORTS_DIR / cfg.experiment_name / ".checkpoint_walk_forward.pkl"
-        )
+        wf_checkpoint = _resolve_output_directory(cfg) / ".checkpoint_walk_forward.pkl"
         if fresh:
             clear_checkpoint(wf_checkpoint)
 
@@ -977,7 +1092,7 @@ def permutation_test(
 
         out_dir = save_with_robustness_reuse(
             result,
-            GENERATED_REPORTS_DIR / cfg.experiment_name,
+            _resolve_output_directory(cfg),
             robustness=robustness_extra,
             validation_artifacts=validation_artifacts,
         )
@@ -1029,7 +1144,7 @@ def sensitivity(
         from quantlab.data.loader import DataLoader
         from quantlab.validation.checkpoint import clear_checkpoint
 
-        out = GENERATED_REPORTS_DIR / cfg.experiment_name
+        out = _resolve_output_directory(cfg)
         wf_checkpoint = out / ".checkpoint_walk_forward.pkl"
         sensitivity_checkpoint = out / ".checkpoint_sensitivity.pkl"
         if fresh:
@@ -1068,6 +1183,12 @@ def sensitivity(
             "parameter_y": y_name,
             "values_y": y_values,
         }
+        _update_resolved_config(
+            result,
+            sensitivity={
+                "parameters": {x_name: x_values, y_name: y_values},
+            },
+        )
 
         validation_artifacts: dict[str, Any] = {"sensitivity.csv": sens}
         robustness_extra: dict[str, Any] = {"sensitivity": sens}
@@ -1117,7 +1238,7 @@ def robustness(
         from quantlab.validation.checkpoint import clear_checkpoint
         from quantlab.validation.robustness import stress_test_checkpoint_paths
 
-        out = GENERATED_REPORTS_DIR / cfg.experiment_name
+        out = _resolve_output_directory(cfg)
         wf_checkpoint = out / ".checkpoint_walk_forward.pkl"
         stress_checkpoint = out / ".checkpoint_stress_test.pkl"
         sensitivity_checkpoint = out / ".checkpoint_sensitivity.pkl"
@@ -1139,6 +1260,13 @@ def robustness(
         _attach_walk_forward_evidence(
             result, wf, validation_artifacts, robustness_extra
         )
+        if wf is None:
+            # Mirrors `backtest`/`report`'s own inclusion of this section --
+            # omitted only in walk-forward mode (each fold can select
+            # different parameters than this config's base values, so a
+            # single full-history diagnostic would misrepresent any
+            # individual fold; see `_render_walk_forward_diagnostics_note`).
+            robustness_extra.update(_strategy_diagnostics_robustness(data, cfg))
 
         ran_any = False
         if cfg.robustness.stress_test.enabled:
@@ -1153,6 +1281,9 @@ def robustness(
             )
             validation_artifacts["stress_tests.csv"] = stress
             robustness_extra["stress_tests"] = stress
+            _update_resolved_config(
+                result, stress_test=_stress_test_resolved_config(cfg)
+            )
             typer.echo("")
             typer.echo(stress.to_string(index=False))
 
@@ -1162,8 +1293,10 @@ def robustness(
             boot_summary = _compute_bootstrap(cfg, result)
             validation_artifacts["bootstrap_summary.csv"] = boot_summary
             robustness_extra["bootstrap"] = boot_summary
+            from quantlab.reporting.tables import format_bootstrap_summary
+
             typer.echo("")
-            typer.echo(boot_summary.to_string(index=False))
+            typer.echo(format_bootstrap_summary(boot_summary).to_string(index=False))
 
         if cfg.robustness.permutation_test.enabled:
             ran_any = True
@@ -1201,6 +1334,9 @@ def robustness(
             )
             validation_artifacts["sensitivity.csv"] = sens
             robustness_extra["sensitivity"] = sens
+            _update_resolved_config(
+                result, sensitivity={"parameters": {x_name: x_values, y_name: y_values}}
+            )
             typer.echo("")
             typer.echo(sens.to_string(index=False))
 
@@ -1229,56 +1365,120 @@ def robustness(
 
 @app.command()
 def report(
-    experiment: str = typer.Option(
-        ...,
+    experiment: str | None = typer.Option(
+        None,
         "--experiment",
         "-e",
         help=(
-            "Regenerate a report from a previously saved experiment. If none exists, "
-            "run a bundled QuantLab config with the same experiment name."
+            "Regenerate a report from an experiment saved under the default "
+            "reports/generated/ directory. If no matching saved config exists "
+            "there, falls back to a bundled QuantLab config of the same "
+            "experiment name. Mutually exclusive with --config/"
+            "--shipped-config, which instead point directly at a config file "
+            "-- use one of those when the experiment's own output.directory "
+            "is not reports/generated/, since this by-name lookup cannot find "
+            "it otherwise."
+        ),
+    ),
+    config: Path | None = typer.Option(
+        None,
+        "--config",
+        help=(
+            "Regenerate a report directly from this config file, bypassing "
+            "the --experiment by-name lookup under reports/generated/ -- the "
+            "way to target a config whose own output.directory points "
+            "elsewhere. Mutually exclusive with --experiment/--shipped-config."
+        ),
+    ),
+    shipped_config: str | None = typer.Option(
+        None,
+        "--shipped-config",
+        help=(
+            "Name of a config bundled with the installed package, as a "
+            "direct alternative to --experiment (see --config). Mutually "
+            "exclusive with --experiment/--config."
         ),
     ),
 ) -> None:
-    """Regenerate a report from a saved experiment or matching bundled config."""
+    """Regenerate a report from a saved experiment, or directly from a config."""
     configure_logging()
     try:
-        reports_root = GENERATED_REPORTS_DIR.resolve()
-        exp_dir = (GENERATED_REPORTS_DIR / experiment).resolve()
-        if not exp_dir.is_relative_to(reports_root):
+        direct_config_requested = config is not None or shipped_config is not None
+        if experiment is not None and direct_config_requested:
             raise QuantLabError(
-                f"Invalid --experiment {experiment!r}: must not escape the "
-                f"generated-reports directory ({GENERATED_REPORTS_DIR})."
+                "--experiment is mutually exclusive with --config/--shipped-config."
             )
-        config_path = exp_dir / "config.yaml"
-        if not config_path.is_file():
-            # Fall back to a shipped config of the same name.
-            from quantlab.constants import CONFIGS_DIR
+        if direct_config_requested:
+            config_path = _resolve_config_path(config, shipped_config)
+            cfg = _load_config(config_path)
+        elif experiment is not None:
+            reports_root = GENERATED_REPORTS_DIR.resolve()
+            exp_dir = (GENERATED_REPORTS_DIR / experiment).resolve()
+            if not exp_dir.is_relative_to(reports_root):
+                raise QuantLabError(
+                    f"Invalid --experiment {experiment!r}: must not escape the "
+                    f"generated-reports directory ({GENERATED_REPORTS_DIR})."
+                )
+            config_path = exp_dir / "config.yaml"
+            if not config_path.is_file():
+                # Fall back to a shipped config of the same name.
+                from quantlab.constants import CONFIGS_DIR
 
-            candidates = sorted(
-                path
-                for pattern in ("*.yaml", "*.yml")
-                for path in CONFIGS_DIR.glob(pattern)
-            )
-            for candidate in candidates:
-                from quantlab.config import ExperimentConfig
+                candidates = sorted(
+                    path
+                    for pattern in ("*.yaml", "*.yml")
+                    for path in CONFIGS_DIR.glob(pattern)
+                )
+                for candidate in candidates:
+                    from quantlab.config import ExperimentConfig
 
-                if ExperimentConfig.from_yaml(candidate).experiment_name == experiment:
-                    config_path = candidate
-                    break
-        if not config_path.is_file():
+                    if (
+                        ExperimentConfig.from_yaml(candidate).experiment_name
+                        == experiment
+                    ):
+                        config_path = candidate
+                        break
+            if not config_path.is_file():
+                raise QuantLabError(
+                    f"No saved or bundled config found for experiment "
+                    f"{experiment!r}. Run `quantlab backtest` first, check "
+                    "the experiment name, or pass --config/--shipped-config "
+                    "directly if it was saved outside reports/generated/."
+                )
+            cfg = _load_config(config_path)
+            if cfg.experiment_name != experiment:
+                raise QuantLabError(
+                    f"Config {config_path} declares experiment_name="
+                    f"{cfg.experiment_name!r}, but --experiment was "
+                    f"{experiment!r}."
+                )
+        else:
             raise QuantLabError(
-                f"No saved or bundled config found for experiment {experiment!r}. "
-                "Run `quantlab backtest` first or check the experiment name."
+                "One of --experiment, --config, or --shipped-config is required."
             )
-        cfg = _load_config(config_path)
-        if cfg.experiment_name != experiment:
-            raise QuantLabError(
-                f"Config {config_path} declares experiment_name="
-                f"{cfg.experiment_name!r}, but --experiment was {experiment!r}."
-            )
-        from quantlab.backtesting.result import save_with_walk_forward_reuse
+        from quantlab.backtesting.result import (
+            resolve_experiment_directory,
+            save_with_walk_forward_reuse,
+        )
         from quantlab.backtesting.runner import run_backtest_from_config
         from quantlab.data.loader import DataLoader
+
+        # This command's entire purpose is producing an HTML report, so it
+        # always renders one -- regardless of output.save_html_report/
+        # save_figures, which only govern whether *other* commands' own
+        # runs render the presentation layer. The saved bundle's real
+        # location follows output.directory when the config sets one,
+        # which may differ from the by-name lookup above (that lookup only
+        # has to find *a* config describing this experiment, not the
+        # directory its own prior runs actually saved to).
+        cfg = cfg.revalidated_copy(
+            update={
+                "output": cfg.output.revalidated_copy(
+                    update={"save_html_report": True, "save_figures": True}
+                )
+            }
+        )
+        exp_dir = resolve_experiment_directory(cfg, default_root=GENERATED_REPORTS_DIR)
 
         _echo_step("Reloading data and re-running for the report")
         data, report = DataLoader().load(cfg)
@@ -1287,7 +1487,10 @@ def report(
 
         # A report-only run does not recompute walk-forward validation.
         # Reuse earlier OOS artefacts only when their provenance checks pass.
-        out = save_with_walk_forward_reuse(result, exp_dir)
+        robustness_extra = _strategy_diagnostics_robustness(data, cfg)
+        out = save_with_walk_forward_reuse(
+            result, exp_dir, robustness_extra=robustness_extra
+        )
         _echo_save_outcome(result, f"Report at {out / 'report.html'}")
     except QuantLabError as exc:
         typer.secho(f"[ERROR] {exc}", fg=typer.colors.RED, err=True)

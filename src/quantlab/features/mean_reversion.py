@@ -38,12 +38,47 @@ def normalized_distance_to_mean(prices: PandasT, window: int) -> PandasT:
     return (validated - ma) / ma
 
 
-def rsi(prices: PandasT, window: int = 14) -> PandasT:
+def rolling_percentile_rank(
+    prices: PandasT, window: int, *, strictly_positive: bool = True
+) -> PandasT:
+    """Trailing percentile rank of the current price within its own window.
+
+    ``[0, 1]``: ``0`` when the current price is the lowest in the trailing
+    window, ``1`` when it is the highest, ``0.5`` in the middle. Ties are
+    averaged (pandas' default rank behavior). ``strictly_positive`` defaults
+    to ``True`` (the usual price-series case); pass ``False`` for a series
+    that can legitimately be zero or negative (e.g. a pairs-trading spread
+    residual) -- the rank computation itself is sign-agnostic, only the
+    input validation differs.
+    """
+    validated = numeric_pandas(
+        prices, name="prices", strictly_positive=strictly_positive
+    )
+    length = positive_int(window, name="window", minimum=2)
+
+    def _percentile_of_last(window_values: np.ndarray) -> float:
+        return float(pd.Series(window_values).rank(pct=True).iloc[-1])
+
+    return validated.rolling(length, min_periods=length).apply(
+        _percentile_of_last, raw=True
+    )
+
+
+def rsi(
+    prices: PandasT, window: int = 14, *, strictly_positive: bool = True
+) -> PandasT:
     """Relative Strength Index using Wilder-style exponential smoothing.
 
     Returns values in ``[0, 100]``; a flat window is neutral at ``50``.
+    ``strictly_positive`` defaults to ``True`` (the usual price-series
+    case); pass ``False`` for a series that can legitimately be zero or
+    negative (e.g. a pairs-trading spread residual) -- RSI is computed
+    from period-over-period changes, which are sign-agnostic; only the
+    input validation differs.
     """
-    validated = numeric_pandas(prices, name="prices", strictly_positive=True)
+    validated = numeric_pandas(
+        prices, name="prices", strictly_positive=strictly_positive
+    )
     length = positive_int(window, name="window", minimum=2)
     delta = validated.diff()
     gain = delta.clip(lower=0.0)

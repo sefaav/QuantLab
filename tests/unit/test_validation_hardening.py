@@ -105,11 +105,11 @@ def _config(*, benchmark: str | None = None) -> ExperimentConfig:
             "mean_reversion",
             {
                 "lookback_period": 20,
-                "entry_zscore": 2.0,
-                "exit_zscore": 0.5,
-                "stop_zscore": 4.0,
+                "entry_threshold": 2.0,
+                "exit_threshold": 0.5,
+                "stop_threshold": 4.0,
             },
-            {"lookback_period", "entry_zscore"},
+            {"lookback_period", "entry_threshold"},
         ),
         (
             "trend_following",
@@ -122,12 +122,12 @@ def _config(*, benchmark: str | None = None) -> ExperimentConfig:
                 "symbol_a": "AAA",
                 "symbol_b": "BBB",
                 "formation_window": 252,
-                "zscore_window": 63,
-                "entry_zscore": 2.0,
-                "exit_zscore": 0.5,
-                "stop_zscore": 4.0,
+                "indicator_window": 63,
+                "entry_threshold": 2.0,
+                "exit_threshold": 0.5,
+                "stop_threshold": 4.0,
             },
-            {"formation_window", "zscore_window", "entry_zscore"},
+            {"formation_window", "indicator_window", "entry_threshold"},
         ),
     ],
 )
@@ -166,6 +166,44 @@ def test_default_walk_forward_grid_covers_each_builtin_strategy_with_valid_combi
         assert values
         if name in parameters:
             assert parameters[name] in values
+    for combination in _grid_combinations(grid):
+        _with_params(config, combination)
+
+
+@pytest.mark.parametrize("strategy_name", ["mean_reversion", "pairs_trading"])
+def test_default_grid_treats_null_thresholds_as_the_indicators_own_default(
+    strategy_name: str,
+) -> None:
+    parameters: dict[str, Any] = {
+        "entry_threshold": None,
+        "exit_threshold": None,
+    }
+    portfolio = (
+        {"allocator": "signal_proportional"} if strategy_name == "pairs_trading" else {}
+    )
+    if strategy_name == "pairs_trading":
+        parameters.update({"symbol_a": "AAA", "symbol_b": "BBB"})
+    config = ExperimentConfig.from_dict(
+        {
+            "experiment_name": f"grid_null_thresholds_{strategy_name}",
+            "data": {
+                "instruments": [
+                    {"symbol": "AAA", "source": "csv", "calendar": "XNYS"},
+                    {"symbol": "BBB", "source": "csv", "calendar": "XNYS"},
+                ],
+                "start_date": "2010-01-01",
+                "end_date": "2020-12-31",
+            },
+            "strategy": {"name": strategy_name, "parameters": parameters},
+            "portfolio": portfolio,
+            "backtest": {"benchmark_kind": "cash"},
+        }
+    )
+
+    grid = default_parameter_grid(config)
+
+    assert "entry_threshold" in grid
+    assert grid["entry_threshold"]
     for combination in _grid_combinations(grid):
         _with_params(config, combination)
 
@@ -252,7 +290,7 @@ def _pairs_walk_forward_config() -> ExperimentConfig:
                     "symbol_a": "AAA",
                     "symbol_b": "BBB",
                     "formation_window": 252,
-                    "zscore_window": 63,
+                    "indicator_window": 63,
                 },
             },
             "portfolio": {
@@ -277,8 +315,8 @@ def test_walk_forward_skips_only_structurally_unwarmed_pair_combinations(
         validation=index[500:626],
         test=index[626:752],
     )
-    insufficient = {"formation_window": 504, "zscore_window": 126}
-    usable = {"formation_window": 252, "zscore_window": 63}
+    insufficient = {"formation_window": 504, "indicator_window": 126}
+    usable = {"formation_window": 252, "indicator_window": 63}
     evaluated: list[dict[str, Any]] = []
 
     def fake_evaluate(
@@ -290,7 +328,7 @@ def test_walk_forward_skips_only_structurally_unwarmed_pair_combinations(
         evaluated.append(
             {
                 "formation_window": candidate.strategy_parameters["formation_window"],
-                "zscore_window": candidate.strategy_parameters["zscore_window"],
+                "indicator_window": candidate.strategy_parameters["indicator_window"],
             }
         )
         # A sufficiently warmed-up strategy may legitimately choose to stay flat.
@@ -328,7 +366,7 @@ def test_walk_forward_explains_when_every_combination_is_still_in_warmup() -> No
         WalkForwardValidator(config)._select_on_validation(
             pd.DataFrame(),
             window,
-            [{"formation_window": 504, "zscore_window": 126}],
+            [{"formation_window": 504, "indicator_window": 126}],
             _SCORERS["sharpe"],
             periods_per_year=252,
             risk_free_rate=0.0,
@@ -480,7 +518,7 @@ def test_reduced_universe_keeps_external_benchmark(
     )
     table = run_stress_tests(data, _config(benchmark="BENCH"))
     assert "BENCH" in seen_reduced_symbols
-    reduced = table.loc[table["scenario"] == "reduced universe"].iloc[0]
+    reduced = table.loc[table["scenario"] == "reduced universe (-1)"].iloc[0]
     assert reduced["status"] == "ok"
 
 
@@ -502,7 +540,7 @@ def test_reduced_universe_scenario_records_failure_without_crashing(
         }
     )
     table = run_stress_tests(data, _config())
-    reduced = table.loc[table["scenario"] == "reduced universe"].iloc[0]
+    reduced = table.loc[table["scenario"] == "reduced universe (-1)"].iloc[0]
     assert reduced["status"] == "failed"
     assert "synthetic reduced-universe failure" in reduced["error"]
 

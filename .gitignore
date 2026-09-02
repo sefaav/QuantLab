@@ -30,6 +30,7 @@ ENV/
 .mypy_cache/
 .ruff_cache/
 .uv-*-cache/
+.uv-cache-codex-review/
 .coverage
 .coverage.*
 htmlcov/

@@ -10,6 +10,7 @@ import pytest
 from quantlab.dashboard.state import (
     build_config_from_inputs,
     estimate_walk_forward_backtest_count,
+    run_dashboard_backtest_with_data,
 )
 from quantlab.validation.parameter_grid import parse_parameter_grid_values
 
@@ -185,3 +186,41 @@ def test_run_dashboard_walk_forward_passes_its_checkpoint_path_through(
     run_dashboard_walk_forward(config)
 
     assert captured["checkpoint_path"] == _checkpoint_path(config, "walk_forward")
+
+
+def test_run_dashboard_backtest_with_data_returns_the_exact_frame_it_ran_on(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The returned frame must be the SAME object the backtest itself ran
+    on (identity, not just equality) -- a Strategy Explorer results
+    diagnostic reusing anything else (e.g. a fresh, independent reload)
+    could silently observe different data than the displayed result for a
+    remote source that changed, or a cache that refreshed, between the two
+    loads."""
+    from types import SimpleNamespace
+
+    import quantlab.dashboard.state as state_module
+
+    config = build_config_from_inputs(_base_inputs(experiment_name="identity_check"))
+    the_frame = pd.DataFrame({"marker": [1, 2, 3]})
+    monkeypatch.setattr(
+        state_module.DataLoader,
+        "load",
+        lambda self, cfg: (the_frame, SimpleNamespace(warnings=["w"])),
+    )
+    captured: dict[str, object] = {}
+
+    def fake_run_backtest_from_config(data, cfg, *, data_quality_report=None):  # type: ignore[no-untyped-def]
+        captured["data_seen_by_backtest"] = data
+        return "fake-result"
+
+    monkeypatch.setattr(
+        state_module, "run_backtest_from_config", fake_run_backtest_from_config
+    )
+
+    result, warnings, returned_data = run_dashboard_backtest_with_data(config)
+
+    assert result == "fake-result"
+    assert warnings == ["w"]
+    assert returned_data is the_frame
+    assert captured["data_seen_by_backtest"] is the_frame

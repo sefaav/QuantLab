@@ -14,7 +14,6 @@ import pandas as pd
 from quantlab.backtesting.result import BacktestResult
 from quantlab.backtesting.runner import run_backtest_from_config
 from quantlab.config import ExperimentConfig
-from quantlab.constants import GENERATED_REPORTS_DIR
 from quantlab.data.base import SymbolSuggestion
 from quantlab.data.binance import BinanceDataSource
 from quantlab.data.loader import DataLoader
@@ -29,7 +28,9 @@ __all__ = [
     "detect_calendar",
     "detect_source",
     "estimate_walk_forward_backtest_count",
+    "load_explorer_prices",
     "run_dashboard_backtest",
+    "run_dashboard_backtest_with_data",
     "run_dashboard_bootstrap",
     "run_dashboard_permutation_test",
     "run_dashboard_sensitivity",
@@ -138,19 +139,37 @@ def run_dashboard_backtest(
     return result, report.warnings
 
 
+def run_dashboard_backtest_with_data(
+    config: ExperimentConfig,
+) -> tuple[BacktestResult, list[str], pd.DataFrame]:
+    """Like :func:`run_dashboard_backtest`, but also returns the loaded frame.
+
+    A Strategy Explorer results diagnostic needing raw prices (e.g. pairs
+    trading) reuses this EXACT frame rather than reloading separately -- a
+    second, independent load could observe different data for a remote
+    source (Yahoo/Binance) if it changed, or a cache refreshed, between the
+    two calls, making the diagnostics silently describe different data than
+    the displayed result.
+    """
+    data, report = DataLoader().load(config)
+    result = run_backtest_from_config(data, config, data_quality_report=report)
+    return result, report.warnings, data
+
+
 def _checkpoint_path(config: ExperimentConfig, technique: str) -> Path:
     """Return the on-disk checkpoint path for one technique of ``config``.
 
-    Same convention the CLI uses (``GENERATED_REPORTS_DIR /
-    experiment_name / ".checkpoint_<technique>.pkl"``), so an interrupted
-    dashboard run (e.g. the Streamlit server process itself restarting) and
-    a same-named CLI run can resume each other's progress. Two different
-    dashboard configs that happen to share a default ``experiment_name``
-    don't collide unsafely: ``compute_provenance``'s config/data/code match
-    still gates whether a checkpoint is actually reused.
+    Same convention the CLI uses (``resolve_experiment_directory(config) /
+    ".checkpoint_<technique>.pkl"``), so an interrupted dashboard run (e.g.
+    the Streamlit server process itself restarting) and a same-named CLI
+    run can resume each other's progress. Two different dashboard configs
+    that happen to share a default ``experiment_name`` don't collide
+    unsafely: ``compute_provenance``'s config/data/code match still gates
+    whether a checkpoint is actually reused.
     """
-    experiment_dir = GENERATED_REPORTS_DIR / config.experiment_name
-    return experiment_dir / f".checkpoint_{technique}.pkl"
+    from quantlab.backtesting.result import resolve_experiment_directory
+
+    return resolve_experiment_directory(config) / f".checkpoint_{technique}.pkl"
 
 
 def run_dashboard_walk_forward(
@@ -180,7 +199,9 @@ def run_dashboard_walk_forward(
 
     data, report = DataLoader().load(config)
     validator = WalkForwardValidator(config)
-    train_window, validation_window, test_window = resolve_walk_forward_windows(config)
+    train_window, validation_window, test_window, step = resolve_walk_forward_windows(
+        config
+    )
     result = validator.run(
         data,
         parameter_grid=parameter_grid_for_config(config),
@@ -188,6 +209,7 @@ def run_dashboard_walk_forward(
         validation_window=validation_window,
         test_window=test_window,
         expanding=config.validation.expanding,
+        step=step,
         on_progress=on_progress,
         checkpoint_path=_checkpoint_path(config, "walk_forward"),
     )
@@ -316,7 +338,7 @@ def run_dashboard_bootstrap(
         periods_per_year=config.periods_per_year,
         initial_capital=config.initial_capital,
         risk_free_rate=config.risk_free_rate,
-    ).summary()
+    ).summary(confidence_level=config.robustness.bootstrap.confidence_level)
 
 
 def run_dashboard_permutation_test(
@@ -404,8 +426,61 @@ def run_dashboard_walk_forward_sensitivity(
 
 
 def default_end_date() -> date:
-    """A safe default end date that does not depend on wall-clock time."""
-    return date(2024, 12, 31)
+    """A safe default end date that does not depend on wall-clock time.
+
+    Matches the bundled synthetic demo CSVs' own last observation (also
+    ``demo_offline.yaml``'s ``end_date``) -- the sidebar's Start/End date
+    widgets default to this range regardless of which instrument source is
+    picked, and the CSV picker's own default symbols (SPY/QQQ/TLT/GLD) are
+    exactly the bundled demo data. A later date here would make the very
+    first "just click Run" experience -- untouched defaults, no instrument
+    source changed -- immediately warn that data ends hundreds of days
+    before the requested end, for every one of those four symbols.
+    """
+    return date(2023, 10, 30)
+
+
+def load_explorer_prices(
+    symbols: list[str],
+    *,
+    source: str,
+    calendar: str,
+    start_date: date,
+    end_date: date,
+    use_bundled_demo_data: bool = False,
+) -> pd.DataFrame:
+    """Load canonical OHLCV data for a Strategy Explorer interactive lab.
+
+    A minimal, throwaway config -- ``data:`` is the only section that
+    matters for loading; ``strategy`` is a fixed placeholder ``DataLoader.
+    load()`` never inspects. Callers wrap this in ``st.cache_data`` (see
+    the labs) since every widget interaction reruns the whole script.
+    Exactly the same ``DataLoader``/``ExperimentConfig`` path backtest and
+    walk-forward use -- Yahoo/Binance/CSV all behave identically here.
+    ``use_bundled_demo_data`` mirrors the main dashboard's own toggle (see
+    ``app.py``'s "Allow bundled synthetic demo data"): only consulted for
+    ``source="csv"``, and only as a fallback when every requested local
+    file under ``data/raw`` is absent.
+    """
+    data_config: dict[str, object] = {
+        "instruments": [
+            {"symbol": symbol, "source": source, "calendar": calendar}
+            for symbol in symbols
+        ],
+        "start_date": start_date,
+        "end_date": end_date,
+    }
+    if use_bundled_demo_data:
+        data_config["use_bundled_demo_data"] = True
+    config = ExperimentConfig.from_dict(
+        {
+            "experiment_name": "strategy_explorer_lab",
+            "data": data_config,
+            "strategy": {"name": "buy_and_hold"},
+        }
+    )
+    data, _ = DataLoader().load(config)
+    return data
 
 
 @lru_cache(maxsize=1)

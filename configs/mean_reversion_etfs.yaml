@@ -3,6 +3,15 @@
 # research notebook.
 experiment_name: mean_reversion_etfs
 
+research_question: >-
+  Does short-term price mean reversion across liquid ETFs generate a
+  positive risk-adjusted edge after transaction costs?
+hypothesis: >-
+  H1: net of modelled transaction costs, a rolling z-score mean-reversion
+  signal across this ETF universe has a genuine positive risk-adjusted
+  edge. H0: any apparent edge is indistinguishable from noise or is
+  eliminated by trading costs.
+
 data:
   instruments:
     - symbol: SPY
@@ -29,10 +38,14 @@ strategy:
   name: mean_reversion
   parameters:
     lookback_period: 20
-    entry_zscore: 2.0
-    exit_zscore: 0.5
-    stop_zscore: 4.0
+    indicator: zscore
+    entry_threshold: 2.0
+    exit_threshold: 0.5
+    stop_threshold: 4.0
     long_only: true
+  # Price series the strategy's own generate_signals() reads. Execution/
+  # costs always use the raw close regardless of this setting.
+  signal_price_type: adjusted_close
 
 portfolio:
   allocator: equal_weight
@@ -65,12 +78,30 @@ reproducibility:
 robustness:
   stress_test:
     enabled: true
+    # Each list is a set of magnitudes evaluated independently (one
+    # scenario row per value); an empty list disables that scenario type
+    # entirely.
+    commission_multipliers: [2.0, 5.0]
+    slippage_multipliers: [2.0]
+    execution_delays: [1]
+    best_days_removed: [10]
+    reduce_universe_by: [1]
   bootstrap:
     enabled: true
+    # Width of the reported p_lower/p_upper percentile band (0.90 -> the
+    # 5th/95th percentiles).
+    confidence_level: 0.90
   permutation_test:
     enabled: true
   sensitivity:
     enabled: true
     parameters:
       lookback_period: [10, 20, 40]
-      entry_zscore: [1.5, 2.0, 2.5]
+      entry_threshold: [1.5, 2.0, 2.5]
+
+# Where and what a run saves. Omit entirely for the default: reports/
+# generated/<experiment_name>/, both artefact toggles enabled.
+output:
+  # directory: reports/generated/mean_reversion_etfs
+  save_html_report: true
+  save_figures: true

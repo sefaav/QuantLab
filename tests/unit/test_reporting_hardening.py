@@ -16,6 +16,8 @@ from quantlab.backtesting.runner import run_backtest_from_config
 from quantlab.config import ExperimentConfig
 from quantlab.reporting import charts
 from quantlab.reporting.html_report import (
+    _format_cell,
+    _format_report_table,
     _render_data_quality,
     _render_robustness,
 )
@@ -24,7 +26,7 @@ from quantlab.reporting.research_summary import (
     data_description,
     methodology,
 )
-from quantlab.reporting.tables import _fmt, regime_table
+from quantlab.reporting.tables import _fmt, format_bootstrap_summary, regime_table
 
 
 def _config(
@@ -72,6 +74,37 @@ def test_metric_formatter_handles_numpy_non_finite_values() -> None:
     assert _fmt(np.float32(np.inf), "num") == "n/a"
     assert _fmt(np.float32(np.nan), "pct") == "n/a"
     assert _fmt(np.float32(np.nan), "int") == "n/a"
+
+
+def test_format_bootstrap_summary_avoids_scientific_notation() -> None:
+    """Each row is formatted by its own statistic's kind (not its column's
+    shared repr) so wildly different magnitudes in the same column --
+    final_value near 1e5 next to cagr near 5e-2 -- never push pandas'
+    default float repr into scientific notation for either one."""
+    summary = pd.DataFrame(
+        {
+            "statistic": ["cagr", "sharpe", "max_drawdown", "final_value"],
+            "median": [0.026741, 0.244565, -0.191660, 105375.654092],
+            "p_lower": [-0.113499, -0.700071, -0.343333, 78738.751320],
+            "p_upper": [0.239792, 1.404149, -0.110733, 153184.828396],
+            "mean": [0.047455, 0.335996, -0.204574, 110866.493909],
+            "std": [0.112626, 0.657864, 0.070470, 24125.201431],
+        }
+    )
+    formatted = format_bootstrap_summary(summary)
+    assert list(formatted["statistic"]) == [
+        "CAGR",
+        "Sharpe",
+        "Max Drawdown",
+        "Final Value",
+    ]
+    rendered = formatted.to_string(index=False).lower()
+    assert "e+" not in rendered
+    assert "e-" not in rendered
+    assert formatted.loc[0, "median"] == "2.67%"
+    assert formatted.loc[1, "median"] == "0.24"
+    assert formatted.loc[2, "median"] == "-19.17%"
+    assert formatted.loc[3, "median"] == "105,375.65"
 
 
 def test_regime_table_excludes_undefined_warmup_and_empty_regimes() -> None:
@@ -146,6 +179,40 @@ def test_robustness_tables_format_percentage_columns() -> None:
     assert "0.42" in rendered
 
 
+def test_format_cell_shows_a_plain_bool_instead_of_n_a() -> None:
+    """Regression test: `bool` is a subclass of `int` (a `numbers.Real`),
+    so a plain `True`/`False` value in a GENERIC (non percent/number/
+    integer) column used to be misclassified as "a Real number that isn't
+    finite" and rendered as "n/a" -- e.g. a strategy diagnostics table's
+    `("Long/short", False)` row would show "n/a" instead of `False`,
+    misrepresenting a real, meaningful configuration value as missing
+    data. A bool inside an ACTUAL designated numeric column (where it
+    would be nonsensical, e.g. formatted as "0.00") must still fall back
+    to "n/a" -- that specific exclusion is deliberate, not a bug."""
+    assert _format_cell(False, "Value") is False
+    assert _format_cell(True, "Value") is True
+    # Genuine non-finite reals must still show "n/a", in any column.
+    assert _format_cell(float("nan"), "Value") == "n/a"
+    assert _format_cell(float("inf"), "Value") == "n/a"
+    assert _format_cell(None, "Value") == "n/a"
+    # A bool landing in an ACTUAL numeric-formatted column is still "n/a".
+    assert _format_cell(True, "return") == "n/a"
+    assert _format_cell(False, "trades") == "n/a"
+
+
+def test_diagnostics_table_shows_a_bool_metric_correctly() -> None:
+    """End-to-end: a strategy diagnostics table (e.g.
+    cross_sectional_momentum's `("Long/short", False)` row) must render
+    the real boolean value, not "n/a"."""
+    table = pd.DataFrame(
+        [("Long/short", False), ("Mean rank correlation", 0.123)],
+        columns=["Metric", "Value"],
+    )
+    formatted = _format_report_table(table)
+    assert formatted.loc[0, "Value"] is False
+    assert "n/a" not in formatted["Value"].astype(str).tolist()
+
+
 def _sensitivity_frame() -> pd.DataFrame:
     return pd.DataFrame(
         {
@@ -201,6 +268,85 @@ def test_render_robustness_sensitivity_heatmap_failure_does_not_crash_report() -
     assert "60" in rendered  # the raw table must still render
 
 
+def test_render_strategy_diagnostics_dispatches_by_type() -> None:
+    """`render_html_report` filters any `DiagnosticsSection` value out of the
+    merged robustness dict, dispatched by isinstance -- never by a
+    hard-coded key name -- and renders it via `_render_strategy_diagnostics`
+    into a section separate from "Robustness" (see
+    `test_diagnostics_section_appears_outside_robustness_section` below): a
+    correlation/spread/ADF diagnostic describes whether the STRATEGY's
+    assumptions hold, not whether the RESULT is robust to perturbation."""
+    from quantlab.reporting.html_report import _render_strategy_diagnostics
+    from quantlab.reporting.sections import DiagnosticsSection
+
+    section = DiagnosticsSection(
+        table=pd.DataFrame({"Metric": ["Correlation"], "Value": ["0.83"]}),
+        chart_data_uri="data:image/png;base64,AAAA",
+        note="Pair relationship diagnostics.",
+    )
+    rendered = _render_strategy_diagnostics({"pair_diagnostics": section})
+    assert "Pair Diagnostics" in rendered
+    assert "Pair relationship diagnostics." in rendered
+    assert '<img src="data:image/png;base64,AAAA"/>' in rendered
+    assert "Correlation" in rendered
+
+
+def test_render_strategy_diagnostics_omits_missing_chart_and_note() -> None:
+    """`note`/`chart_data_uri` are optional -- absent, they render nothing,
+    never an empty `<p>`/`<img>` tag."""
+    from quantlab.reporting.html_report import _render_strategy_diagnostics
+    from quantlab.reporting.sections import DiagnosticsSection
+
+    section = DiagnosticsSection(table=pd.DataFrame({"Metric": ["x"], "Value": ["1"]}))
+    rendered = _render_strategy_diagnostics({"pair_diagnostics": section})
+    assert "<img" not in rendered
+    assert "<p>" not in rendered
+
+
+def test_render_robustness_never_receives_a_diagnostics_section() -> None:
+    """A `DiagnosticsSection` value passed to `_render_robustness` directly
+    (bypassing `render_html_report`'s own filtering) renders as a generic
+    unrecognised object rather than specially -- `_render_robustness` no
+    longer knows about this type at all; filtering it out is
+    `render_html_report`'s job, exercised by
+    `test_diagnostics_section_appears_outside_robustness_section` below."""
+    from quantlab.reporting.sections import DiagnosticsSection
+
+    section = DiagnosticsSection(table=pd.DataFrame({"Metric": ["x"], "Value": ["1"]}))
+    rendered = _render_robustness({"pair_diagnostics": section})
+    assert "Correlation" not in rendered
+    assert "<table" not in rendered
+
+
+def test_diagnostics_section_appears_outside_robustness_section() -> None:
+    """`render_html_report` places a `DiagnosticsSection`-typed robustness
+    entry under its own "Strategy diagnostics" heading, before
+    "Robustness", and never inside the Robustness section's own rendered
+    HTML -- a strategy diagnostic must never be misclassified as
+    robustness evidence."""
+    from quantlab.reporting.html_report import render_html_report
+    from quantlab.reporting.sections import DiagnosticsSection
+
+    result = _result()
+    section = DiagnosticsSection(
+        table=pd.DataFrame({"Metric": ["Correlation"], "Value": ["0.83"]}),
+        note="Pair relationship diagnostics: correlation, hedge ratio.",
+    )
+    document = render_html_report(
+        result,
+        robustness={"pair_diagnostics": section},
+        figures={},
+    )
+    diagnostics_index = document.index("Strategy diagnostics")
+    robustness_index = document.index("<h2>Robustness</h2>")
+    assert diagnostics_index < robustness_index
+    robustness_section = document[
+        robustness_index : document.index("Limitations", robustness_index)
+    ]
+    assert "Correlation" not in robustness_section
+    assert "pair relationship diagnostics" not in robustness_section.lower()
+
+
 def test_methodology_describes_volume_slippage_and_constraints() -> None:
     result: Any = SimpleNamespace(
         config=_config(volume_slippage=True),
@@ -211,7 +357,7 @@ def test_methodology_describes_volume_slippage_and_constraints() -> None:
     assert "impact coefficient 0.2000" in text
     assert "maximum absolute weight 80.00%" in text
     assert "annual volatility target 10.00%" in text
-    assert "maximum L1 turnover per rebalance 0.30" in text
+    assert "maximum L1 turnover per period 0.30" in text
 
 
 def test_data_description_separates_requested_and_observed_periods() -> None:

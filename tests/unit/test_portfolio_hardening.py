@@ -178,7 +178,7 @@ def test_turnover_functions_reject_non_finite_weights() -> None:
 def test_cap_turnover_rejects_invalid_direct_budget(bad: object) -> None:
     targets = pd.DataFrame({"A": [0.5]})
     with pytest.raises(InvalidConfigurationError):
-        cap_turnover(targets, maximum_turnover=bad)  # type: ignore[arg-type]
+        cap_turnover(targets, maximum_turnover=bad)  # type: ignore[call-overload]
 
 
 def test_volatility_estimator_excludes_missing_observations() -> None:

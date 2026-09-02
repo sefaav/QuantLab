@@ -35,8 +35,18 @@ class BootstrapResult:
             raise ValueError(f"samples is missing columns: {sorted(missing)}.")
         object.__setattr__(self, "samples", self.samples.loc[:, _SAMPLE_COLUMNS].copy())
 
-    def summary(self) -> pd.DataFrame:
-        """Return the mean, dispersion and central percentile interval."""
+    def summary(self, confidence_level: float = 0.90) -> pd.DataFrame:
+        """Return the mean, dispersion and central percentile interval.
+
+        ``confidence_level`` (default 0.90) sets the width of the reported
+        ``p_lower``/``p_upper`` percentile band, e.g. 0.90 -> the 5th/95th
+        percentiles, 0.95 -> the 2.5th/97.5th.
+        """
+        level = finite_real(confidence_level, name="confidence_level")
+        if not (0.0 < level < 1.0):
+            raise ValueError("confidence_level must be strictly between 0 and 1.")
+        lower_quantile = (1.0 - level) / 2.0
+        upper_quantile = 1.0 - lower_quantile
         rows = []
         for column in self.samples.columns:
             series = self.samples[column].dropna()
@@ -44,8 +54,8 @@ class BootstrapResult:
                 {
                     "statistic": column,
                     "median": float(series.median()),
-                    "p05": float(series.quantile(0.05)),
-                    "p95": float(series.quantile(0.95)),
+                    "p_lower": float(series.quantile(lower_quantile)),
+                    "p_upper": float(series.quantile(upper_quantile)),
                     "mean": float(series.mean()),
                     "std": float(series.std(ddof=1)) if len(series) > 1 else 0.0,
                 }

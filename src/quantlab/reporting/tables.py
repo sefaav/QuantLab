@@ -20,6 +20,7 @@ from quantlab.risk.metrics import (
 
 if TYPE_CHECKING:
     from quantlab.backtesting.result import BacktestResult
+    from quantlab.features.pairs_diagnostics import PairDiagnostics
 
 
 _METRIC_FORMAT = {
@@ -38,7 +39,7 @@ _METRIC_FORMAT = {
     "kurtosis": ("Kurtosis", "num"),
     "annual_turnover": ("Annual turnover (x/year)", "num"),
     "average_gross_exposure": ("Avg gross exposure (x)", "num"),
-    "number_of_trades": ("Number of trades", "int"),
+    "number_of_trades": ("Number of fills", "int"),
     "beta": ("Beta", "num"),
     "alpha": ("Alpha (ann.)", "pct"),
     "information_ratio": ("Information ratio", "num"),
@@ -221,3 +222,67 @@ def regime_table(
         row["Observations"] = len(regime_returns)
         rows.append(row)
     return pd.DataFrame(rows)
+
+
+#: Formatting kind for each statistic name BootstrapResult.summary() reports.
+_BOOTSTRAP_STATISTIC_FORMAT: dict[str, tuple[str, str]] = {
+    "cagr": ("CAGR", "pct"),
+    "sharpe": ("Sharpe", "num"),
+    "max_drawdown": ("Max Drawdown", "pct"),
+    "final_value": ("Final Value", "currency"),
+}
+
+
+def pair_diagnostics_summary_table(diagnostics: PairDiagnostics) -> pd.DataFrame:
+    """Metric/Value summary table for a pairs-trading result's diagnostics.
+
+    A snapshot only -- the full spread/indicator/rolling-stability history
+    lives in the accompanying chart (``reporting.charts.pair_spread_
+    chart``), not in this table.
+    """
+    adf = diagnostics.adf_result
+    coint = diagnostics.cointegration_result
+    rows = [
+        ("Symbols", f"{diagnostics.symbol_a} / {diagnostics.symbol_b}"),
+        ("Return correlation", _fmt(diagnostics.correlation, "num")),
+        (
+            "Hedge-ratio stability (std of beta)",
+            _fmt(diagnostics.hedge_ratio_stability, "num"),
+        ),
+        ("Half-life (periods)", _fmt(diagnostics.half_life, "num")),
+        ("ADF statistic (spread)", _fmt(adf.statistic, "num") if adf else "n/a"),
+        ("ADF p-value (spread)", _fmt(adf.pvalue, "num") if adf else "n/a"),
+        (
+            "Engle-Granger statistic",
+            _fmt(coint.statistic, "num") if coint else "n/a",
+        ),
+        ("Engle-Granger p-value", _fmt(coint.pvalue, "num") if coint else "n/a"),
+    ]
+    return pd.DataFrame(rows, columns=["Metric", "Value"])
+
+
+def format_bootstrap_summary(summary: pd.DataFrame) -> pd.DataFrame:
+    """Format ``BootstrapResult.summary()`` for display.
+
+    Its ``mean``/``median``/``std``/``p_lower``/``p_upper`` columns stack
+    values of very different scale across rows -- a CAGR near 0.05 next to
+    a final value near 100000 -- because each row is a different
+    statistic sharing the same generic columns. Pandas' default float
+    repr renders that mix inconsistently (scientific notation for some
+    cells, fixed-point for others, depending on each cell's own
+    magnitude). Formatting every cell in a row by its own statistic's
+    kind -- the same percent/number/currency convention ``metrics_table``
+    uses -- keeps the whole table in fixed-point notation regardless of
+    what the other rows contain.
+    """
+    numeric_columns = [column for column in summary.columns if column != "statistic"]
+    rows = []
+    for _, row in summary.iterrows():
+        label, kind = _BOOTSTRAP_STATISTIC_FORMAT.get(
+            row["statistic"], (str(row["statistic"]), "num")
+        )
+        formatted_row: dict[str, object] = {"statistic": label}
+        for column in numeric_columns:
+            formatted_row[column] = _fmt(row[column], kind)
+        rows.append(formatted_row)
+    return pd.DataFrame(rows, columns=["statistic", *numeric_columns])

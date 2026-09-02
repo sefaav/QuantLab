@@ -774,6 +774,32 @@ def test_cli_robustness_orchestrator_runs_only_enabled_techniques(
     assert not (exp_dir / "sensitivity.csv").is_file()
 
 
+def test_cli_robustness_orchestrator_report_includes_strategy_diagnostics(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, isolated_reports_dir: Path
+) -> None:
+    """Regression test: `robustness` used to save a report with no Strategy
+    diagnostics section at all -- unlike `backtest`/`report`, it never
+    called `_strategy_diagnostics_robustness`. Reproduces the exact
+    "backtest, then robustness" sequence: the first save (via `backtest`)
+    would include diagnostics; `robustness` then overwrote that same
+    report.html without them, since neither `_ROBUSTNESS_ARTIFACT_FILES`
+    nor `load_previous_robustness_artifacts` carries that section forward
+    from a prior save. cross_sectional_momentum (this fixture's default
+    strategy) declares `results_diagnostics`, so it must appear here too."""
+    config_path, raw = _write_offline_experiment(
+        tmp_path,
+        extra={"robustness": {"bootstrap": {"enabled": True, "n_iterations": 30}}},
+    )
+    _patch_raw_dir(monkeypatch, raw)
+
+    result = runner.invoke(app, ["robustness", "--config", str(config_path)])
+
+    assert result.exit_code == 0, result.stdout
+    exp_dir = isolated_reports_dir / "cli_test"
+    report_html = (exp_dir / "report.html").read_text(encoding="utf-8")
+    assert "Strategy diagnostics" in report_html
+
+
 def test_cli_robustness_orchestrator_warns_when_nothing_enabled(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

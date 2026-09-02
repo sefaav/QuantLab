@@ -26,6 +26,7 @@ from quantlab.risk.exposure import gross_exposure_series, net_exposure_series
 
 if TYPE_CHECKING:
     from quantlab.backtesting.result import BacktestResult
+    from quantlab.features.pairs_diagnostics import PairDiagnostics
 
 logger = get_logger(__name__)
 
@@ -245,6 +246,90 @@ def sensitivity_heatmap_chart(
                 fontsize=7,
                 color=colour,
             )
+    return fig
+
+
+def correlation_heatmap_chart(matrix: pd.DataFrame) -> Figure:
+    """Plot a symbol x symbol correlation matrix as a static heatmap.
+
+    Mirrors the dashboard's interactive Plotly heatmap
+    (``dashboard.explorer.shared_components.render_correlation_matrix``)
+    in a static form for the HTML report.
+    """
+    width = max(4.0, 0.6 * len(matrix.columns) + 2.0)
+    height = max(3.0, 0.6 * len(matrix.index) + 1.0)
+    fig, ax = _new_figure((width, height))
+    values = matrix.to_numpy(dtype=float)
+    image = ax.imshow(
+        values, cmap=colormaps["RdBu"], vmin=-1.0, vmax=1.0, aspect="auto"
+    )
+    ax.set_xticks(range(len(matrix.columns)))
+    ax.set_xticklabels([str(c) for c in matrix.columns], rotation=45, ha="right")
+    ax.set_yticks(range(len(matrix.index)))
+    ax.set_yticklabels([str(r) for r in matrix.index])
+    ax.set_title("Correlation matrix (of returns)", fontsize=11, fontweight="bold")
+    fig.colorbar(image, ax=ax, fraction=0.025, pad=0.02)
+    for row in range(values.shape[0]):
+        for column in range(values.shape[1]):
+            value = values[row, column]
+            colour = "white" if abs(value) > 0.6 else "#111827"
+            ax.text(
+                column,
+                row,
+                f"{value:.2f}",
+                ha="center",
+                va="center",
+                fontsize=7,
+                color=colour,
+            )
+    return fig
+
+
+def pair_spread_chart(diagnostics: PairDiagnostics) -> Figure:
+    """Plot a pair's spread, indicator and rolling stationarity p-value.
+
+    The three panels answer, respectively: what does the residual look
+    like, how far is it currently from its own recent behaviour (per
+    ``diagnostics.indicator`` -- zscore, rsi or percentile, whichever the
+    pair was actually diagnosed with), and has the relationship stayed
+    stationary throughout the sample rather than only when tested once
+    over the whole history (see ``PairDiagnostics.rolling_adf_pvalue``).
+    """
+    fig = Figure(figsize=(9, 7.5))
+    FigureCanvasAgg(fig)
+    ax_spread, ax_indicator, ax_pvalue = fig.subplots(3, 1, sharex=True)
+
+    spread = diagnostics.spread
+    ax_spread.plot(spread.index, spread.to_numpy(), color=STRATEGY, lw=1.2)
+    ax_spread.axhline(0.0, color=_GRID, lw=1.0)
+    _style_axes(
+        ax_spread, f"{diagnostics.symbol_a}/{diagnostics.symbol_b} spread", "Spread"
+    )
+
+    indicator = diagnostics.spread_indicator
+    indicator_label = f"{diagnostics.indicator} indicator"
+    ax_indicator.plot(indicator.index, indicator.to_numpy(), color=ACCENT, lw=1.2)
+    ax_indicator.axhline(0.0, color=_GRID, lw=1.0)
+    _style_axes(ax_indicator, f"Spread {indicator_label}", indicator_label)
+
+    pvalue = diagnostics.rolling_adf_pvalue.dropna()
+    if len(pvalue):
+        ax_pvalue.plot(
+            pvalue.index, pvalue.to_numpy(), color=NEGATIVE, marker="o", ms=3, lw=1.0
+        )
+    else:
+        ax_pvalue.text(
+            0.5,
+            0.5,
+            "Not enough history for a rolling stationarity check.",
+            ha="center",
+            va="center",
+            transform=ax_pvalue.transAxes,
+            color=BENCHMARK,
+        )
+    ax_pvalue.axhline(0.05, color=_GRID, lw=1.0, ls="--")
+    _style_axes(ax_pvalue, "Rolling ADF p-value (stability over time)", "p-value")
+    fig.tight_layout()
     return fig
 
 

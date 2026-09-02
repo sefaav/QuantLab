@@ -71,6 +71,33 @@ def test_walk_forward_parameter_grid_is_validated_at_config_load() -> None:
         ExperimentConfig.from_dict(invalid)
 
 
+def test_walk_forward_parameter_grid_rejects_duplicate_candidates_at_load() -> None:
+    """Regression test: `validation.parameter_grid.lookback_period: [126,
+    126]` used to load fine and only fail later, deep inside
+    `walk_forward.py`'s own execution-time duplicate check (`Grid
+    parameter 'lookback_period' must not contain duplicate values`) --
+    caught here at YAML load time instead, mirroring
+    `StressTestSettings`'s own established convention."""
+    base: dict[str, Any] = {
+        "experiment_name": "yaml_grid_dupe",
+        "data": {
+            "instruments": [{"symbol": "AAA", "source": "csv", "calendar": "XNYS"}],
+            "start_date": "2020-01-01",
+            "end_date": "2022-01-01",
+        },
+        "strategy": {
+            "name": "mean_reversion",
+            "parameters": {"lookback_period": 20},
+        },
+        "validation": {
+            "method": "walk_forward",
+            "parameter_grid": {"lookback_period": [126, 126]},
+        },
+    }
+    with pytest.raises(InvalidConfigurationError, match="duplicate"):
+        ExperimentConfig.from_dict(base)
+
+
 def test_parameter_grid_is_rejected_for_non_walk_forward_validation() -> None:
     with pytest.raises(ValueError, match="applies only"):
         ValidationConfig.model_validate(
@@ -140,11 +167,228 @@ def test_robustness_bootstrap_n_iterations_must_be_positive(
         )
 
 
+def test_validation_step_defaults_to_none_and_accepts_override() -> None:
+    config = ExperimentConfig.from_dict(_robustness_base_dict())
+    assert config.validation.step is None
+    with_step = ExperimentConfig.from_dict(
+        {
+            **_robustness_base_dict(),
+            "validation": {"method": "walk_forward", "step": 5},
+        }
+    )
+    assert with_step.validation.step == 5
+
+
+def test_validation_walk_forward_fields_rejected_outside_walk_forward_method() -> None:
+    with pytest.raises(InvalidConfigurationError, match="walk_forward"):
+        ExperimentConfig.from_dict(
+            {**_robustness_base_dict(), "validation": {"step": 5}}
+        )
+
+
+@pytest.mark.parametrize("bad_step", [0, -1])
+def test_validation_step_must_be_positive(bad_step: int) -> None:
+    with pytest.raises(InvalidConfigurationError):
+        ExperimentConfig.from_dict(
+            {**_robustness_base_dict(), "validation": {"step": bad_step}}
+        )
+
+
+def test_validation_step_exceeding_test_window_is_rejected() -> None:
+    """A larger step than test_window would skip dates between consecutive
+    folds' test blocks entirely -- documented as forbidden (see
+    ValidationConfig.step's own docstring) but previously unenforced at
+    config-load time, only failing much later inside the walk-forward
+    validator itself."""
+    with pytest.raises(InvalidConfigurationError, match="step"):
+        ExperimentConfig.from_dict(
+            {
+                **_robustness_base_dict(),
+                "validation": {
+                    "method": "walk_forward",
+                    "test_window": 10,
+                    "step": 11,
+                },
+            }
+        )
+
+
+def test_validation_step_equal_to_test_window_is_accepted() -> None:
+    config = ExperimentConfig.from_dict(
+        {
+            **_robustness_base_dict(),
+            "validation": {"method": "walk_forward", "test_window": 10, "step": 10},
+        }
+    )
+    assert config.validation.step == 10
+
+
+def test_validation_step_exceeding_default_test_window_is_rejected() -> None:
+    """test_window omitted -> resolve_walk_forward_windows()'s own 126
+    default applies; the same check must account for it, not only an
+    explicitly-set test_window."""
+    with pytest.raises(InvalidConfigurationError, match="step"):
+        ExperimentConfig.from_dict(
+            {
+                **_robustness_base_dict(),
+                "validation": {"method": "walk_forward", "step": 200},
+            }
+        )
+
+
+def test_bootstrap_confidence_level_default_and_override() -> None:
+    config = ExperimentConfig.from_dict(_robustness_base_dict())
+    assert config.robustness.bootstrap.confidence_level == pytest.approx(0.90)
+    custom = ExperimentConfig.from_dict(
+        _robustness_base_dict(bootstrap={"confidence_level": 0.95})
+    )
+    assert custom.robustness.bootstrap.confidence_level == pytest.approx(0.95)
+
+
+@pytest.mark.parametrize("bad_level", [0.0, 1.0, -0.1, 1.5])
+def test_bootstrap_confidence_level_must_be_strictly_between_0_and_1(
+    bad_level: float,
+) -> None:
+    with pytest.raises(InvalidConfigurationError):
+        ExperimentConfig.from_dict(
+            _robustness_base_dict(bootstrap={"confidence_level": bad_level})
+        )
+
+
+def test_stress_test_settings_default_lists_reproduce_original_scenarios() -> None:
+    config = ExperimentConfig.from_dict(_robustness_base_dict())
+    settings = config.robustness.stress_test
+    assert settings.commission_multipliers == [2.0, 5.0]
+    assert settings.slippage_multipliers == [2.0]
+    assert settings.execution_delays == [1]
+    assert settings.best_days_removed == [10]
+    assert settings.reduce_universe_by == [1]
+
+
+def test_stress_test_settings_accept_custom_lists() -> None:
+    config = ExperimentConfig.from_dict(
+        _robustness_base_dict(
+            stress_test={
+                "commission_multipliers": [3.0],
+                "slippage_multipliers": [],
+                "execution_delays": [1, 2, 3],
+                "best_days_removed": [5, 20],
+                "reduce_universe_by": [],
+            }
+        )
+    )
+    settings = config.robustness.stress_test
+    assert settings.commission_multipliers == [3.0]
+    assert settings.slippage_multipliers == []
+    assert settings.execution_delays == [1, 2, 3]
+    assert settings.best_days_removed == [5, 20]
+    assert settings.reduce_universe_by == []
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "commission_multipliers",
+        "slippage_multipliers",
+        "execution_delays",
+        "best_days_removed",
+        "reduce_universe_by",
+    ],
+)
+def test_stress_test_settings_reject_duplicate_values(field: str) -> None:
+    with pytest.raises(InvalidConfigurationError):
+        ExperimentConfig.from_dict(_robustness_base_dict(stress_test={field: [2, 2]}))
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "commission_multipliers",
+        "slippage_multipliers",
+        "execution_delays",
+        "best_days_removed",
+        "reduce_universe_by",
+    ],
+)
+def test_stress_test_settings_reject_non_positive_values(field: str) -> None:
+    with pytest.raises(InvalidConfigurationError):
+        ExperimentConfig.from_dict(_robustness_base_dict(stress_test={field: [0]}))
+
+
+def test_strategy_signal_price_type_default_and_override() -> None:
+    config = ExperimentConfig.from_dict(_robustness_base_dict())
+    assert config.strategy.signal_price_type == "adjusted_close"
+    custom = ExperimentConfig.from_dict(
+        {
+            **_robustness_base_dict(),
+            "strategy": {
+                "name": "mean_reversion",
+                "parameters": {"lookback_period": 20},
+                "signal_price_type": "close",
+            },
+        }
+    )
+    assert custom.strategy.signal_price_type == "close"
+
+
+def test_strategy_signal_price_type_rejects_invalid_value() -> None:
+    with pytest.raises(InvalidConfigurationError):
+        ExperimentConfig.from_dict(
+            {
+                **_robustness_base_dict(),
+                "strategy": {
+                    "name": "mean_reversion",
+                    "parameters": {"lookback_period": 20},
+                    "signal_price_type": "vwap",
+                },
+            }
+        )
+
+
+def test_research_question_and_hypothesis_default_none_and_accept_override() -> None:
+    config = ExperimentConfig.from_dict(_robustness_base_dict())
+    assert config.research_question is None
+    assert config.hypothesis is None
+    custom = ExperimentConfig.from_dict(
+        {
+            **_robustness_base_dict(),
+            "research_question": "Is this strategy any good?",
+            "hypothesis": "H1: yes. H0: no.",
+        }
+    )
+    assert custom.research_question == "Is this strategy any good?"
+    assert custom.hypothesis == "H1: yes. H0: no."
+
+
+def test_output_config_defaults_and_accepts_override() -> None:
+    config = ExperimentConfig.from_dict(_robustness_base_dict())
+    assert config.output.directory is None
+    assert config.output.save_html_report is True
+    assert config.output.save_figures is True
+    custom = ExperimentConfig.from_dict(
+        {
+            **_robustness_base_dict(),
+            "output": {
+                "directory": "/tmp/custom",
+                "save_html_report": False,
+                "save_figures": False,
+            },
+        }
+    )
+    assert custom.output.directory == "/tmp/custom"
+    assert custom.output.save_html_report is False
+    assert custom.output.save_figures is False
+
+
 @pytest.mark.parametrize(
     "parameters",
     [
         {"lookback_period": [10, 20]},
-        {"lookback_period": [10, 20], "entry_zscore": [1.0, 2.0], "exit_zscore": [0.5]},
+        {
+            "lookback_period": [10, 20],
+            "entry_threshold": [1.0, 2.0],
+            "exit_threshold": [0.5],
+        },
     ],
 )
 def test_robustness_sensitivity_parameters_must_have_exactly_two_keys(
@@ -161,7 +405,29 @@ def test_robustness_sensitivity_parameters_rejects_empty_candidate_list() -> Non
         ExperimentConfig.from_dict(
             _robustness_base_dict(
                 sensitivity={
-                    "parameters": {"lookback_period": [10, 20], "entry_zscore": []}
+                    "parameters": {"lookback_period": [10, 20], "entry_threshold": []}
+                }
+            )
+        )
+
+
+def test_robustness_sensitivity_parameters_rejects_duplicate_candidates_at_load() -> (
+    None
+):
+    """Regression test: `robustness.sensitivity.parameters.lookback_
+    period: [126, 126]` used to load fine and only fail later, deep
+    inside `parameter_sensitivity.py`'s own execution-time duplicate
+    check (`Values for 'lookback_period' must not contain duplicates`) --
+    caught here at YAML load time instead, mirroring `StressTestSettings`/
+    `validation.parameter_grid`'s own established convention."""
+    with pytest.raises(InvalidConfigurationError, match="duplicate"):
+        ExperimentConfig.from_dict(
+            _robustness_base_dict(
+                sensitivity={
+                    "parameters": {
+                        "lookback_period": [126, 126],
+                        "entry_threshold": [1.0, 2.0],
+                    }
                 }
             )
         )
@@ -205,7 +471,7 @@ def test_robustness_sensitivity_parameters_accepts_two_valid_keys() -> None:
                 "enabled": True,
                 "parameters": {
                     "lookback_period": [10, 20],
-                    "entry_zscore": [1.0, 2.0],
+                    "entry_threshold": [1.0, 2.0],
                 },
             }
         )
@@ -213,7 +479,7 @@ def test_robustness_sensitivity_parameters_accepts_two_valid_keys() -> None:
     assert config.robustness.sensitivity.enabled is True
     assert config.robustness.sensitivity.parameters == {
         "lookback_period": [10, 20],
-        "entry_zscore": [1.0, 2.0],
+        "entry_threshold": [1.0, 2.0],
     }
 
 
@@ -248,7 +514,7 @@ def test_robustness_sensitivity_parameters_rejects_an_invalid_candidate_value() 
                     "enabled": True,
                     "parameters": {
                         "lookback_period": [0],
-                        "entry_zscore": [1.0, 2.0],
+                        "entry_threshold": [1.0, 2.0],
                     },
                 }
             )
@@ -262,15 +528,15 @@ def test_robustness_sensitivity_parameters_rejects_an_invalid_value_combination(
     *combination* across the two axes still isn't -- this must be checked
     against the strategy's own combined-parameter validator, not just each
     axis's values in isolation."""
-    with pytest.raises(InvalidConfigurationError, match="exit_zscore"):
+    with pytest.raises(InvalidConfigurationError, match="entry_threshold"):
         ExperimentConfig.from_dict(
             _robustness_base_dict(
                 sensitivity={
                     "enabled": True,
                     "parameters": {
-                        # mean_reversion requires exit_zscore < entry_zscore.
-                        "entry_zscore": [1.0],
-                        "exit_zscore": [2.0],
+                        # mean_reversion requires exit_threshold < entry_threshold.
+                        "entry_threshold": [1.0],
+                        "exit_threshold": [2.0],
                     },
                 }
             )

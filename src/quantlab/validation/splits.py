@@ -87,15 +87,30 @@ def walk_forward_windows(
     test_window: int,
     *,
     expanding: bool = True,
+    step: int | None = None,
 ) -> list[WalkForwardWindow]:
     """Generate contiguous rolling or expanding walk-forward folds.
 
-    Test blocks advance by ``test_window`` and therefore never overlap.
+    Each fold's train window starts ``step`` periods after the previous
+    fold's (default: ``step = test_window``, the original "test blocks
+    advance by test_window and never overlap" behaviour). A ``step``
+    smaller than ``test_window`` makes consecutive test blocks overlap
+    (denser evaluation). ``step`` must not exceed ``test_window``: a larger
+    step would skip observations between folds, leaving the stitched OOS
+    curve with gaps that CAGR/annualisation (which assume regularly spaced
+    observations) would silently misread as a shorter elapsed time.
     """
     _validate_datetime_index(index)
     train_window = _validate_window(train_window, name="train_window")
     validation_window = _validate_window(validation_window, name="validation_window")
     test_window = _validate_window(test_window, name="test_window")
+    step = test_window if step is None else _validate_window(step, name="step")
+    if step > test_window:
+        raise InvalidConfigurationError(
+            f"step ({step}) must not exceed test_window ({test_window}) -- a "
+            "larger step would skip observations between folds, which "
+            "CAGR/annualisation cannot account for."
+        )
     if not isinstance(expanding, (bool, np.bool_)):
         raise InvalidConfigurationError("expanding must be a boolean.")
     expanding = bool(expanding)
@@ -120,7 +135,7 @@ def walk_forward_windows(
             )
         )
         fold += 1
-        start += test_window
+        start += step
     return folds
 
 

@@ -1409,14 +1409,19 @@ def test_generator_hash_is_sensitive_to_cli_edits_but_not_dashboard_edits(
     assert engine._generator_hash() != original
 
 
-def test_robustness_placeholder_does_not_overclaim_cli_coverage() -> None:
+def test_robustness_placeholder_points_to_the_actual_cli_commands() -> None:
+    """Every technique named here now has a real `quantlab <name>` CLI
+    command (added alongside YAML-configurable robustness settings) --
+    the placeholder must point users at those, not only the Python API."""
     from quantlab.reporting.html_report import _render_robustness
 
     html = _render_robustness(None)
     assert "quantlab walk-forward" in html
-    assert "run_parameter_sensitivity" in html
-    assert "bootstrap_returns" in html
-    assert "monte_carlo_permutation" in html
+    assert "quantlab stress-test" in html
+    assert "quantlab sensitivity" in html
+    assert "quantlab bootstrap" in html
+    assert "quantlab permutation-test" in html
+    assert "quantlab robustness" in html
 
 
 def test_cache_covers_tolerates_a_weekend_end_date(tmp_path: Path) -> None:
@@ -4126,26 +4131,51 @@ def test_bar_bucket_end_distinguishes_xnys_friday_close_from_24_7_monday() -> No
 
 
 def test_drop_still_open_bars_uses_the_right_calendar(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """Deterministic in wall-clock time: real ``_utc_now()`` briefly disagreed
+    with itself near a UTC/exchange-local day boundary (the equity bar was
+    already safe 12h past its close, but the 24/7 bar -- whose bucket runs to
+    the following UTC midnight -- was not yet 12h past its own close), making
+    this flaky once per day. Pinned via monkeypatch instead."""
+    import quantlab.data.storage as storage_module
     from quantlab.data.calendar import (
         daily_equity_bucket_settlement,
         last_trading_day_on_or_before,
     )
-    from quantlab.data.storage import ParquetStorage, _drop_still_open_bars
+    from quantlab.data.storage import (
+        ParquetStorage,
+        _drop_still_open_bars,
+        _posting_lag_for,
+    )
 
-    now = pd.Timestamp.now(tz="UTC").tz_localize(None)
-    today = pd.Timestamp(year=now.year, month=now.month, day=now.day)
+    # A fixed, known-closed XNYS session -- no dependence on wall-clock time.
     closed_session = last_trading_day_on_or_before(
-        today - pd.Timedelta(days=1), calendar="XNYS"
+        pd.Timestamp("2024-01-10"), calendar="XNYS"
     )
     data = pd.DataFrame({"timestamp": [closed_session], "symbol": ["AAPL"]})
-    assert len(_drop_still_open_bars(data, "1d", calendar="XNYS")) == 1
-    assert len(_drop_still_open_bars(data, "1d", calendar="24/7")) == 1
 
     equity_close = daily_equity_bucket_settlement(closed_session)
     flat_close = closed_session + pd.Timedelta(days=1)
     assert equity_close < flat_close
+    posting_lag = _posting_lag_for("1d")
+    equity_safe_at = equity_close + posting_lag
+    flat_safe_at = flat_close + posting_lag
+    assert equity_safe_at < flat_safe_at
+
+    # Between the two safe-at instants: the equity bar is already safe, the
+    # 24/7 bar (whose bucket, and thus posting-lag clock, starts later) is not.
+    between = equity_safe_at + (flat_safe_at - equity_safe_at) / 2
+    monkeypatch.setattr(storage_module, "_utc_now", lambda: between)
+    assert len(_drop_still_open_bars(data, "1d", calendar="XNYS")) == 1
+    assert len(_drop_still_open_bars(data, "1d", calendar="24/7")) == 0
+
+    # After both instants: both calendars now consider the bar safe.
+    monkeypatch.setattr(
+        storage_module, "_utc_now", lambda: flat_safe_at + pd.Timedelta(minutes=1)
+    )
+    assert len(_drop_still_open_bars(data, "1d", calendar="XNYS")) == 1
+    assert len(_drop_still_open_bars(data, "1d", calendar="24/7")) == 1
 
     storage = ParquetStorage(cache_dir=tmp_path / "cache", metadata_dir=tmp_path / "md")
     equity_data = pd.DataFrame(

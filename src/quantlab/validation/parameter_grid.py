@@ -76,18 +76,45 @@ def default_parameter_grid(config: ExperimentConfig) -> dict[str, list[Any]]:
             grid.update(_cross_sectional_fraction_grid(config, parameters))
             return grid
         case "mean_reversion":
-            configured_entry = float(parameters.get("entry_zscore", 2.0))
-            exit_zscore = float(parameters.get("exit_zscore", 0.5))
-            stop_zscore = parameters.get("stop_zscore", 4.0)
-            maximum_entry = float(stop_zscore) if stop_zscore is not None else None
+            from quantlab.strategies.mean_reversion import INDICATOR_DEFAULT_THRESHOLDS
+
+            indicator = parameters.get("indicator", "zscore")
+            default_entry, default_exit, default_stop = (
+                INDICATOR_DEFAULT_THRESHOLDS.get(
+                    indicator, INDICATOR_DEFAULT_THRESHOLDS["zscore"]
+                )
+            )
+            # entry_threshold/exit_threshold=None (absent, or an explicit
+            # YAML `null`) both mean "the indicator's own default" per
+            # MeanReversionStrategy.validate_parameters -- unlike
+            # stop_threshold, there is no separate UNSET/None distinction
+            # to preserve here.
+            raw_entry = parameters.get("entry_threshold")
+            configured_entry = default_entry if raw_entry is None else float(raw_entry)
+            raw_exit = parameters.get("exit_threshold")
+            exit_threshold = default_exit if raw_exit is None else float(raw_exit)
+            stop_threshold = parameters.get("stop_threshold", default_stop)
+            maximum_entry = (
+                float(stop_threshold) if stop_threshold is not None else None
+            )
+            # Candidates scaled around THIS indicator's own default (0.75x/
+            # 1x/1.25x) rather than z-score-specific literals that would
+            # be meaningless on e.g. rsi's or percentile's own scale.
             return {
                 "lookback_period": _ordered_unique(
                     [10, 20, 40, int(parameters.get("lookback_period", 20))]
                 ),
-                "entry_zscore": [
+                "entry_threshold": [
                     value
-                    for value in _ordered_unique([1.5, 2.0, 2.5, configured_entry])
-                    if value > exit_zscore
+                    for value in _ordered_unique(
+                        [
+                            default_entry * 0.75,
+                            default_entry,
+                            default_entry * 1.25,
+                            configured_entry,
+                        ]
+                    )
+                    if value > exit_threshold
                     and (maximum_entry is None or value < maximum_entry)
                 ],
             }
@@ -106,21 +133,45 @@ def default_parameter_grid(config: ExperimentConfig) -> dict[str, list[Any]]:
             ]
             return {"fast_window": fast_candidates, "slow_window": slow_candidates}
         case "pairs_trading":
-            configured_entry = float(parameters.get("entry_zscore", 2.0))
-            exit_zscore = float(parameters.get("exit_zscore", 0.5))
-            stop_zscore = parameters.get("stop_zscore", 4.0)
-            maximum_entry = float(stop_zscore) if stop_zscore is not None else None
+            from quantlab.strategies.mean_reversion import INDICATOR_DEFAULT_THRESHOLDS
+
+            indicator = parameters.get("indicator", "zscore")
+            default_entry, default_exit, default_stop = (
+                INDICATOR_DEFAULT_THRESHOLDS.get(
+                    indicator, INDICATOR_DEFAULT_THRESHOLDS["zscore"]
+                )
+            )
+            # entry_threshold/exit_threshold=None (absent, or an explicit
+            # YAML `null`) both mean "the indicator's own default" per
+            # PairsTradingStrategy.validate_parameters -- unlike
+            # stop_threshold, there is no separate UNSET/None distinction
+            # to preserve here.
+            raw_entry = parameters.get("entry_threshold")
+            configured_entry = default_entry if raw_entry is None else float(raw_entry)
+            raw_exit = parameters.get("exit_threshold")
+            exit_threshold = default_exit if raw_exit is None else float(raw_exit)
+            stop_threshold = parameters.get("stop_threshold", default_stop)
+            maximum_entry = (
+                float(stop_threshold) if stop_threshold is not None else None
+            )
             return {
                 "formation_window": _ordered_unique(
                     [126, 252, 504, int(parameters.get("formation_window", 252))]
                 ),
-                "zscore_window": _ordered_unique(
-                    [21, 63, 126, int(parameters.get("zscore_window", 63))]
+                "indicator_window": _ordered_unique(
+                    [21, 63, 126, int(parameters.get("indicator_window", 63))]
                 ),
-                "entry_zscore": [
+                "entry_threshold": [
                     value
-                    for value in _ordered_unique([1.5, 2.0, 2.5, configured_entry])
-                    if value > exit_zscore
+                    for value in _ordered_unique(
+                        [
+                            default_entry * 0.75,
+                            default_entry,
+                            default_entry * 1.25,
+                            configured_entry,
+                        ]
+                    )
+                    if value > exit_threshold
                     and (maximum_entry is None or value < maximum_entry)
                 ],
             }

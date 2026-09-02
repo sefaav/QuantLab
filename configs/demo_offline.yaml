@@ -3,6 +3,16 @@
 # NOTE: the prices here are SYNTHETIC (generated), not real market data.
 experiment_name: demo_offline_momentum
 
+research_question: >-
+  Does cross-sectional momentum on this small offline demo universe
+  produce a stable out-of-sample signal, purely as a fast, no-network
+  illustration of the walk-forward pipeline?
+hypothesis: >-
+  H1: the walk-forward pipeline selects a consistent momentum parameter
+  across folds on this synthetic demo data. H0: fold-to-fold selection is
+  effectively random. (Demo data is synthetic -- not evidence about real
+  markets either way.)
+
 data:
   # The synthetic symbols model US equity ETFs.
   instruments:
@@ -34,6 +44,9 @@ strategy:
     bottom_fraction: 0.5
     long_short: false
     signal_scaling: binary
+  # Price series the strategy's own generate_signals() reads. Execution/
+  # costs always use the raw close regardless of this setting.
+  signal_price_type: adjusted_close
 
 portfolio:
   allocator: inverse_volatility
@@ -64,6 +77,9 @@ validation:
   train_window: 500
   validation_window: 126
   test_window: 126
+  # Advance between consecutive folds' train windows. Omit (or set equal to
+  # test_window) for the default: contiguous, non-overlapping test blocks.
+  step: 126
   expanding: true
   optimization_metric: sharpe
 
@@ -80,8 +96,19 @@ reproducibility:
 robustness:
   stress_test:
     enabled: true
+    # Each list is a set of magnitudes evaluated independently (one
+    # scenario row per value); an empty list disables that scenario type
+    # entirely.
+    commission_multipliers: [2.0, 5.0]
+    slippage_multipliers: [2.0]
+    execution_delays: [1]
+    best_days_removed: [10]
+    reduce_universe_by: [1]
   bootstrap:
     enabled: true
+    # Width of the reported p_lower/p_upper percentile band (0.90 -> the
+    # 5th/95th percentiles).
+    confidence_level: 0.90
   permutation_test:
     enabled: true
   sensitivity:
@@ -89,3 +116,10 @@ robustness:
     parameters:
       lookback_period: [126, 189, 252]
       top_fraction: [0.25, 0.50]
+
+# Where and what a run saves. Omit entirely for the default: reports/
+# generated/<experiment_name>/, both artefact toggles enabled.
+output:
+  # directory: reports/generated/demo_offline_momentum
+  save_html_report: true
+  save_figures: true

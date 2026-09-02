@@ -123,8 +123,15 @@ def executive_summary(result: BacktestResult) -> str:
 
 
 def research_question(result: BacktestResult) -> str:
-    """Return a question that names only configured and attached evidence."""
+    """Return a question that names only configured and attached evidence.
+
+    Returns ``result.config.research_question`` verbatim when set --
+    every experiment that doesn't set it keeps the auto-generated text
+    below unchanged.
+    """
     cfg = result.config
+    if cfg.research_question is not None:
+        return cfg.research_question
     strategy = _actually_used(result, "strategy", cfg.strategy_name)
     portfolio = cfg.portfolio
     volatility_targeted = (
@@ -173,7 +180,14 @@ def research_question(result: BacktestResult) -> str:
 
 
 def hypothesis(result: BacktestResult) -> str:
-    """Return H1/H0 and state whether OOS evidence is attached to the run."""
+    """Return H1/H0 and state whether OOS evidence is attached to the run.
+
+    Returns ``result.config.hypothesis`` verbatim when set -- every
+    experiment that doesn't set it keeps the auto-generated text below
+    unchanged.
+    """
+    if result.config.hypothesis is not None:
+        return result.config.hypothesis
     oos = _oos_metrics(result)
     oos_status = (
         f"attached to this run: {oos[1]}."
@@ -259,7 +273,7 @@ def _portfolio_methodology(result: BacktestResult) -> str:
         (portfolio.target_minimum_weight, "target minimum weight", ".2%"),
         (portfolio.maximum_gross_exposure, "maximum gross exposure", ".2f"),
         (portfolio.maximum_net_exposure, "maximum absolute net exposure", ".2f"),
-        (portfolio.maximum_turnover, "maximum L1 turnover per rebalance", ".2f"),
+        (portfolio.maximum_turnover, "maximum L1 turnover per period", ".2f"),
     )
     for value, label, spec in optional:
         if value is not None:

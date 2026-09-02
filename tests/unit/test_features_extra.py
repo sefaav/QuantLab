@@ -38,6 +38,25 @@ def test_rolling_channels_and_donchian() -> None:
     assert pos.between(-0.01, 1.01).all()
 
 
+def test_efficiency_ratio_is_high_for_a_clean_trend_and_low_for_noise() -> None:
+    trending = pd.Series(np.linspace(100, 200, 60))
+    rng = np.random.default_rng(0)
+    choppy = pd.Series(100.0 + np.cumsum(rng.normal(0.0, 1.0, 60)))
+    trending_ratio = T.efficiency_ratio(trending, 20).dropna()
+    choppy_ratio = T.efficiency_ratio(choppy, 20).dropna()
+    assert trending_ratio.between(0.0, 1.0).all()
+    assert choppy_ratio.between(0.0, 1.0).all()
+    # A perfectly monotonic trend's net move equals its total path length.
+    assert trending_ratio.iloc[-1] == pytest.approx(1.0)
+    assert trending_ratio.mean() > choppy_ratio.mean()
+
+
+def test_efficiency_ratio_is_neutral_for_a_flat_window() -> None:
+    flat = pd.Series(np.full(30, 100.0))
+    ratio = T.efficiency_ratio(flat, 10).dropna()
+    assert (ratio == 0.5).all()
+
+
 def test_log_returns_and_equity_curve() -> None:
     prices = pd.Series([100.0, 110.0, 99.0])
     lr = log_returns(prices)

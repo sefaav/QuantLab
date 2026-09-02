@@ -181,8 +181,8 @@ def run_walk_forward_parameter_sensitivity(
     WalkForwardValidator` run (all folds, OOS reconstruction), scored on that
     run's out-of-sample metrics. This keeps Walk-forward mode's sensitivity
     heatmap genuinely walk-forward-derived rather than silently reusing plain
-    single-backtest numbers.  Train/validation/test windows and expanding
-    mode come from ``base_config.validation``
+    single-backtest numbers.  Train/validation/test/step windows and
+    expanding mode come from ``base_config.validation``
     (:func:`~quantlab.validation.walk_forward.resolve_walk_forward_windows`).
 
     Args:
@@ -212,7 +212,7 @@ def run_walk_forward_parameter_sensitivity(
     if not isinstance(base_config, ExperimentConfig):
         raise TypeError("base_config must be an ExperimentConfig.")
     _validate_parameter_axes(base_config, parameter_x, values_x, parameter_y, values_y)
-    train_window, validation_window, test_window = resolve_walk_forward_windows(
+    train_window, validation_window, test_window, step = resolve_walk_forward_windows(
         base_config
     )
     expanding = base_config.validation.expanding
@@ -299,6 +299,7 @@ def run_walk_forward_parameter_sensitivity(
                 validation_window=validation_window,
                 test_window=test_window,
                 expanding=expanding,
+                step=step,
             )
             if wf.oos_result is None:
                 raise InvalidConfigurationError(

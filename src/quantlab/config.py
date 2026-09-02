@@ -19,12 +19,20 @@ from collections.abc import Iterable, Mapping
 from datetime import date
 from enum import StrEnum
 from pathlib import Path
-from typing import Any, Self, Union, get_args, get_origin
+from typing import Any, Literal, Self, Union, get_args, get_origin
 
 import numpy as np
 import pandas as pd
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StrictFloat,
+    StrictInt,
+    field_validator,
+    model_validator,
+)
 from yaml.constructor import ConstructorError
 from yaml.nodes import MappingNode
 
@@ -535,35 +543,37 @@ class DataConfig(_StrictModel):
         return self
 
     @model_validator(mode="after")
-    def _warn_if_mixed_calendars_dilute_windowed_features(self) -> DataConfig:
-        """Warn (never reject) that rolling-window features may be diluted.
+    def _note_mixed_calendars_use_native_calendar_features(self) -> DataConfig:
+        """Informational: a mixed-calendar universe uses native-calendar features.
 
-        A verified closure's synthetic bar (:mod:`quantlab.data.closures`)
-        is exactly flat -- zero return, zero volume -- so any trailing
-        window counted in raw *periods* (a momentum lookback, a volatility
-        window, an ADV window, a technical indicator's own window, ...)
-        spans MORE real trading sessions than its configured length for a
-        session-bound instrument sharing a combined timeline with an
-        always-open one (e.g. equities alongside crypto): those flat bars
-        silently dilute volatility/ADV estimates, and a "252-period"
-        lookback stretches across more than 252 real equity sessions.
-        Computing every instrument's own features on its native calendar
-        before aligning signals would remove this entirely, but that is a
-        substantially larger redesign than a single validator can express
-        -- this only makes the existing, structural limitation visible at
-        config load instead of a silent distortion (see
-        docs/limitations.md).
+        Every built-in strategy's own rolling-window signal (momentum
+        lookback, technical indicator, mean-reversion indicator, a pairs
+        spread's own hedge fit) and the ADV window are computed on each
+        instrument's own native session dates before aligning back onto
+        the combined timeline (see :func:`quantlab.features.
+        native_calendar.compute_native_then_align`) -- a session-bound
+        instrument sharing a combined timeline with an always-open one
+        (e.g. equities alongside crypto) is not diluted by the always-open
+        instrument's own extra sessions in what actually gets traded. Not
+        yet covered: the inverse-volatility/volatility-targeting
+        allocators, and most Strategy Explorer diagnostics (see
+        docs/limitations.md for the precise, still-open list). Kept at
+        ``logger.warning`` (surfaced in the dashboard sidebar) purely so a
+        user configuring a mixed-calendar portfolio is still made aware of
+        both what is covered and what remains open.
         """
         calendars = {instrument.calendar for instrument in self.instruments}
         if len(calendars) > 1:
             logger.warning(
-                "Instruments span more than one calendar (%s): any "
-                "rolling-window feature (momentum lookback, volatility "
-                "window, ADV window, technical indicators, ...) counts raw "
-                "periods, not real trading sessions per instrument -- a "
-                "session-bound instrument's estimates are diluted by the "
-                "flat, zero-return/zero-volume closure bars inserted to "
-                "keep the combined timeline dense. See docs/limitations.md.",
+                "Instruments span more than one calendar (%s): every "
+                "built-in strategy's own rolling-window signal (momentum "
+                "lookback, technical indicator, mean-reversion indicator, "
+                "a pairs spread's own hedge fit) and the ADV window are "
+                "computed on each instrument's own native calendar before "
+                "aligning onto the combined timeline. Not yet covered: "
+                "the inverse-volatility/volatility-targeting allocators, "
+                "and most Strategy Explorer diagnostics. See "
+                "docs/limitations.md.",
                 sorted(calendars),
             )
         return self
@@ -599,6 +609,21 @@ class StrategyConfig(_StrictModel):
 
     name: str
     parameters: dict[str, Any] = Field(default_factory=dict)
+    #: Price series used to generate signals -- execution/costs always use
+    #: the raw close regardless of this setting (see docs/data_pipeline.md);
+    #: this only controls what a strategy's own generate_signals() sees.
+    signal_price_type: Literal["adjusted_close", "close"] = "adjusted_close"
+
+    @model_validator(mode="after")
+    def _reject_price_type_in_parameters(self) -> StrategyConfig:
+        if "price_type" in self.parameters:
+            raise ValueError(
+                "strategy.parameters must not set 'price_type' directly -- "
+                "use strategy.signal_price_type instead, so the value the "
+                "strategy actually uses always matches what is recorded in "
+                "resolved_config."
+            )
+        return self
 
 
 class PortfolioConfig(_StrictModel):
@@ -618,8 +643,24 @@ class PortfolioConfig(_StrictModel):
     volatility_window: int = Field(default=63, gt=1)
     maximum_leverage: float = Field(default=1.0, gt=0.0)
     rebalance_frequency: RebalanceFrequency = RebalanceFrequency.MONTHLY
-    # Maximum L1 weight change allowed at each rebalance.
+    # Maximum L1 weight change allowed on any single row. A rebalance whose
+    # full target exceeds this in one step lands partially and keeps
+    # closing the remaining gap over subsequent rows, so a whole rebalance
+    # can take several rows to fully execute.
     maximum_turnover: float | None = Field(default=None, gt=0.0)
+    # Evolve executed weights forward by organic price drift between real
+    # trades (see quantlab.backtesting.accounting.apply_weight_drift)
+    # instead of holding them constant until the next scheduled rebalance --
+    # a real portfolio's weights genuinely do drift with each asset's own
+    # price move between trades; holding them constant is only ever exactly
+    # correct when the schedule itself rebalances every single period. A
+    # genuinely scheduled rebalance still always trades toward its
+    # freshly-decided target regardless of drift -- landing there in one
+    # row unless maximum_turnover caps the move, in which case it lands
+    # partially and keeps closing the gap on subsequent rows. `False`
+    # remains available as an explicit legacy/reproducibility escape
+    # hatch, not the standard path.
+    model_weight_drift: bool = True
 
     @model_validator(mode="after")
     def _reject_unimplemented_custom_rebalancing(self) -> PortfolioConfig:
@@ -738,6 +779,11 @@ class ValidationConfig(_StrictModel):
     train_window: int | None = Field(default=None, gt=0)
     validation_window: int | None = Field(default=None, gt=0)
     test_window: int | None = Field(default=None, gt=0)
+    # Advance between consecutive folds' train windows. None defaults to
+    # test_window (contiguous, non-overlapping test blocks). A smaller step
+    # overlaps test blocks for denser evaluation; step must not exceed
+    # test_window (see walk_forward_windows()'s docstring for why).
+    step: int | None = Field(default=None, gt=0)
     expanding: bool = True
     optimization_metric: OptimizationMetric = OptimizationMetric.SHARPE
     # Optional strategy-parameter candidates for walk-forward selection. When
@@ -758,6 +804,18 @@ class ValidationConfig(_StrictModel):
                 "validation_ratio has no effect without a positive test_ratio "
                 "when validation.method is 'holdout'."
             )
+        if self.method is ValidationMethod.WALK_FORWARD and self.step is not None:
+            # Mirrors resolve_walk_forward_windows()'s own default (126) --
+            # kept duplicated rather than imported since that function lives
+            # in quantlab.validation.walk_forward, which itself imports this
+            # config module.
+            effective_test_window = self.test_window or 126
+            if self.step > effective_test_window:
+                raise ValueError(
+                    f"step ({self.step}) must not exceed test_window "
+                    f"({effective_test_window}) -- a larger step would skip "
+                    "dates between consecutive folds' test blocks entirely."
+                )
         if self.method is ValidationMethod.WALK_FORWARD and (
             self.validation_ratio is not None or self.test_ratio is not None
         ):
@@ -777,6 +835,30 @@ class ValidationConfig(_StrictModel):
                     raise ValueError(
                         f"parameter_grid.{name} must contain at least one candidate."
                     )
+                if name == "price_type":
+                    raise ValueError(
+                        "parameter_grid must not include 'price_type' -- it is a "
+                        "structural choice, set strategy.signal_price_type instead."
+                    )
+                # Caught here, at YAML load time, rather than deep inside
+                # walk_forward.py's own execution-time duplicate check --
+                # same "reject at the door" convention as StressTestSettings.
+                _no_duplicate_values(candidates, name=f"parameter_grid.{name}")
+        if self.method is not ValidationMethod.WALK_FORWARD:
+            window_fields = {
+                "train_window": self.train_window,
+                "validation_window": self.validation_window,
+                "test_window": self.test_window,
+                "step": self.step,
+            }
+            provided = sorted(k for k, v in window_fields.items() if v is not None)
+            if provided:
+                verb = "apply" if len(provided) > 1 else "applies"
+                pronoun = "them" if len(provided) > 1 else "it"
+                raise ValueError(
+                    f"{', '.join(provided)} {verb} only to validation.method "
+                    f"'walk_forward'; remove {pronoun} or set method: walk_forward."
+                )
         return self
 
 
@@ -786,10 +868,56 @@ class ReproducibilityConfig(_StrictModel):
     random_seed: int = Field(default=42, ge=0)
 
 
+def _no_duplicate_values(values: list[Any], *, name: str) -> list[Any]:
+    """Reject a candidate list containing the same value more than once."""
+    seen: list[Any] = []
+    for value in values:
+        if value in seen:
+            raise ValueError(f"{name} must not contain duplicate values.")
+        seen.append(value)
+    return values
+
+
 class StressTestSettings(_StrictModel):
-    """Toggle for the ``robustness stress-test`` / orchestrator run."""
+    """Scenario magnitudes for the ``robustness stress-test`` / orchestrator run.
+
+    Each list is a set of scenario magnitudes to evaluate independently
+    (one row per value) -- an empty list disables that scenario TYPE
+    entirely, the same "empty means nothing to run" convention as
+    ``validation.parameter_grid``. Defaults reproduce exactly the fixed
+    scenario set this project ran before these became configurable.
+    """
 
     enabled: bool = False
+    commission_multipliers: list[StrictFloat] = Field(
+        default_factory=lambda: [2.0, 5.0]
+    )
+    slippage_multipliers: list[StrictFloat] = Field(default_factory=lambda: [2.0])
+    execution_delays: list[StrictInt] = Field(default_factory=lambda: [1])
+    best_days_removed: list[StrictInt] = Field(default_factory=lambda: [10])
+    #: Number of symbols dropped from the tail of the universe, per
+    #: scenario. A scenario whose universe is too small for that count is
+    #: recorded with status="failed", never silently omitted.
+    reduce_universe_by: list[StrictInt] = Field(default_factory=lambda: [1])
+
+    @model_validator(mode="after")
+    def _check_magnitudes(self) -> StressTestSettings:
+        # Multipliers below are genuine stress scenarios (elevated costs),
+        # not arbitrary perturbations -- 1.0 or below would silently test
+        # cheaper-than-baseline execution instead. Delays/day-counts/removed
+        # symbols are plain positive counts.
+        for name, values, gt in (
+            ("commission_multipliers", self.commission_multipliers, 1.0),
+            ("slippage_multipliers", self.slippage_multipliers, 1.0),
+            ("execution_delays", self.execution_delays, 0),
+            ("best_days_removed", self.best_days_removed, 0),
+            ("reduce_universe_by", self.reduce_universe_by, 0),
+        ):
+            for value in values:
+                if value <= gt:
+                    raise ValueError(f"{name} entries must be greater than {gt}.")
+            _no_duplicate_values(values, name=name)
+        return self
 
 
 class BootstrapSettings(_StrictModel):
@@ -798,6 +926,9 @@ class BootstrapSettings(_StrictModel):
     enabled: bool = False
     n_iterations: int = Field(default=1000, gt=0)
     block_size: int = Field(default=1, gt=0)
+    #: Central percentile interval width reported by BootstrapResult.summary()
+    #: (0.90 -> the 5th/95th percentiles).
+    confidence_level: float = Field(default=0.90, gt=0.0, lt=1.0)
 
 
 class PermutationTestSettings(_StrictModel):
@@ -845,6 +976,19 @@ class SensitivitySettings(_StrictModel):
                     f"robustness.sensitivity.parameters.{name} must "
                     "contain at least one candidate value."
                 )
+            if name == "price_type":
+                raise ValueError(
+                    "robustness.sensitivity.parameters must not include "
+                    "'price_type' -- it is a structural choice, set "
+                    "strategy.signal_price_type instead."
+                )
+            # Caught here, at YAML load time, rather than deep inside
+            # parameter_sensitivity.py's own execution-time duplicate
+            # check -- same "reject at the door" convention as
+            # StressTestSettings/ValidationConfig.parameter_grid.
+            _no_duplicate_values(
+                candidates, name=f"robustness.sensitivity.parameters.{name}"
+            )
         return self
 
 
@@ -861,6 +1005,37 @@ class RobustnessConfig(_StrictModel):
         default_factory=PermutationTestSettings
     )
     sensitivity: SensitivitySettings = Field(default_factory=SensitivitySettings)
+
+
+class OutputConfig(_StrictModel):
+    """Where and what a run saves (``output:``).
+
+    ``directory`` overrides the default ``reports/generated/<experiment_
+    name>`` location used by every CLI command (``backtest``'s own
+    ``--output`` flag still takes priority when given). The two artefact
+    toggles skip only the presentation layer -- metrics.json/trades.csv/
+    equity_curve.csv and every other numeric artefact are always written
+    regardless. ``quantlab report`` does NOT depend on those saved
+    artefacts to regenerate the HTML report later: it reloads the data and
+    re-runs the backtest from this same config, and only reuses previously
+    saved walk-forward/stress/bootstrap/permutation-test/sensitivity
+    EVIDENCE when its own provenance check against the fresh run still
+    passes.
+    """
+
+    directory: str | None = None
+    save_html_report: bool = True
+    save_figures: bool = True
+
+    @field_validator("directory")
+    @classmethod
+    def _reject_blank_directory(cls, value: str | None) -> str | None:
+        if value is not None and not value.strip():
+            raise ValueError(
+                "output.directory must not be empty or whitespace-only -- omit "
+                "the field entirely to use the default location instead."
+            )
+        return value
 
 
 class ExperimentConfig(_StrictModel):
@@ -881,6 +1056,25 @@ class ExperimentConfig(_StrictModel):
         default_factory=ReproducibilityConfig
     )
     robustness: RobustnessConfig = Field(default_factory=RobustnessConfig)
+    output: OutputConfig = Field(default_factory=OutputConfig)
+    #: Optional overrides for the HTML report's auto-generated research
+    #: question/hypothesis text (quantlab.reporting.research_summary). When
+    #: unset, that text is synthesized from the strategy name/config as
+    #: before -- unchanged behaviour for every experiment that doesn't set
+    #: these.
+    research_question: str | None = None
+    hypothesis: str | None = None
+
+    @field_validator("research_question", "hypothesis")
+    @classmethod
+    def _reject_blank_research_text(cls, value: str | None) -> str | None:
+        if value is not None and not value.strip():
+            raise ValueError(
+                "research_question/hypothesis must not be empty or "
+                "whitespace-only -- omit the field entirely to use the "
+                "auto-generated text instead."
+            )
+        return value
 
     @field_validator("experiment_name")
     @classmethod
@@ -982,7 +1176,8 @@ class ExperimentConfig(_StrictModel):
             if self.portfolio.allocator != "signal_proportional":
                 raise ValueError(
                     "pairs_trading requires portfolio.allocator "
-                    "'signal_proportional' so its dollar hedge ratio is preserved."
+                    "'signal_proportional' so the relative dollar-notional "
+                    "hedge ratio implied by beta and current prices is preserved."
                 )
             if (
                 self.portfolio.maximum_weight is not None
@@ -1026,6 +1221,13 @@ class ExperimentConfig(_StrictModel):
                     "cross_sectional_momentum needs enough distinct symbols for "
                     f"its top/bottom selections ({top_count} + {bottom_count} "
                     f"requested, {available} configured)."
+                )
+            scaling = parameters.get("signal_scaling", "binary")
+            if scaling != "binary" and self.portfolio.allocator == "equal_weight":
+                raise ValueError(
+                    "Non-binary cross_sectional_momentum signals require an "
+                    "allocator that preserves signal magnitude; equal_weight "
+                    "keeps only signs."
                 )
         if self.strategy.name == "time_series_momentum":
             scaling = self.strategy.parameters.get("signal_scaling", "binary")
