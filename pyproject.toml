@@ -42,7 +42,7 @@ dependencies = [
     "typer>=0.27.1",         # CLI
     "requests>=2.31",      # Binance REST client
     "pandas-market-calendars>=5.4,<6",  # Maintained market calendars (XNYS, XASX, XSAU, ...)
-    "filelock>=3.13",      # Cross-process cache-write coordination
+    "filelock>=3.32.3",      # Cross-process cache-write coordination
 ]
 
 [project.optional-dependencies]

@@ -14,7 +14,7 @@ pyyaml>=6.0
 typer>=0.27.1
 requests>=2.31
 pandas-market-calendars>=5.4,<6
-filelock>=3.13
+filelock>=3.32.3
 
 # Data source (optional but needed for `quantlab download` from Yahoo)
 yfinance>=1.6.0
