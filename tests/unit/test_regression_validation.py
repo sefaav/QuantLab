@@ -321,6 +321,44 @@ def test_walk_forward_oos_result_reports_config_yaml_reflects_everything() -> No
     assert "reproducible from config.yaml given the same code" in html
 
 
+def test_walk_forward_trade_log_has_no_reason_attribution() -> None:
+    """The stitched out-of-sample trade log has no trigger/adjustment/
+    position_strategy_origin provenance -- not a crash, not a fabricated
+    value, and not the `unknown` safety-net code either (that is reserved
+    for the *active* attribution path failing to identify a real cause,
+    never for an attribution path that was never run). Each fold reruns
+    the pipeline independently with its own warmup/fit; the diagnostic
+    frames a single engine run keeps for attribution do not survive the
+    cut/restitch across folds, so `build_trade_log` is called here without
+    any of the provenance kwargs (see the comment at that call site in
+    `walk_forward.py`), leaving the reason columns `None`/`NaT`
+    everywhere -- a real architectural fact about walk-forward, not a
+    negligence bug."""
+    from quantlab.validation.walk_forward import WalkForwardValidator
+
+    data, cfg = _rf_test_setup()
+    wf = WalkForwardValidator(cfg).run(
+        data, parameter_grid={}, train_window=200, validation_window=50, test_window=50
+    )
+    assert wf.oos_result is not None
+    trades = wf.oos_result.trades
+    assert len(trades) > 0  # sanity: the fixture must actually produce trades to check
+
+    reason_columns = [
+        "trigger_reason_code",
+        "trigger_reason_detail_code",
+        "trigger_reason_details",
+        "adjustment_reason_codes",
+        "adjustment_reason_details",
+        "position_strategy_origin_code",
+        "position_strategy_origin_details",
+    ]
+    for column in reason_columns:
+        assert trades[column].isna().all(), column
+    assert trades["position_strategy_origin_timestamp"].isna().all()
+    assert (trades["trigger_reason_code"] == "unknown").sum() == 0
+
+
 def test_holdout_test_ratio_without_validation_ratio_does_not_crash() -> None:
     from quantlab.backtesting.runner import run_backtest_from_config
 
@@ -761,7 +799,177 @@ def test_walk_forward_oos_metrics_use_configured_risk_free_rate() -> None:
     assert with_rf["sharpe_ratio"] != pytest.approx(without_rf["sharpe_ratio"])
 
 
+def test_walk_forward_step_defaults_to_test_window() -> None:
+    """Omitting ``step`` must reproduce the original non-overlapping-folds
+    behaviour exactly: the same fold count/dates as an explicit
+    ``step=test_window``, and the metadata must record that resolved value."""
+    from quantlab.validation.walk_forward import WalkForwardValidator
+
+    data, cfg = _rf_test_setup()
+    default_run = WalkForwardValidator(cfg).run(
+        data, parameter_grid={}, train_window=150, validation_window=30, test_window=40
+    )
+    explicit_run = WalkForwardValidator(cfg).run(
+        data,
+        parameter_grid={},
+        train_window=150,
+        validation_window=30,
+        test_window=40,
+        step=40,
+    )
+    assert len(default_run.folds) == len(explicit_run.folds)
+    assert default_run.oos_returns.equals(explicit_run.oos_returns)
+    assert default_run.oos_result is not None
+    assert default_run.oos_result.metadata["walk_forward_windows"]["step"] == 40
+
+
+def test_walk_forward_step_smaller_than_test_window_overlaps_folds() -> None:
+    """A step smaller than test_window must produce MORE folds than the
+    default (overlapping test blocks) and must not raise the "test blocks
+    overlap" error a genuine bug would trigger -- the stitched OOS series
+    must still come out with a unique, sorted date index."""
+    from quantlab.config import RebalanceFrequency
+    from quantlab.validation.walk_forward import WalkForwardValidator
+
+    data, cfg = _rf_test_setup()
+    # Daily rebalancing so each fold's first execution date is distinct even
+    # with heavily overlapping test blocks -- with the default monthly
+    # cadence, a step this much smaller than test_window can make two folds'
+    # test blocks share the same first rebalance date, which is a distinct,
+    # separately covered failure mode (see
+    # test_walk_forward_folds_are_rejected_when_execution_dates_collide).
+    cfg = cfg.revalidated_copy(
+        update={
+            "portfolio": cfg.portfolio.revalidated_copy(
+                update={"rebalance_frequency": RebalanceFrequency.DAILY}
+            )
+        }
+    )
+    default_run = WalkForwardValidator(cfg).run(
+        data, parameter_grid={}, train_window=150, validation_window=30, test_window=40
+    )
+    overlapping_run = WalkForwardValidator(cfg).run(
+        data,
+        parameter_grid={},
+        train_window=150,
+        validation_window=30,
+        test_window=40,
+        step=20,
+    )
+    assert len(overlapping_run.folds) > len(default_run.folds)
+    assert overlapping_run.oos_returns.index.is_unique
+    assert overlapping_run.oos_returns.index.is_monotonic_increasing
+
+
+def test_walk_forward_folds_are_rejected_when_execution_dates_collide() -> None:
+    """A step small enough to overlap test blocks, combined with rebalancing
+    too infrequent to distinguish them, can make two folds resolve to the
+    SAME first execution date -- silently attributing zero (or the wrong)
+    observations to one of them via FoldResult.test_returns slicing. This
+    must be rejected outright rather than reported silently."""
+    from quantlab.exceptions import InvalidConfigurationError
+    from quantlab.validation.walk_forward import WalkForwardValidator
+
+    data, cfg = _rf_test_setup()
+    with pytest.raises(InvalidConfigurationError, match="execution date"):
+        WalkForwardValidator(cfg).run(
+            data,
+            parameter_grid={},
+            train_window=150,
+            validation_window=30,
+            test_window=40,
+            step=20,
+        )
+
+
+def test_walk_forward_step_larger_than_test_window_is_rejected() -> None:
+    """A step larger than test_window would skip observations between folds,
+    leaving the stitched OOS curve with gaps that CAGR/annualisation (which
+    assume regularly spaced observations) cannot account for -- rejected
+    outright rather than silently misreporting elapsed time."""
+    from quantlab.exceptions import InvalidConfigurationError
+    from quantlab.validation.walk_forward import WalkForwardValidator
+
+    data, cfg = _rf_test_setup()
+    with pytest.raises(InvalidConfigurationError, match="step"):
+        WalkForwardValidator(cfg).run(
+            data,
+            parameter_grid={},
+            train_window=150,
+            validation_window=30,
+            test_window=40,
+            step=80,
+        )
+
+
+def test_walk_forward_overlapping_step_keeps_the_latest_folds_target() -> None:
+    """On a date shared by two overlapping folds' test blocks, the stitched
+    series must keep the LATER fold's own target -- verified directly on
+    ``_finalize()``'s own dedup step with two fabricated, deliberately
+    conflicting target pieces, sidestepping any dependency on a real
+    strategy/allocator pipeline actually producing distinguishable values
+    for two overlapping folds (not guaranteed for every strategy)."""
+    from quantlab.config import RebalanceFrequency
+    from quantlab.validation.splits import WalkForwardWindow
+    from quantlab.validation.walk_forward import WalkForwardValidator
+
+    data, cfg = _rf_test_setup()
+    # Daily rebalancing so every short, synthetic fold test-window below
+    # has at least one rebalance date -- irrelevant to what this test
+    # actually verifies (the dedup step), just a precondition _finalize()
+    # enforces.
+    cfg = cfg.revalidated_copy(
+        update={
+            "portfolio": cfg.portfolio.revalidated_copy(
+                update={"rebalance_frequency": RebalanceFrequency.DAILY}
+            )
+        }
+    )
+    validator = WalkForwardValidator(cfg)
+    idx = pd.bdate_range("2020-06-01", periods=10)
+    shared_dates = idx[3:7]
+    piece_a = pd.DataFrame(0.1, index=idx[0:7], columns=["AAA", "BBB"])
+    piece_b = pd.DataFrame(0.9, index=idx[3:10], columns=["AAA", "BBB"])
+    fold_a = WalkForwardWindow(fold=0, train=idx[:1], validation=idx[:1], test=idx[0:7])
+    fold_b = WalkForwardWindow(
+        fold=1, train=idx[:1], validation=idx[:1], test=idx[3:10]
+    )
+
+    stitched = validator._finalize(
+        [fold_a, fold_b],
+        [{}, {}],
+        [1.0, 1.0],
+        [piece_a, piece_b],
+        data[data["symbol"].isin({"AAA", "BBB"})],
+        data,
+        cfg,
+        252,
+        0.0,
+        0,
+        {},
+        7,
+        1,
+        7,
+        4,  # step=4 < test_window=7 -> overlap, dedup path
+        True,
+        0.0,
+    )
+    assert stitched.oos_result is not None
+    assert stitched.oos_result.target_weights is not None
+    for date in shared_dates:
+        target = stitched.oos_result.target_weights.at[date, "AAA"]
+        assert target == pytest.approx(0.9)
+
+
 def test_walk_forward_charges_entry_cost_at_the_first_fold_start() -> None:
+    """This test is about the OOS-stitching mechanism, not weight drift: it
+    checks that per-fold reporting doesn't spuriously double-charge an
+    entry cost at a fold boundary the position was actually carried
+    through. `model_weight_drift` is pinned `False` here so a genuine,
+    correct periodic rebalance-driven cost (buy_and_hold's constant
+    target snapping back from organic price drift on a scheduled
+    rebalance -- see test_weight_drift.py) can't be mistaken for a
+    stitching bug."""
     from quantlab.validation.walk_forward import WalkForwardValidator
 
     def run_with_commission(commission_bps: float) -> list[pd.Series]:
@@ -774,7 +982,10 @@ def test_walk_forward_charges_entry_cost_at_the_first_fold_start() -> None:
                         "spread_bps": 0.0,
                         "slippage_bps": 0.0,
                     }
-                )
+                ),
+                "portfolio": cfg.portfolio.revalidated_copy(
+                    update={"model_weight_drift": False}
+                ),
             }
         )
         wf = WalkForwardValidator(cfg).run(
@@ -953,23 +1164,19 @@ def test_walk_forward_turnover_cap_chains_across_fold_boundaries(
 
     monkeypatch.setattr(WalkForwardValidator, "_weights_on_test", fake_weights_on_test)
 
-    import quantlab.validation.walk_forward as wf_mod
-
-    captured: dict[str, pd.DataFrame] = {}
-    orig_run_accounting = wf_mod.run_accounting
-
-    def spy_run_accounting(all_weights: pd.DataFrame, *args: Any, **kwargs: Any) -> Any:
-        captured["weights"] = all_weights.copy()
-        return orig_run_accounting(all_weights, *args, **kwargs)
-
-    monkeypatch.setattr(wf_mod, "run_accounting", spy_run_accounting)
-
-    validator.run(
+    result = validator.run(
         data, parameter_grid={}, train_window=100, validation_window=20, test_window=5
     )
 
-    weights = captured["weights"]
-    turnover = (weights - weights.shift(1).fillna(0.0)).abs().sum(axis=1)
+    # With `model_weight_drift` at its default (True), `apply_weight_drift`
+    # (inside `run_accounting`) is the SOLE place `maximum_turnover` is
+    # enforced -- the decision-level `all_weights` handed to accounting is
+    # deliberately left uncapped (see `decision_portfolio_config` in
+    # walk_forward.py's own OOS-stitching call site), so the cap must be
+    # checked on the final realised turnover, not intercepted upstream.
+    assert result.oos_result is not None
+    turnover = result.oos_result.turnover
+    assert turnover is not None
     assert turnover.max() == pytest.approx(0.1, abs=1e-6), (
         f"maximum_turnover=0.1 must bound every rebalance, including across "
         f"a fold boundary; observed max realised turnover {turnover.max()}"
@@ -1456,3 +1663,105 @@ def test_notebook_walk_forward_cell_passes_risk_free_rate() -> None:
     assert oos_metrics_cells, "expected a wf.oos_metrics(...) cell in the notebook"
     for code in oos_metrics_cells:
         assert "wf.oos_metrics(config.periods_per_year, config.risk_free_rate)" in code
+
+
+def test_evaluate_window_never_double_applies_execution_delay_to_rebalance_date() -> (
+    None
+):
+    """`window_weights` (from `_weights_for_window`, via
+    `run_backtest_from_config(..., execution_delay=execution_delay)`) is
+    itself already `execution_delay`-shifted -- it IS
+    `BacktestResult.weights`. Passing `execution_delay` a second time into
+    `_rebalance_date_for_run_accounting` would shift the rebalance-date
+    flag an EXTRA `execution_delay` rows past where `window_weights`
+    itself already sits, misaligning candidate-scoring's schedule-anchor
+    detection from the actual execution model it's supposed to score.
+    `rebalance_date` must be built with `delay=0`, matching the sibling
+    call site in this module's own candidate-scoring loop."""
+    from tests.regression_helpers import _rf_test_setup
+
+    import quantlab.validation.walk_forward as wf_mod
+
+    data, cfg = _rf_test_setup()
+    cfg = cfg.revalidated_copy(
+        update={
+            "portfolio": cfg.portfolio.revalidated_copy(
+                update={"rebalance_frequency": "daily"}
+            )
+        }
+    )
+    lookback_start = pd.Timestamp("2020-01-01")
+    window_start = pd.Timestamp("2020-03-01")
+    window_end = pd.Timestamp("2020-06-01")
+
+    captured: dict[str, pd.DataFrame] = {}
+    orig_run_accounting = wf_mod.run_accounting
+
+    def spy_run_accounting(*args: Any, **kwargs: Any) -> Any:
+        captured["rebalance_date"] = kwargs["rebalance_date"].copy()
+        captured["tradable"] = kwargs["tradable"]
+        return orig_run_accounting(*args, **kwargs)
+
+    wf_mod.run_accounting = spy_run_accounting
+    try:
+        window_weights, _ = wf_mod._weights_and_returns_for_validation(
+            data, cfg, lookback_start, window_start, window_end, execution_delay=2
+        )
+    finally:
+        wf_mod.run_accounting = orig_run_accounting
+
+    expected = wf_mod._rebalance_date_for_run_accounting(
+        window_weights,
+        cfg.portfolio.rebalance_frequency,
+        None,
+        captured["tradable"],
+        0,
+    )
+    double_delayed = wf_mod._rebalance_date_for_run_accounting(
+        window_weights,
+        cfg.portfolio.rebalance_frequency,
+        None,
+        captured["tradable"],
+        2,
+    )
+    # Sanity: the two would genuinely differ, so this test is not vacuous.
+    assert not expected.equals(double_delayed)
+    pd.testing.assert_frame_equal(captured["rebalance_date"], expected)
+
+
+def test_rebalance_date_for_run_accounting_never_true_on_a_closed_row() -> None:
+    """Regression test: `compute_executed_weights` is built for *weights*,
+    where a closed row correctly repeats the last tradable row's frozen
+    value. `_rebalance_date_for_run_accounting` reused it to align a
+    boolean flag -- applied to a flag, that same repetition kept it True
+    for every row a column stayed closed right after a landing, which
+    `apply_weight_drift`'s own documented precondition explicitly forbids
+    (it re-anchors ordinary debt to a stale target and fires an
+    unscheduled trade the moment the column reopens). A `daily` schedule
+    flags every row True, so a landing on the last tradable row before a
+    closure is guaranteed, not scenario-dependent."""
+    from quantlab.validation.walk_forward import _rebalance_date_for_run_accounting
+
+    dates = pd.date_range("2024-01-01", periods=8, freq="D")
+    decision_weights = pd.DataFrame({"A": [0.5] * 8, "B": [0.5] * 8}, index=dates)
+    tradable = pd.DataFrame(
+        {
+            "A": [True, True, True, False, False, True, True, True],
+            "B": [True] * 8,
+        },
+        index=dates,
+    )
+
+    result = _rebalance_date_for_run_accounting(
+        decision_weights, "daily", None, tradable, 0
+    )
+
+    violation = result & ~tradable
+    assert not violation.to_numpy().any(), (
+        f"rebalance_date is True on a closed row: {violation[violation.any(axis=1)]}"
+    )
+    # Sanity: the closure itself is genuinely exercised, not vacuously
+    # passing because A never lands True around it.
+    assert result.loc[dates[2], "A"]  # lands True right before the closure
+    assert not result.loc[dates[3], "A"]
+    assert not result.loc[dates[4], "A"]

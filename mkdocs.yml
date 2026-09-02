@@ -26,8 +26,10 @@ nav:
   - Architecture: architecture.md
   - Data pipeline: data_pipeline.md
   - Strategies: strategies.md
+  - Strategy Explorer: strategy_explorer.md
   - Python API: api.md
   - Backtesting: backtesting.md
+  - Drift compliance: drift_compliance.md
   - Validation: validation.md
   - Limitations: limitations.md
 

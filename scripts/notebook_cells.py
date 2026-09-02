@@ -289,8 +289,10 @@ plt.show()
         """\
 The three indicators broadly agree on *when* SPY is stretched (their extremes
 line up in time), but disagree on magnitude — this is exactly why the
-strategy config exposes `entry_zscore` / `exit_zscore` as tunable parameters
-rather than hard-coding one indicator's convention.
+strategy config exposes `entry_threshold` / `exit_threshold` as tunable
+parameters (on whichever `indicator` is selected — z-score, Bollinger %B, RSI,
+distance to a moving average, or percentile rank) rather than hard-coding
+one indicator's convention.
 """,
     ),
     ("md", "## Full backtest: rolling z-score mean reversion"),
@@ -473,7 +475,7 @@ not as strong standalone evidence that the pair is permanently stationary.
     (
         "code",
         """\
-z = rolling_zscore(spread, window=config.strategy.parameters["zscore_window"])
+z = rolling_zscore(spread, window=config.strategy.parameters["indicator_window"])
 fig, ax = plt.subplots(figsize=(10, 4))
 ax.plot(z.index, z.to_numpy(dtype=float), color="#2563eb", lw=0.8)
 ax.axhline(2, color="#dc2626", lw=0.8, ls="--")
@@ -533,6 +535,7 @@ from quantlab.validation.parameter_sensitivity import (
 )
 from quantlab.validation.bootstrap import bootstrap_returns
 from quantlab.validation.robustness import run_stress_tests, monte_carlo_permutation
+from quantlab.reporting.tables import format_bootstrap_summary
 
 config = ExperimentConfig.from_yaml("../configs/momentum_sp500.yaml")
 data, report = DataLoader().load(config)
@@ -604,19 +607,21 @@ boot = bootstrap_returns(
     periods_per_year=config.periods_per_year, initial_capital=config.initial_capital,
     risk_free_rate=config.risk_free_rate,
 )
-boot.summary()
+format_bootstrap_summary(boot.summary())
 """,
     ),
     (
         "md",
         """\
 The median represents the typical result across the 1,000 synthetic histories.
-The `p05` and `p95` columns contain the middle 90% of the simulated outcomes:
+The `p_lower` and `p_upper` columns contain the middle 90% of the simulated
+outcomes (the 5th/95th percentiles by default; configurable via
+`robustness.bootstrap.confidence_level`):
 
-- for CAGR, Sharpe and final value, `p05` is the less favourable boundary and
-  `p95` is the more favourable boundary;
+- for CAGR, Sharpe and final value, `p_lower` is the less favourable boundary
+  and `p_upper` is the more favourable boundary;
 - for maximum drawdown, a more negative value represents a worse loss, so
-  `p05` is the more severe drawdown scenario.
+  `p_lower` is the more severe drawdown scenario.
 
 A narrow range suggests that the result is relatively insensitive to the
 historical ordering of returns. A wide range means that performance depends

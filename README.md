@@ -166,12 +166,15 @@ a config's `robustness:` block in one pass. All five branch on
 `validation.method`: with `walk_forward`, each starts from the same
 walk-forward-stitched out-of-sample result rather than a single backtest, so
 the evidence never silently comes from a different validation method than
-the one configured. `stress-test` and `sensitivity` re-run the whole
-walk-forward selection process per scenario/candidate, since each one
-represents a different cost/methodology assumption or parameter to
-re-optimise under. `bootstrap` and `permutation-test` do not: they resample
-or permute the walk-forward's already-realised out-of-sample return series
-statistically, without re-running the selection process itself.
+the one configured. `sensitivity` re-runs the whole walk-forward selection process per candidate
+parameter pair. `stress-test`'s commission/slippage scenarios reuse the
+baseline's own cached per-fold candidate weights and only re-score them
+under the new costs (cheaper, since selection never depends on execution
+costs); its execution-delay and reduced-universe scenarios genuinely change
+the weights themselves, so each still re-runs selection end to end.
+`bootstrap` and `permutation-test` do neither: they resample or permute the
+walk-forward's already-realised out-of-sample return series statistically,
+without touching the selection process at all.
 
 `walk-forward`, `stress-test`, `sensitivity` and `robustness` show a live
 progress bar with an ETA in the terminal, and checkpoint their progress to
@@ -222,8 +225,10 @@ progress bar with an ETA while a run is in flight. Both modes' Robustness
 tab includes stress tests, block bootstrap, a Monte Carlo permutation test
 and a 2-parameter sensitivity heatmap,
 individually or via "Run all robustness tests" — in Walk-forward mode,
-stress tests and sensitivity re-run the whole selection process per
-scenario/cell rather than a single backtest.
+sensitivity re-runs the whole selection process per cell; stress tests do
+too for execution-delay/reduced-universe scenarios, but reuse the
+baseline's cached candidate weights (just re-scored under new costs) for
+commission/slippage scenarios.
 
 ![QuantLab dashboard results](reports/figures/dashboard_results.png)
 
@@ -281,13 +286,13 @@ produces the full 26-fold report the numbers below are drawn from.
 Real, non-cherry-picked results from real Yahoo Finance / Binance data (2008–2025
 for ETFs, 2018–2025 for BTC), net of modelled transaction costs:
 
-| Experiment | Universe | Period | CAGR | Sharpe | Max DD | Trades |
+| Experiment | Universe | Period | CAGR | Sharpe | Max DD | Fills |
 | --- | --- | --- | --- | --- | --- | --- |
-| Cross-sectional momentum (example above) | 8 multi-asset ETFs | 2008–2025 | 5.7% | 0.44 | −15.8% | 277 |
+| Cross-sectional momentum (example above) | 8 multi-asset ETFs | 2008–2025 | 5.5% | 0.43 | −15.8% | 1,514 |
 | ↳ walk-forward out-of-sample | same | 26 folds | 4.7% | 0.32 | −18.5% | — |
-| Mean reversion (z-score) | 5 equity ETFs | 2010–2025 | 4.4% | 0.25 | −34.6% | 1,180 |
+| Mean reversion (z-score) | 5 equity ETFs | 2010–2025 | 4.4% | 0.25 | −34.6% | 3,351 |
 | Pairs trading (EWA/EWC, vs SPY) | 2 country ETFs | 2010–2025 | 0.9% | −0.35 | −8.0% | 1,314 |
-| Trend following (BTC) | BTCUSDT | 2018–2025 | 30.3% | 0.93 | −43.9% | 1,560 |
+| Trend following (BTC) | BTCUSDT | 2018–2025 | 30.3% | 0.93 | −43.9% | 1,563 |
 
 Every number above — including the negative Sharpe on the pairs trade — is
 reported as computed; nothing here is filtered for looking good. **These are

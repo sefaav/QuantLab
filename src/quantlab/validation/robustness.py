@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -13,7 +14,7 @@ import pandas as pd
 from quantlab.backtesting.runner import run_backtest_from_config
 from quantlab.config import ExperimentConfig
 from quantlab.constants import SYMBOL, TIMESTAMP
-from quantlab.exceptions import QuantLabError
+from quantlab.exceptions import InvalidConfigurationError, QuantLabError
 from quantlab.logging_config import get_logger
 from quantlab.risk import metrics as M
 from quantlab.risk._validation import (
@@ -74,6 +75,24 @@ def _failed_row(name: str, error: QuantLabError) -> dict[str, object]:
         "status": "failed",
         "error": str(error),
     }
+
+
+def _ensure_unique_scenario_names(names: list[str]) -> None:
+    """Reject scenario names that collide once formatted for display.
+
+    Multipliers close enough together (e.g. 1.0000001 and 1.0000002) both
+    format to "x1" under ``:g`` -- distinct configured values must not
+    silently collapse onto the same row identity.
+    """
+    seen: set[str] = set()
+    for name in names:
+        if name in seen:
+            raise InvalidConfigurationError(
+                f"Two configured stress-test scenarios both format to the "
+                f"name {name!r} -- pick magnitudes that remain visibly "
+                "distinct once rounded for display."
+            )
+        seen.add(name)
 
 
 _STRESS_METRIC_COLUMNS = ("total_return", "cagr", "sharpe", "max_drawdown")
@@ -165,6 +184,74 @@ def _baseline_returns_is_valid(
         return False
 
 
+@dataclass(frozen=True)
+class _CostScenario:
+    """One commission- or slippage-multiplier stress scenario."""
+
+    name: str
+    kind: str  # "commission" | "slippage"
+    multiplier: float
+
+
+def _cost_scenarios(config: ExperimentConfig) -> list[_CostScenario]:
+    """Return every configured commission/slippage scenario, in fixed order.
+
+    Commission scenarios first (in the configured order), then slippage.
+    """
+    settings = config.robustness.stress_test
+    return [
+        _CostScenario(f"commission x{multiplier:g}", "commission", multiplier)
+        for multiplier in settings.commission_multipliers
+    ] + [
+        _CostScenario(f"slippage x{multiplier:g}", "slippage", multiplier)
+        for multiplier in settings.slippage_multipliers
+    ]
+
+
+def _cost_scenario_config(
+    config: ExperimentConfig, scenario: _CostScenario
+) -> ExperimentConfig:
+    """Return ``config`` with exactly one cost component scaled."""
+    if scenario.kind == "commission":
+        return scale_costs(config, commission_mult=scenario.multiplier)
+    return scale_costs(config, slippage_mult=scenario.multiplier)
+
+
+def _execution_delay_scenarios(config: ExperimentConfig) -> list[tuple[str, int]]:
+    """Return ``(name, delay)`` for every configured execution-delay scenario."""
+    return [
+        (f"execution delay +{delay}", delay)
+        for delay in config.robustness.stress_test.execution_delays
+    ]
+
+
+def _best_days_removed_scenarios(config: ExperimentConfig) -> list[tuple[str, int]]:
+    """Return ``(name, n)`` for every configured best-days-removed scenario."""
+    return [
+        (f"best {n} days removed", n)
+        for n in config.robustness.stress_test.best_days_removed
+    ]
+
+
+def _reduced_universe_scenarios(config: ExperimentConfig) -> list[tuple[str, int]]:
+    """Return ``(name, count)`` for every configured reduced-universe scenario.
+
+    Every configured ``count`` gets a row: one whose universe is too small
+    to leave at least 2 tradable symbols is recorded with status="failed"
+    at run time (see ``_universe_reduction_is_feasible``), never silently
+    omitted from the table.
+    """
+    return [
+        (f"reduced universe (-{count})", count)
+        for count in config.robustness.stress_test.reduce_universe_by
+    ]
+
+
+def _universe_reduction_is_feasible(config: ExperimentConfig, count: int) -> bool:
+    """Return whether dropping ``count`` symbols leaves >=2 tradable ones."""
+    return len(config.symbols) > count + 1
+
+
 def run_stress_tests(
     data: pd.DataFrame,
     config: ExperimentConfig,
@@ -174,14 +261,22 @@ def run_stress_tests(
 ) -> pd.DataFrame:
     """Re-run the experiment under cost, delay and universe perturbations.
 
+    Every scenario's magnitude comes from ``config.robustness.stress_test``
+    (commission/slippage multipliers, execution delays, days-removed
+    counts, universe-reduction counts) -- each a list, so more than one
+    magnitude can be evaluated per scenario type; an empty list disables
+    that scenario type entirely. See :class:`~quantlab.config.
+    StressTestSettings`.
+
     Args:
         data: Canonical long OHLCV frame.
         config: Experiment configuration.
         on_progress: Optional callback invoked as ``on_progress(done, total)``
-            once before the first scenario and once after each of the
-            (baseline plus) up to 6 scenarios below completes — each is a
-            single backtest, so this is coarser than a fold-level signal but
-            still enough to show a stalled run is actually progressing.
+            once before the first scenario and once after each scenario
+            (baseline plus every configured cost/delay/best-days/universe
+            scenario) completes — each is a single backtest, so this is
+            coarser than a fold-level signal but still enough to show a
+            stalled run is actually progressing.
         checkpoint_path: Optional path to persist per-scenario progress to,
             so an interrupted run resumes from its last completed scenario
             instead of starting over. See ``quantlab.validation.checkpoint``.
@@ -195,11 +290,20 @@ def run_stress_tests(
     periods_per_year = positive_int(config.periods_per_year, name="periods_per_year")
     risk_free_rate = finite_real(config.risk_free_rate, name="risk_free_rate")
 
-    reduced_universe = len(config.symbols) > 2
-    total_scenarios = 1 + 3 + 2 + (1 if reduced_universe else 0)
+    cost_scenarios = _cost_scenarios(config)
+    delay_scenarios = _execution_delay_scenarios(config)
+    best_days_scenarios = _best_days_removed_scenarios(config)
+    universe_scenarios = _reduced_universe_scenarios(config)
+    total_scenarios = (
+        1
+        + len(cost_scenarios)
+        + len(delay_scenarios)
+        + len(best_days_scenarios)
+        + len(universe_scenarios)
+    )
 
     rows: list[dict[str, object]] = []
-    # "best 10 days removed" needs the actual baseline returns Series later,
+    # "best N days removed" needs the actual baseline returns Series later,
     # not just its already-computed metrics row, so it has to be part of the
     # checkpointed state too, or resuming past "baseline" would lose it.
     baseline_returns: pd.Series | None = None
@@ -207,19 +311,17 @@ def run_stress_tests(
     completed_scenarios = 0
 
     # The exact scenario name each row must have, in order -- fixed by this
-    # function's own scenario sequence below, independent of `progress`
-    # (which only ever names a prefix of it: a config with two symbols or
-    # fewer never reaches "reduced universe", and neither does an in-progress
-    # resume).
-    _scenario_names_in_order = [
-        "baseline",
-        "commission x2",
-        "commission x5",
-        "slippage x2",
-        "execution delay +1",
-        "best 10 days removed",
-        "reduced universe",
-    ]
+    # function's own scenario sequence below (built from the same
+    # configured lists, so it can never drift from what actually runs),
+    # independent of `progress` (which only ever names a prefix of it).
+    _scenario_names_in_order = (
+        ["baseline"]
+        + [scenario.name for scenario in cost_scenarios]
+        + [name for name, _ in delay_scenarios]
+        + [name for name, _ in best_days_scenarios]
+        + [name for name, _ in universe_scenarios]
+    )
+    _ensure_unique_scenario_names(_scenario_names_in_order)
 
     def _validate_stress_state(state: Any, progress: int) -> bool:
         # One row per scenario, in lockstep with `progress` -- so an exact
@@ -290,85 +392,114 @@ def run_stress_tests(
         if on_progress is not None:
             on_progress(completed_scenarios, total_scenarios)
 
-    scenarios = {
-        "commission x2": scale_costs(config, commission_mult=2.0),
-        "commission x5": scale_costs(config, commission_mult=5.0),
-        "slippage x2": scale_costs(config, slippage_mult=2.0),
-    }
-    for position, (name, scenario_config) in enumerate(scenarios.items(), start=2):
+    position = 2
+    for scenario in cost_scenarios:
         if completed_scenarios < position:
-            result = run_backtest_from_config(data, scenario_config)
-            rows.append(
-                _metrics_row(name, result.returns, periods_per_year, risk_free_rate)
-            )
+            try:
+                scenario_config = _cost_scenario_config(config, scenario)
+                result = run_backtest_from_config(data, scenario_config)
+            except QuantLabError as exc:
+                logger.warning("%s scenario failed: %s", scenario.name, exc)
+                rows.append(_failed_row(scenario.name, exc))
+            else:
+                rows.append(
+                    _metrics_row(
+                        scenario.name, result.returns, periods_per_year, risk_free_rate
+                    )
+                )
             completed_scenarios += 1
             _checkpoint()
             if on_progress is not None:
                 on_progress(completed_scenarios, total_scenarios)
+        position += 1
 
-    if completed_scenarios < 5:
-        delayed = run_backtest_from_config(data, config, execution_delay=1)
-        rows.append(
-            _metrics_row(
-                "execution delay +1",
-                delayed.returns,
-                periods_per_year,
-                risk_free_rate,
-            )
-        )
-        completed_scenarios += 1
-        _checkpoint()
-        if on_progress is not None:
-            on_progress(completed_scenarios, total_scenarios)
-
-    if completed_scenarios < 6:
-        assert baseline_returns is not None
-        rows.append(
-            _metrics_row(
-                "best 10 days removed",
-                remove_best_days(baseline_returns, 10),
-                periods_per_year,
-                risk_free_rate,
-            )
-        )
-        completed_scenarios += 1
-        _checkpoint()
-        if on_progress is not None:
-            on_progress(completed_scenarios, total_scenarios)
-
-    if reduced_universe and completed_scenarios < 7:
-        reduced_symbols = config.symbols[:-1]
-        reduced_instruments = [
-            instrument
-            for instrument in config.data.instruments
-            if instrument.symbol in reduced_symbols
-        ]
-        data_config = config.data.revalidated_copy(
-            update={"instruments": reduced_instruments}
-        )
-        reduced_config = config.revalidated_copy(update={"data": data_config})
-        required_symbols = set(reduced_symbols)
-        if config.benchmark_symbol is not None:
-            required_symbols.add(config.benchmark_symbol)
-        subset = data[data[SYMBOL].isin(required_symbols)].reset_index(drop=True)
-        try:
-            result = run_backtest_from_config(subset, reduced_config)
-        except QuantLabError as exc:
-            logger.warning("Reduced-universe scenario failed: %s", exc)
-            rows.append(_failed_row("reduced universe", exc))
-        else:
-            rows.append(
-                _metrics_row(
-                    "reduced universe",
-                    result.returns,
-                    periods_per_year,
-                    risk_free_rate,
+    for name, delay in delay_scenarios:
+        if completed_scenarios < position:
+            try:
+                delayed = run_backtest_from_config(data, config, execution_delay=delay)
+            except QuantLabError as exc:
+                logger.warning("%s scenario failed: %s", name, exc)
+                rows.append(_failed_row(name, exc))
+            else:
+                rows.append(
+                    _metrics_row(
+                        name, delayed.returns, periods_per_year, risk_free_rate
+                    )
                 )
-            )
-        completed_scenarios += 1
-        _checkpoint()
-        if on_progress is not None:
-            on_progress(completed_scenarios, total_scenarios)
+            completed_scenarios += 1
+            _checkpoint()
+            if on_progress is not None:
+                on_progress(completed_scenarios, total_scenarios)
+        position += 1
+
+    for name, n in best_days_scenarios:
+        if completed_scenarios < position:
+            # completed_scenarios >= 1 guarantees baseline_returns is set.
+            assert baseline_returns is not None
+            try:
+                scenario_returns = remove_best_days(baseline_returns, n)
+            except QuantLabError as exc:
+                logger.warning("%s scenario failed: %s", name, exc)
+                rows.append(_failed_row(name, exc))
+            else:
+                rows.append(
+                    _metrics_row(
+                        name, scenario_returns, periods_per_year, risk_free_rate
+                    )
+                )
+            completed_scenarios += 1
+            _checkpoint()
+            if on_progress is not None:
+                on_progress(completed_scenarios, total_scenarios)
+        position += 1
+
+    for name, count in universe_scenarios:
+        if completed_scenarios < position:
+            if not _universe_reduction_is_feasible(config, count):
+                rows.append(
+                    _failed_row(
+                        name,
+                        QuantLabError(
+                            f"Universe has only {len(config.symbols)} symbols; "
+                            f"removing {count} would leave fewer than 2 tradable."
+                        ),
+                    )
+                )
+            else:
+                try:
+                    reduced_symbols = config.symbols[:-count]
+                    reduced_instruments = [
+                        instrument
+                        for instrument in config.data.instruments
+                        if instrument.symbol in reduced_symbols
+                    ]
+                    data_config = config.data.revalidated_copy(
+                        update={"instruments": reduced_instruments}
+                    )
+                    reduced_config = config.revalidated_copy(
+                        update={"data": data_config}
+                    )
+                    required_symbols = set(reduced_symbols)
+                    if config.benchmark_symbol is not None:
+                        required_symbols.add(config.benchmark_symbol)
+                    subset = data[data[SYMBOL].isin(required_symbols)].reset_index(
+                        drop=True
+                    )
+                    result = run_backtest_from_config(subset, reduced_config)
+                except QuantLabError as exc:
+                    logger.warning("%s scenario failed: %s", name, exc)
+                    rows.append(_failed_row(name, exc))
+                else:
+                    rows.append(
+                        _metrics_row(
+                            name, result.returns, periods_per_year, risk_free_rate
+                        )
+                    )
+            completed_scenarios += 1
+            _checkpoint()
+            if on_progress is not None:
+                on_progress(completed_scenarios, total_scenarios)
+        position += 1
 
     if checkpoint_path is not None:
         clear_checkpoint(checkpoint_path)
@@ -403,27 +534,32 @@ def run_walk_forward_stress_tests(
 ) -> pd.DataFrame:
     """Re-run the whole walk-forward process under cost/delay/universe stress.
 
-    Unlike :func:`run_stress_tests`, every scenario except "best 10 days
+    Every scenario's magnitude comes from ``config.robustness.stress_test``
+    (see :func:`run_stress_tests` and :class:`~quantlab.config.
+    StressTestSettings`) -- each a list, so more than one magnitude can be
+    evaluated per scenario type; an empty list disables that scenario type
+    entirely.
+
+    Unlike :func:`run_stress_tests`, every scenario except "best N days
     removed" re-evaluates parameter selection under the scenario's
     perturbation instead of a single plain backtest — so a Walk-forward
     mode's Robustness numbers never silently come from a different
     validation method than the one currently in effect.
 
-    The three cost-only scenarios ("commission x2", "commission x5",
-    "slippage x2") never change signals or portfolio allocation — only the
-    accounting step depends on execution costs — so they share a single
-    :class:`~quantlab.validation.walk_forward.WalkForwardWeightCache` built
-    once from the baseline config, cheaply re-scoring each fold's cached
-    candidates under the new costs via
+    Every commission/slippage scenario never changes signals or portfolio
+    allocation — only the accounting step depends on execution costs — so
+    they all share a single :class:`~quantlab.validation.walk_forward.
+    WalkForwardWeightCache` built once from the baseline config, cheaply
+    re-scoring each fold's cached candidates under the new costs via
     :meth:`~quantlab.validation.walk_forward.WalkForwardValidator.
     rescore_with_costs` instead of re-running signal generation and
-    allocation three more times. "Execution delay +1" and "reduced
-    universe" genuinely change the weights themselves (the delay shift and
-    the tradable universe respectively), so they still re-execute
+    allocation once per scenario. Every execution-delay and reduced-universe
+    scenario genuinely changes the weights themselves (the delay shift and
+    the tradable universe respectively), so each still re-executes
     :class:`~quantlab.validation.walk_forward.WalkForwardValidator` end to
-    end. "Best 10 days removed" stays a post-hoc transform of the
-    already-realised baseline OOS returns: it changes no configuration, so
-    re-running walk-forward would only waste time reproducing the exact
+    end. Every "best N days removed" scenario stays a post-hoc transform of
+    the already-realised baseline OOS returns: it changes no configuration,
+    so re-running walk-forward would only waste time reproducing the exact
     same selection.
 
     Args:
@@ -431,20 +567,20 @@ def run_walk_forward_stress_tests(
         config: The baseline experiment config (``validation.method`` must
             be ``"walk_forward"``).
         wf_baseline: The already-computed baseline ``WalkForwardResult``,
-            reused for "baseline" and "best 10 days removed".
+            reused for "baseline" and every "best N days removed" scenario.
         on_progress: Optional callback invoked as ``on_progress(done, total)``
             once before any work starts and once after each unit of work
             completes: one tick per candidate (folds x grid size) while the
-            weight cache used by the three cost-only scenarios is
+            weight cache used by the commission/slippage scenarios is
             (re)built — the bulk of the total cost — then one tick per
-            remaining scenario ("execution delay +1" and "reduced universe"
-            are each a full walk-forward run; the three cost-only rescores
-            and "best 10 days removed" are
-            cheap).
+            remaining scenario (each execution-delay/reduced-universe
+            scenario is a full walk-forward run; the commission/slippage
+            rescores and best-N-days-removed scenarios are cheap).
         checkpoint_path: Optional path to persist progress to, so an
             interrupted run resumes instead of starting over — at the
-            scenario-block level (baseline / [cache-build + the 3 cost-only
-            rescores] / execution-delay+1 / best-10-days / reduced-universe)
+            scenario-block level (baseline / [cache-build + every
+            commission/slippage rescore] / every execution-delay scenario /
+            every best-N-days scenario / every reduced-universe scenario)
             for this function's own progress, plus a separate, nested
             checkpoint for the cache-build block specifically (passed
             through to :meth:`~quantlab.validation.walk_forward.
@@ -500,7 +636,9 @@ def run_walk_forward_stress_tests(
         )
     periods_per_year = positive_int(config.periods_per_year, name="periods_per_year")
     risk_free_rate = finite_real(config.risk_free_rate, name="risk_free_rate")
-    train_window, validation_window, test_window = resolve_walk_forward_windows(config)
+    train_window, validation_window, test_window, step = resolve_walk_forward_windows(
+        config
+    )
     expanding = config.validation.expanding
     grid = parameter_grid_for_config(config)
 
@@ -520,6 +658,7 @@ def run_walk_forward_stress_tests(
         "train_window": train_window,
         "validation_window": validation_window,
         "test_window": test_window,
+        "step": step,
         "expanding": expanding,
     }
     if baseline_windows != expected_windows:
@@ -536,18 +675,24 @@ def run_walk_forward_stress_tests(
             f"its own recorded walk_forward_parameter_grid {baseline_grid!r} "
             f"does not match {grid!r} derived from `config`."
         )
-    # The "execution delay +1" scenario below is only meaningful relative to
-    # a zero-delay baseline; a baseline already run with a non-zero delay
-    # would need "+1" to mean "one more than the baseline's own", not a
-    # hardcoded absolute 1.
-    baseline_delay = wf_baseline.oos_result.metadata.get("walk_forward_execution_delay")
-    if baseline_delay != 0:
-        raise ValueError(
-            "wf_baseline was not built with execution_delay=0: its own "
-            f"recorded walk_forward_execution_delay is {baseline_delay!r}, "
-            "so this call's 'execution delay +1' scenario cannot be "
-            "compared against it."
+    # Every configured execution-delay scenario below is a delay relative to
+    # the baseline's own delay; a baseline already run with a non-zero delay
+    # would make "delay +N" mean "N more than the baseline's own", not a
+    # delay of exactly N. Only checked when a delay scenario is actually
+    # configured -- an unrelated non-zero baseline delay is not this
+    # function's problem when no delay scenario will ever use it.
+    delay_scenarios = _execution_delay_scenarios(config)
+    if delay_scenarios:
+        baseline_delay = wf_baseline.oos_result.metadata.get(
+            "walk_forward_execution_delay"
         )
+        if baseline_delay != 0:
+            raise ValueError(
+                "wf_baseline was not built with execution_delay=0: its own "
+                f"recorded walk_forward_execution_delay is {baseline_delay!r}, "
+                "so this call's configured execution-delay scenarios cannot "
+                "be compared against it."
+            )
 
     def _run_walk_forward(
         scenario_config: ExperimentConfig,
@@ -563,20 +708,25 @@ def run_walk_forward_stress_tests(
             validation_window=validation_window,
             test_window=test_window,
             expanding=expanding,
+            step=step,
             execution_delay=execution_delay,
         )
 
-    cost_scenarios = {
-        "commission x2": scale_costs(config, commission_mult=2.0),
-        "commission x5": scale_costs(config, commission_mult=5.0),
-        "slippage x2": scale_costs(config, slippage_mult=2.0),
-    }
-    reduced_universe = len(config.symbols) > 2
+    cost_scenarios = _cost_scenarios(config)
+    best_days_scenarios = _best_days_removed_scenarios(config)
+    universe_scenarios = _reduced_universe_scenarios(config)
     n_baseline_folds = len(wf_baseline.folds)
     n_combinations = math.prod(len(values) for values in grid.values()) if grid else 1
-    n_cache_units = n_baseline_folds * n_combinations
+    # No cost scenario means the weight cache below is never consulted --
+    # skip counting (and later, building) it entirely rather than paying for
+    # the second-most-expensive step of this whole function for nothing.
+    n_cache_units = (n_baseline_folds * n_combinations) if cost_scenarios else 0
     total_units = (
-        n_cache_units + len(cost_scenarios) + 2 + (1 if reduced_universe else 0)
+        n_cache_units
+        + len(cost_scenarios)
+        + len(delay_scenarios)
+        + len(best_days_scenarios)
+        + len(universe_scenarios)
     )
 
     def _cache_progress(done: int, _total: int) -> None:
@@ -584,48 +734,49 @@ def run_walk_forward_stress_tests(
             on_progress(done, total_units)
 
     # Scenario-block-level checkpoint (own file): baseline / [cache-build +
-    # the 3 cost-only rescores, as one block] / execution-delay+1 /
-    # best-10-days / reduced-universe. `rows` is the only state that needs
-    # to survive between blocks — every block computes from `config`/`data`/
-    # `wf_baseline`, already covered by `provenance`, not from a prior
-    # block's output.
+    # every commission/slippage rescore, as one block] / every
+    # execution-delay scenario / every best-N-days scenario / every
+    # reduced-universe scenario -- always exactly 5 blocks, even when a
+    # scenario type's own list is empty (that block then simply appends no
+    # rows). `rows` is the only state that needs to survive between blocks
+    # — every block computes from `config`/`data`/`wf_baseline`, already
+    # covered by `provenance`, not from a prior block's output.
     rows: list[dict[str, object]] = []
     provenance: dict[str, Any] | None = None
     cache_checkpoint_path: Path | None = None
     completed_blocks = 0
-    total_blocks = 4 + (1 if reduced_universe else 0)
+    total_blocks = 5
+    _block_row_counts = [
+        1,
+        len(cost_scenarios),
+        len(delay_scenarios),
+        len(best_days_scenarios),
+        len(universe_scenarios),
+    ]
 
     def _expected_block_row_count(progress: int) -> int:
-        """Return exactly how many rows each block count has appended.
+        """Return exactly how many rows the first ``progress`` blocks append.
 
-        Block 1 ("baseline") appends 1 row; block 2 appends one row per
-        cost-only scenario (``len(cost_scenarios)`` = 3: commission x2,
-        commission x5, slippage x2); blocks 3-5 ("execution delay +1",
-        "best 10 days removed", "reduced universe") each append exactly 1.
-        Not a simple linear formula in ``progress`` alone, but still fully
+        Not a simple linear formula in ``progress`` alone (each block can
+        append a different, configured number of rows), but still fully
         determined by it -- there is no ambiguity to fall back to a mere
         upper bound for.
         """
-        if progress <= 0:
-            return 0
-        if progress == 1:
-            return 1
-        if progress == 2:
-            return 1 + len(cost_scenarios)
-        return 1 + len(cost_scenarios) + (progress - 2)
+        return sum(_block_row_counts[:progress])
 
     # The exact scenario name each row must have, in order -- not just how
     # many rows there should be. Fixed by the block structure above:
-    # baseline, then the 3 cost-only rescores (in `cost_scenarios`' own
-    # order), then execution delay, best-10-days, and (if applicable)
-    # reduced universe.
-    _scenario_names_in_order = [
-        "baseline",
-        *cost_scenarios.keys(),
-        "execution delay +1",
-        "best 10 days removed",
-        "reduced universe",
-    ]
+    # baseline, then every commission/slippage rescore (in `cost_scenarios`'
+    # own order), then every execution-delay, best-N-days and
+    # reduced-universe scenario.
+    _scenario_names_in_order = (
+        ["baseline"]
+        + [scenario.name for scenario in cost_scenarios]
+        + [name for name, _ in delay_scenarios]
+        + [name for name, _ in best_days_scenarios]
+        + [name for name, _ in universe_scenarios]
+    )
+    _ensure_unique_scenario_names(_scenario_names_in_order)
 
     def _validate_block_state(state: Any, progress: int) -> bool:
         # A structurally-plausible-but-incoherent checkpoint (e.g.
@@ -680,7 +831,12 @@ def run_walk_forward_stress_tests(
     completed_units = 0
     if completed_blocks >= 2:
         completed_units += n_cache_units + len(cost_scenarios)
-    completed_units += max(0, completed_blocks - 2)
+    if completed_blocks >= 3:
+        completed_units += len(delay_scenarios)
+    if completed_blocks >= 4:
+        completed_units += len(best_days_scenarios)
+    if completed_blocks >= 5:
+        completed_units += len(universe_scenarios)
     if on_progress is not None and completed_blocks >= 2:
         # Otherwise block 2 is about to run (fresh or resumed) and
         # run_with_weight_cache() below already emits its own accurate
@@ -707,43 +863,60 @@ def run_walk_forward_stress_tests(
         _checkpoint_block()
 
     if completed_blocks < 2:
-        # Signals and portfolio allocation never depend on execution costs,
-        # so build the per-candidate weight cache once (this is where the
-        # candidate-level progress reported above comes from — finer-grained
-        # than one tick per fold, since this build does roughly twice the
-        # work of a plain walk-forward fold) and reuse it for every
-        # cost-only scenario below instead of paying for a full re-run each.
-        # This block gets its own nested checkpoint (see the docstring):
-        # it's the expensive one, and the whole point of the weight-cache
-        # optimisation is not having to redo it.
-        validator = WalkForwardValidator(config)
-        _, weight_cache = validator.run_with_weight_cache(
-            data,
-            parameter_grid=grid,
-            train_window=train_window,
-            validation_window=validation_window,
-            test_window=test_window,
-            expanding=expanding,
-            execution_delay=0,
-            on_progress=_cache_progress,
-            checkpoint_path=cache_checkpoint_path,
-        )
-        # No separate on_progress call needed here: run_with_weight_cache's
-        # own ticks (via _cache_progress) already reached completed_units ==
-        # n_cache_units by the time it returns.
-        completed_units = n_cache_units
-
-        for name, scenario_config in cost_scenarios.items():
-            wf = validator.rescore_with_costs(weight_cache, scenario_config)
-            assert wf.oos_result is not None  # same data/windows as the baseline
-            rows.append(
-                _metrics_row(
-                    name, wf.oos_result.returns, periods_per_year, risk_free_rate
-                )
+        if cost_scenarios:
+            # Signals and portfolio allocation never depend on execution
+            # costs, so build the per-candidate weight cache once (this is
+            # where the candidate-level progress reported above comes from —
+            # finer-grained than one tick per fold, since this build does
+            # roughly twice the work of a plain walk-forward fold) and reuse
+            # it for every cost-only scenario below instead of paying for a
+            # full re-run each. This block gets its own nested checkpoint
+            # (see the docstring): it's the expensive one, and the whole
+            # point of the weight-cache optimisation is not having to redo
+            # it. Skipped entirely when there is no cost scenario to use it
+            # for -- building it would waste this function's second-most
+            # expensive step on nothing.
+            validator = WalkForwardValidator(config)
+            _, weight_cache = validator.run_with_weight_cache(
+                data,
+                parameter_grid=grid,
+                train_window=train_window,
+                validation_window=validation_window,
+                test_window=test_window,
+                expanding=expanding,
+                step=step,
+                execution_delay=0,
+                on_progress=_cache_progress,
+                checkpoint_path=cache_checkpoint_path,
             )
-            completed_units += 1
-            if on_progress is not None:
-                on_progress(completed_units, total_units)
+            # No separate on_progress call needed here: run_with_weight_
+            # cache's own ticks (via _cache_progress) already reached
+            # completed_units == n_cache_units by the time it returns.
+            completed_units = n_cache_units
+
+            for scenario in cost_scenarios:
+                scenario_config = _cost_scenario_config(config, scenario)
+                wf = validator.rescore_with_costs(weight_cache, scenario_config)
+                if wf.oos_result is None:
+                    # Rescoring reuses the baseline's own already-fitted
+                    # folds/windows, so this should be unreachable -- a hard
+                    # invariant violation, not an expected external failure
+                    # to report as a "failed" row.
+                    raise QuantLabError(
+                        f"{scenario.name}: rescore_with_costs produced no OOS "
+                        "result despite reusing the baseline's own windows."
+                    )
+                rows.append(
+                    _metrics_row(
+                        scenario.name,
+                        wf.oos_result.returns,
+                        periods_per_year,
+                        risk_free_rate,
+                    )
+                )
+                completed_units += 1
+                if on_progress is not None:
+                    on_progress(completed_units, total_units)
         completed_blocks += 1
         if cache_checkpoint_path is not None:
             clear_checkpoint(cache_checkpoint_path)
@@ -752,76 +925,106 @@ def run_walk_forward_stress_tests(
     # seeded correctly above, nothing left to recompute for this block.
 
     if completed_blocks < 3:
-        delayed = _run_walk_forward(config, data, grid, execution_delay=1)
-        assert delayed.oos_result is not None
-        rows.append(
-            _metrics_row(
-                "execution delay +1",
-                delayed.oos_result.returns,
-                periods_per_year,
-                risk_free_rate,
-            )
-        )
-        completed_units += 1
+        for name, delay in delay_scenarios:
+            try:
+                delayed = _run_walk_forward(config, data, grid, execution_delay=delay)
+                if delayed.oos_result is None:
+                    raise QuantLabError(
+                        f"{name}: no walk-forward fold fit under this delay."
+                    )
+            except QuantLabError as exc:
+                logger.warning("%s scenario failed: %s", name, exc)
+                rows.append(_failed_row(name, exc))
+            else:
+                rows.append(
+                    _metrics_row(
+                        name,
+                        delayed.oos_result.returns,
+                        periods_per_year,
+                        risk_free_rate,
+                    )
+                )
+            completed_units += 1
+            if on_progress is not None:
+                on_progress(completed_units, total_units)
         completed_blocks += 1
         _checkpoint_block()
-        if on_progress is not None:
-            on_progress(completed_units, total_units)
 
     if completed_blocks < 4:
-        rows.append(
-            _metrics_row(
-                "best 10 days removed",
-                remove_best_days(wf_baseline.oos_result.returns, 10),
-                periods_per_year,
-                risk_free_rate,
-            )
-        )
-        completed_units += 1
+        for name, n in best_days_scenarios:
+            try:
+                scenario_returns = remove_best_days(wf_baseline.oos_result.returns, n)
+            except QuantLabError as exc:
+                logger.warning("%s scenario failed: %s", name, exc)
+                rows.append(_failed_row(name, exc))
+            else:
+                rows.append(
+                    _metrics_row(
+                        name, scenario_returns, periods_per_year, risk_free_rate
+                    )
+                )
+            completed_units += 1
+            if on_progress is not None:
+                on_progress(completed_units, total_units)
         completed_blocks += 1
         _checkpoint_block()
-        if on_progress is not None:
-            on_progress(completed_units, total_units)
 
-    if reduced_universe and completed_blocks < 5:
-        reduced_symbols = config.symbols[:-1]
-        reduced_instruments = [
-            instrument
-            for instrument in config.data.instruments
-            if instrument.symbol in reduced_symbols
-        ]
-        data_config = config.data.revalidated_copy(
-            update={"instruments": reduced_instruments}
-        )
-        reduced_config = config.revalidated_copy(update={"data": data_config})
-        required_symbols = set(reduced_symbols)
-        if config.benchmark_symbol is not None:
-            required_symbols.add(config.benchmark_symbol)
-        subset = data[data[SYMBOL].isin(required_symbols)].reset_index(drop=True)
-        try:
-            reduced_grid = parameter_grid_for_config(reduced_config)
-            wf_reduced = _run_walk_forward(reduced_config, subset, reduced_grid)
-            if wf_reduced.oos_result is None:
-                raise QuantLabError(
-                    "No walk-forward fold fit the reduced universe's history."
+    if completed_blocks < 5:
+        for name, count in universe_scenarios:
+            if not _universe_reduction_is_feasible(config, count):
+                rows.append(
+                    _failed_row(
+                        name,
+                        QuantLabError(
+                            f"Universe has only {len(config.symbols)} symbols; "
+                            f"removing {count} would leave fewer than 2 tradable."
+                        ),
+                    )
                 )
-        except QuantLabError as exc:
-            logger.warning("Reduced-universe walk-forward scenario failed: %s", exc)
-            rows.append(_failed_row("reduced universe", exc))
-        else:
-            rows.append(
-                _metrics_row(
-                    "reduced universe",
-                    wf_reduced.oos_result.returns,
-                    periods_per_year,
-                    risk_free_rate,
+                completed_units += 1
+                if on_progress is not None:
+                    on_progress(completed_units, total_units)
+                continue
+            reduced_symbols = config.symbols[:-count]
+            reduced_instruments = [
+                instrument
+                for instrument in config.data.instruments
+                if instrument.symbol in reduced_symbols
+            ]
+            try:
+                data_config = config.data.revalidated_copy(
+                    update={"instruments": reduced_instruments}
                 )
-            )
-        completed_units += 1
+                reduced_config = config.revalidated_copy(update={"data": data_config})
+                required_symbols = set(reduced_symbols)
+                if config.benchmark_symbol is not None:
+                    required_symbols.add(config.benchmark_symbol)
+                subset = data[data[SYMBOL].isin(required_symbols)].reset_index(
+                    drop=True
+                )
+                reduced_grid = parameter_grid_for_config(reduced_config)
+                wf_reduced = _run_walk_forward(reduced_config, subset, reduced_grid)
+                if wf_reduced.oos_result is None:
+                    raise QuantLabError(
+                        "No walk-forward fold fit the reduced universe's history."
+                    )
+            except QuantLabError as exc:
+                logger.warning("Reduced-universe walk-forward scenario failed: %s", exc)
+                rows.append(_failed_row(name, exc))
+            else:
+                rows.append(
+                    _metrics_row(
+                        name,
+                        wf_reduced.oos_result.returns,
+                        periods_per_year,
+                        risk_free_rate,
+                    )
+                )
+            completed_units += 1
+            if on_progress is not None:
+                on_progress(completed_units, total_units)
         completed_blocks += 1
         _checkpoint_block()
-        if on_progress is not None:
-            on_progress(completed_units, total_units)
 
     if checkpoint_path is not None:
         clear_checkpoint(checkpoint_path)

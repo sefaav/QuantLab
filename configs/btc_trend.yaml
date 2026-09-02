@@ -2,6 +2,15 @@
 # Crypto uses 365 periods/year and higher costs than ETFs.
 experiment_name: btc_trend_following
 
+research_question: >-
+  Does a simple moving-average trend-following rule on Bitcoin capture a
+  persistent risk-adjusted edge once volatility targeting and elevated
+  crypto transaction costs are accounted for?
+hypothesis: >-
+  H1: net of modelled transaction costs, long-only trend following on BTC
+  has a genuine positive risk-adjusted edge. H0: any apparent edge is
+  indistinguishable from noise or is eliminated by trading costs.
+
 data:
   instruments:
     - symbol: BTCUSDT
@@ -18,6 +27,9 @@ strategy:
     fast_window: 20
     slow_window: 100
     long_only: true
+  # Price series the strategy's own generate_signals() reads. Execution/
+  # costs always use the raw close regardless of this setting.
+  signal_price_type: adjusted_close
 
 portfolio:
   allocator: volatility_targeting
@@ -57,8 +69,19 @@ reproducibility:
 robustness:
   stress_test:
     enabled: true
+    # Each list is a set of magnitudes evaluated independently (one
+    # scenario row per value); an empty list disables that scenario type
+    # entirely. Crypto's higher baseline costs (see execution: above) make
+    # a larger commission stress meaningful here too.
+    commission_multipliers: [2.0, 5.0]
+    slippage_multipliers: [2.0]
+    execution_delays: [1]
+    best_days_removed: [10]
   bootstrap:
     enabled: true
+    # Width of the reported p_lower/p_upper percentile band (0.90 -> the
+    # 5th/95th percentiles).
+    confidence_level: 0.90
   permutation_test:
     enabled: true
   sensitivity:
@@ -66,3 +89,10 @@ robustness:
     parameters:
       fast_window: [10, 20, 40]
       slow_window: [50, 100, 200]
+
+# Where and what a run saves. Omit entirely for the default: reports/
+# generated/<experiment_name>/, both artefact toggles enabled.
+output:
+  # directory: reports/generated/btc_trend_following
+  save_html_report: true
+  save_figures: true

@@ -131,7 +131,16 @@ class SignalProportionalAllocator(PortfolioAllocator):
 
 @register_allocator("inverse_volatility")
 class InverseVolatilityAllocator(PortfolioAllocator):
-    """Allocate inversely to trailing annualised volatility."""
+    """Allocate inversely to trailing annualised volatility.
+
+    Computed on the combined, closure-padded timeline (via ``self.
+    _returns``/``price_matrix``), NOT each symbol's own native calendar --
+    unlike every built-in strategy's own signal generation (see
+    ``quantlab.features.native_calendar.compute_native_then_align``), a
+    mixed-calendar universe's realized-volatility estimate here can still
+    be diluted by an always-open instrument's extra sessions. Disclosed in
+    docs/limitations.md rather than silently assumed away.
+    """
 
     def __init__(
         self,
@@ -175,7 +184,11 @@ class InverseVolatilityAllocator(PortfolioAllocator):
 
 @register_allocator("volatility_targeting")
 class VolatilityTargetingAllocator(PortfolioAllocator):
-    """Scale inverse-volatility weights toward an annual volatility target."""
+    """Scale inverse-volatility weights toward an annual volatility target.
+
+    Same combined-timeline (not native-calendar) volatility estimate as
+    `InverseVolatilityAllocator` -- see that class's own docstring.
+    """
 
     def __init__(
         self,

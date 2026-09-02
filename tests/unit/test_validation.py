@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 from pathlib import Path
-from typing import Any, TypedDict
+from typing import Any, TypedDict, cast
 
 import numpy as np
 import pandas as pd
@@ -115,8 +115,8 @@ def _cost_sensitive_config(commission_bps: float = 50.0) -> ExperimentConfig:
                 "name": "mean_reversion",
                 "parameters": {
                     "lookback_period": 10,
-                    "entry_zscore": 1.0,
-                    "exit_zscore": 0.1,
+                    "entry_threshold": 1.0,
+                    "exit_threshold": 0.1,
                 },
             },
             "portfolio": {"allocator": "equal_weight", "rebalance_frequency": "daily"},
@@ -135,7 +135,7 @@ def _cost_sensitive_config(commission_bps: float = 50.0) -> ExperimentConfig:
                 # Pinned explicitly: run_walk_forward_stress_tests() resolves
                 # its grid from this config (parameter_grid_for_config), not
                 # from an argument, so it must match the grid used below.
-                "parameter_grid": {"entry_zscore": [0.5, 3.0]},
+                "parameter_grid": {"entry_threshold": [0.5, 3.0]},
             },
         }
     )
@@ -368,6 +368,7 @@ def test_walk_forward_run_refuses_a_checkpoint_whose_window_does_not_match(
         train_window=300,
         validation_window=120,
         test_window=120,
+        step=120,
         expanding=True,
         execution_delay=0,
         parameter_grid={"lookback_period": [60, 120]},
@@ -455,6 +456,7 @@ def test_walk_forward_run_refuses_a_checkpoint_with_a_garbage_target_frame(
         train_window=300,
         validation_window=120,
         test_window=120,
+        step=120,
         expanding=True,
         execution_delay=0,
         parameter_grid={"lookback_period": [60, 120]},
@@ -539,6 +541,7 @@ def test_walk_forward_run_refuses_a_checkpoint_with_an_incomplete_target_frame(
         train_window=300,
         validation_window=120,
         test_window=120,
+        step=120,
         expanding=True,
         execution_delay=0,
         parameter_grid={"lookback_period": [60, 120]},
@@ -621,6 +624,7 @@ def test_walk_forward_run_refuses_a_checkpoint_with_a_non_grid_parameter(
         train_window=300,
         validation_window=120,
         test_window=120,
+        step=120,
         expanding=True,
         execution_delay=0,
         parameter_grid={"lookback_period": [60, 120]},
@@ -863,13 +867,13 @@ def test_run_walk_forward_stress_tests_reselects_parameters_under_higher_costs()
 ):
     """The methodological point of the whole process-level/returns-level
     split: a Walk-forward mode stress scenario must genuinely re-run
-    selection, not rescale a fixed baseline's weights. entry_zscore=0.5
+    selection, not rescale a fixed baseline's weights. entry_threshold=0.5
     trades far more often than 3.0 on this mean-reverting panel, so it must
     lose ground once commission is stressed 5x — and the stress-test
     function's own numbers must come from that re-selected run."""
     data = _cost_sensitive_panel()
     config = _cost_sensitive_config(commission_bps=50.0)
-    grid = {"entry_zscore": [0.5, 3.0]}
+    grid = {"entry_threshold": [0.5, 3.0]}
     windows: _WalkForwardWindows = {
         "train_window": 150,
         "validation_window": 60,
@@ -879,7 +883,9 @@ def test_run_walk_forward_stress_tests_reselects_parameters_under_higher_costs()
 
     wf_baseline = WalkForwardValidator(config).run(data, parameter_grid=grid, **windows)
     assert wf_baseline.oos_result is not None
-    baseline_choices = [fold.best_params["entry_zscore"] for fold in wf_baseline.folds]
+    baseline_choices = [
+        fold.best_params["entry_threshold"] for fold in wf_baseline.folds
+    ]
     # The high-turnover parameter must win at least one fold at baseline cost
     # — otherwise there is nothing for higher costs to knock it away from.
     assert 0.5 in baseline_choices
@@ -887,7 +893,7 @@ def test_run_walk_forward_stress_tests_reselects_parameters_under_higher_costs()
     x5_config = scale_costs(config, commission_mult=5.0)
     wf_x5 = WalkForwardValidator(x5_config).run(data, parameter_grid=grid, **windows)
     assert wf_x5.oos_result is not None
-    x5_choices = [fold.best_params["entry_zscore"] for fold in wf_x5.folds]
+    x5_choices = [fold.best_params["entry_threshold"] for fold in wf_x5.folds]
 
     # The core assertion: re-running walk-forward selection under 5x
     # commission actually changes which parameter wins on at least one fold.
@@ -912,7 +918,7 @@ def test_run_with_weight_cache_matches_plain_run() -> None:
     by-product of the same computation, not a different one."""
     data = _cost_sensitive_panel()
     config = _cost_sensitive_config(commission_bps=50.0)
-    grid = {"entry_zscore": [0.5, 3.0]}
+    grid = {"entry_threshold": [0.5, 3.0]}
     windows: _WalkForwardWindows = {
         "train_window": 150,
         "validation_window": 60,
@@ -942,7 +948,7 @@ def test_run_with_weight_cache_resumes_from_a_checkpoint_and_matches_a_fresh_run
     resumable and bit-for-bit reproducible on its own."""
     data = _cost_sensitive_panel()
     config = _cost_sensitive_config(commission_bps=50.0)
-    grid = {"entry_zscore": [0.5, 3.0]}
+    grid = {"entry_threshold": [0.5, 3.0]}
     windows: _WalkForwardWindows = {
         "train_window": 150,
         "validation_window": 60,
@@ -1003,7 +1009,7 @@ def test_run_with_weight_cache_refuses_a_checkpoint_with_a_mismatched_candidate_
 
     data = _cost_sensitive_panel()
     config = _cost_sensitive_config(commission_bps=50.0)
-    grid = {"entry_zscore": [0.5, 3.0]}
+    grid = {"entry_threshold": [0.5, 3.0]}
     windows: _WalkForwardWindows = {
         "train_window": 150,
         "validation_window": 60,
@@ -1040,9 +1046,10 @@ def test_run_with_weight_cache_refuses_a_checkpoint_with_a_mismatched_candidate_
         train_window=150,
         validation_window=60,
         test_window=60,
+        step=60,
         expanding=True,
         execution_delay=0,
-        parameter_grid={"entry_zscore": [0.5, 3.0]},
+        parameter_grid={"entry_threshold": [0.5, 3.0]},
     )
     loaded = load_checkpoint(checkpoint_path, provenance)
     assert loaded is not None
@@ -1084,7 +1091,7 @@ def test_run_with_weight_cache_refuses_a_checkpoint_with_a_corrupted_candidate_f
 
     data = _cost_sensitive_panel()
     config = _cost_sensitive_config(commission_bps=50.0)
-    grid = {"entry_zscore": [0.5, 3.0]}
+    grid = {"entry_threshold": [0.5, 3.0]}
     windows: _WalkForwardWindows = {
         "train_window": 150,
         "validation_window": 60,
@@ -1121,9 +1128,10 @@ def test_run_with_weight_cache_refuses_a_checkpoint_with_a_corrupted_candidate_f
         train_window=150,
         validation_window=60,
         test_window=60,
+        step=60,
         expanding=True,
         execution_delay=0,
-        parameter_grid={"entry_zscore": [0.5, 3.0]},
+        parameter_grid={"entry_threshold": [0.5, 3.0]},
     )
     loaded = load_checkpoint(checkpoint_path, provenance)
     assert loaded is not None
@@ -1164,7 +1172,7 @@ def test_rescore_with_costs_matches_a_fresh_scenario_run() -> None:
     faster way to compute the same answer, not an approximation."""
     data = _cost_sensitive_panel()
     config = _cost_sensitive_config(commission_bps=50.0)
-    grid = {"entry_zscore": [0.5, 3.0]}
+    grid = {"entry_threshold": [0.5, 3.0]}
     windows: _WalkForwardWindows = {
         "train_window": 150,
         "validation_window": 60,
@@ -1206,7 +1214,9 @@ def test_run_walk_forward_stress_tests_best_days_removed_reuses_baseline() -> No
     # and windows (resolve_walk_forward_windows(config)), so both must match
     # what the baseline below is built with.
     config = _config_with_grid(grid)
-    train_window, validation_window, test_window = resolve_walk_forward_windows(config)
+    train_window, validation_window, test_window, _step = resolve_walk_forward_windows(
+        config
+    )
     wf_baseline = WalkForwardValidator(config).run(
         data,
         parameter_grid=grid,
@@ -1312,7 +1322,9 @@ def test_run_walk_forward_stress_tests_reports_scenario_progress() -> None:
     # way real callers (dashboard/CLI) do — otherwise its fold count
     # wouldn't match the weight cache's, which this progress accounting
     # relies on.
-    train_window, validation_window, test_window = resolve_walk_forward_windows(config)
+    train_window, validation_window, test_window, _step = resolve_walk_forward_windows(
+        config
+    )
     wf_baseline = WalkForwardValidator(config).run(
         data,
         parameter_grid=grid,
@@ -1359,7 +1371,9 @@ def test_run_walk_forward_stress_tests_resumes_the_weight_cache_build(
     data = _panel()
     grid = {"lookback_period": [60, 120]}
     config = _config_with_grid(grid)
-    train_window, validation_window, test_window = resolve_walk_forward_windows(config)
+    train_window, validation_window, test_window, _step = resolve_walk_forward_windows(
+        config
+    )
     wf_baseline = WalkForwardValidator(config).run(
         data,
         parameter_grid=grid,
@@ -1435,7 +1449,9 @@ def test_run_walk_forward_stress_tests_resume_after_cost_block_runs_every_later_
 
     data = _panel()
     config = _config_with_grid({})
-    train_window, validation_window, test_window = resolve_walk_forward_windows(config)
+    train_window, validation_window, test_window, _step = resolve_walk_forward_windows(
+        config
+    )
     wf_baseline = WalkForwardValidator(config).run(
         data,
         parameter_grid={},
@@ -1490,7 +1506,9 @@ def test_run_walk_forward_stress_tests_refuses_a_checkpoint_with_wrong_scenario_
 
     data = _panel()
     config = _config_with_grid({})
-    train_window, validation_window, test_window = resolve_walk_forward_windows(config)
+    train_window, validation_window, test_window, _step = resolve_walk_forward_windows(
+        config
+    )
     wf_baseline = WalkForwardValidator(config).run(
         data,
         parameter_grid={},
@@ -1543,7 +1561,9 @@ def test_run_walk_forward_stress_tests_refuses_a_checkpoint_with_an_inconsistent
 
     data = _panel()
     config = _config_with_grid({})
-    train_window, validation_window, test_window = resolve_walk_forward_windows(config)
+    train_window, validation_window, test_window, _step = resolve_walk_forward_windows(
+        config
+    )
     wf_baseline = WalkForwardValidator(config).run(
         data,
         parameter_grid={},
@@ -1709,14 +1729,13 @@ def test_walk_forward_parameter_sensitivity_refuses_a_checkpoint_with_a_garbage_
 def test_walk_forward_parameter_sensitivity_recovers_from_a_pd_na_checkpoint(
     tmp_path: Path,
 ) -> None:
-    """A checkpointed cell whose swept-parameter value is ``pd.NA`` used to
-    crash the resume path with ``TypeError: boolean value of NA is
-    ambiguous`` deep inside the comparison that checks a cell's value
-    against its expected combination -- an exception that then propagated
-    out of ``load_checkpoint`` despite its own contract that a corrupted
-    checkpoint is only ever skipped, never raised. Must now be treated as
-    "not a match" and trigger a fresh recompute instead of crashing the
-    whole sweep."""
+    """A checkpointed cell whose swept-parameter value is ``pd.NA`` must be
+    treated as "not a match" and trigger a fresh recompute instead of
+    crashing the whole sweep: the comparison that checks a cell's value
+    against its expected combination must never let ``TypeError: boolean
+    value of NA is ambiguous`` propagate out of ``load_checkpoint``,
+    whose own contract is that a corrupted checkpoint is only ever
+    skipped, never raised."""
     from quantlab.validation.checkpoint import compute_provenance, save_checkpoint
 
     data = _panel()
@@ -1795,7 +1814,39 @@ def test_bootstrap_summary_percentiles() -> None:
     )
     # Percentile ordering holds.
     for _, row in summary.iterrows():
-        assert row["p05"] <= row["median"] <= row["p95"]
+        assert row["p_lower"] <= row["median"] <= row["p_upper"]
+
+
+def test_bootstrap_summary_confidence_level_is_configurable() -> None:
+    """A narrower confidence level must yield a tighter p_lower/p_upper band.
+
+    0.90 (the default) reproduces the original fixed 5th/95th percentile
+    interval exactly; a lower confidence level (e.g. 0.50 -> 25th/75th)
+    must be strictly narrower for a large enough sample.
+    """
+    rng = np.random.default_rng(0)
+    returns = pd.Series(rng.normal(0.0005, 0.01, 500))
+    boot = bootstrap_returns(returns, n_iterations=300, block_size=5, seed=42)
+
+    default_summary = boot.summary()
+    explicit_90 = boot.summary(confidence_level=0.90)
+    pd.testing.assert_frame_equal(default_summary, explicit_90)
+
+    narrow_summary = boot.summary(confidence_level=0.50)
+    wide = default_summary.set_index("statistic")
+    narrow = narrow_summary.set_index("statistic")
+    for statistic in wide.index:
+        wide_width = cast(float, wide.at[statistic, "p_upper"]) - cast(
+            float, wide.at[statistic, "p_lower"]
+        )
+        narrow_width = cast(float, narrow.at[statistic, "p_upper"]) - cast(
+            float, narrow.at[statistic, "p_lower"]
+        )
+        assert narrow_width < wide_width
+
+    for level in (0.0, 1.0, -0.1, 1.5):
+        with pytest.raises(ValueError, match="confidence_level"):
+            boot.summary(confidence_level=level)
 
 
 def test_bootstrap_is_reproducible() -> None:
@@ -1873,6 +1924,101 @@ def test_stress_tests_resumes_from_a_checkpoint_including_baseline_returns(
     pd.testing.assert_frame_equal(
         resumed.reset_index(drop=True), fresh.reset_index(drop=True)
     )
+
+
+def test_stress_tests_with_custom_scenario_lists_produces_expected_names() -> None:
+    """Multiple configured values per scenario type must each produce their
+    own row, in the fixed order (commission, slippage, delay, best-days,
+    universe), and an empty list must produce none for that type."""
+    data = _panel()
+    config = _config().revalidated_copy(
+        update={
+            "robustness": _config().robustness.revalidated_copy(
+                update={
+                    "stress_test": {
+                        "enabled": True,
+                        "commission_multipliers": [3.0],
+                        "slippage_multipliers": [],
+                        "execution_delays": [1, 2],
+                        "best_days_removed": [5],
+                        "reduce_universe_by": [1],
+                    }
+                }
+            )
+        }
+    )
+    table = run_stress_tests(data, config)
+    assert list(table["scenario"]) == [
+        "baseline",
+        "commission x3",
+        "execution delay +1",
+        "execution delay +2",
+        "best 5 days removed",
+        "reduced universe (-1)",
+    ]
+    assert (table["status"] == "ok").all()
+
+
+def test_stress_tests_with_custom_scenario_lists_resumes_from_a_checkpoint(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Checkpoint/resume must stay correct when scenario counts per type
+    differ from the historical fixed 1-1-1-1-1 shape (the dynamic block/
+    row-count bookkeeping this rewrite introduced is the actual risk)."""
+    import quantlab.validation.robustness as robustness_module
+
+    data = _panel()
+    config = _config().revalidated_copy(
+        update={
+            "robustness": _config().robustness.revalidated_copy(
+                update={
+                    "stress_test": {
+                        "enabled": True,
+                        "commission_multipliers": [2.0, 3.0],
+                        "slippage_multipliers": [1.5],
+                        "execution_delays": [1],
+                        "best_days_removed": [10, 20],
+                        "reduce_universe_by": [1],
+                    }
+                }
+            )
+        }
+    )
+    checkpoint_path = tmp_path / "checkpoint.pkl"
+
+    real_backtest = robustness_module.run_backtest_from_config
+    calls = {"n": 0}
+
+    def _flaky_backtest(*args: object, **kwargs: object):  # type: ignore[no-untyped-def]
+        calls["n"] += 1
+        # 1=baseline, 2=commission x2, 3=commission x3, 4=slippage x1.5 --
+        # interrupt mid-way through the cost scenarios.
+        if calls["n"] == 4:
+            raise RuntimeError("simulated interruption")
+        return real_backtest(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(robustness_module, "run_backtest_from_config", _flaky_backtest)
+    with pytest.raises(RuntimeError, match="simulated interruption"):
+        run_stress_tests(data, config, checkpoint_path=checkpoint_path)
+    assert checkpoint_path.is_file()
+    monkeypatch.undo()
+
+    resumed = run_stress_tests(data, config, checkpoint_path=checkpoint_path)
+    assert not checkpoint_path.is_file()
+    fresh = run_stress_tests(data, config)
+    pd.testing.assert_frame_equal(
+        resumed.reset_index(drop=True), fresh.reset_index(drop=True)
+    )
+    assert list(resumed["scenario"]) == [
+        "baseline",
+        "commission x2",
+        "commission x3",
+        "slippage x1.5",
+        "execution delay +1",
+        "best 10 days removed",
+        "best 20 days removed",
+        "reduced universe (-1)",
+    ]
 
 
 @pytest.mark.slow

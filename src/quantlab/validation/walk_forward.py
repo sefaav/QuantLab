@@ -36,7 +36,7 @@ from quantlab.backtesting.runner import (
     run_backtest_from_config,
 )
 from quantlab.backtesting.trade_log import build_trade_log
-from quantlab.config import BenchmarkKind, ExperimentConfig
+from quantlab.config import BenchmarkKind, ExperimentConfig, RebalanceFrequency
 from quantlab.constants import SYMBOL
 from quantlab.data.base import price_matrix
 from quantlab.data.calendar import uniform_calendar
@@ -44,6 +44,7 @@ from quantlab.data.closures import DAILY_FREQUENCY, tradable_mask_for
 from quantlab.data.storage import ParquetStorage
 from quantlab.exceptions import InvalidConfigurationError
 from quantlab.execution.execution_model import ExecutionModel
+from quantlab.execution.orders import executed_weights as compute_executed_weights
 from quantlab.execution.orders import shift_respecting_tradability
 from quantlab.logging_config import get_logger
 from quantlab.portfolio.rebalancing import (
@@ -257,6 +258,7 @@ class WalkForwardWeightCache:
     train_window: int
     validation_window: int
     test_window: int
+    step: int
     expanding: bool
     execution_delay: int
     #: The config this cache's weights/candidates were actually computed
@@ -268,16 +270,22 @@ class WalkForwardWeightCache:
     base_config: ExperimentConfig
 
 
-def resolve_walk_forward_windows(config: ExperimentConfig) -> tuple[int, int, int]:
-    """Resolve train/validation/test windows, applying the documented default.
+def resolve_walk_forward_windows(
+    config: ExperimentConfig,
+) -> tuple[int, int, int, int]:
+    """Resolve train/validation/test/step windows, applying documented defaults.
 
     Shared by the CLI, dashboard and walk-forward-aware robustness/sensitivity
-    functions so the 500/126/126 fallback lives in exactly one place.
+    functions so the 500/126/126 fallback (and ``step``'s own default of
+    "equal to the resolved test_window", reproducing the original
+    non-overlapping-folds behaviour) lives in exactly one place.
     """
+    test_window = config.validation.test_window or 126
     return (
         config.validation.train_window or 500,
         config.validation.validation_window or 126,
-        config.validation.test_window or 126,
+        test_window,
+        config.validation.step or test_window,
     )
 
 
@@ -305,6 +313,7 @@ class _PreparedWalkForward:
     scorer: Callable[[pd.Series, pd.Series, int, float], float]
     grid: dict[str, Sequence[Any]]
     delay: int
+    step: int
 
 
 class WalkForwardValidator:
@@ -324,6 +333,7 @@ class WalkForwardValidator:
         test_window: int,
         *,
         expanding: bool = True,
+        step: int | None = None,
         execution_delay: int = 0,
         on_progress: Callable[[int, int], None] | None = None,
         checkpoint_path: Path | None = None,
@@ -340,6 +350,12 @@ class WalkForwardValidator:
             test_window: Out-of-sample test periods per fold.
             expanding: Grow the training window across folds instead of
                 sliding it.
+            step: Periods to advance between consecutive folds' train
+                windows. ``None`` (default) equals ``test_window``, so test
+                blocks are contiguous and never overlap. A smaller step
+                overlaps test blocks; ``step`` must not exceed
+                ``test_window`` (a larger step would leave gaps that
+                CAGR/annualisation cannot account for).
             on_progress: Optional callback invoked as ``on_progress(done,
                 total)`` once before the first candidate (``done=0``, or the
                 resumed count if ``checkpoint_path`` supplied a partial run)
@@ -373,8 +389,10 @@ class WalkForwardValidator:
             validation_window,
             test_window,
             expanding=expanding,
+            step=step,
             execution_delay=execution_delay,
         )
+        step = prepared.step
 
         fold_windows: list[WalkForwardWindow] = []
         fold_parameters: list[dict[str, Any]] = []
@@ -449,6 +467,7 @@ class WalkForwardValidator:
                 train_window=train_window,
                 validation_window=validation_window,
                 test_window=test_window,
+                step=step,
                 expanding=expanding,
                 execution_delay=execution_delay,
                 parameter_grid={k: list(v) for k, v in parameter_grid.items()},
@@ -522,6 +541,7 @@ class WalkForwardValidator:
             train_window,
             validation_window,
             test_window,
+            step,
             expanding,
             started,
         )
@@ -538,6 +558,7 @@ class WalkForwardValidator:
         test_window: int,
         *,
         expanding: bool = True,
+        step: int | None = None,
         execution_delay: int = 0,
         on_progress: Callable[[int, int], None] | None = None,
         checkpoint_path: Path | None = None,
@@ -575,8 +596,10 @@ class WalkForwardValidator:
             validation_window,
             test_window,
             expanding=expanding,
+            step=step,
             execution_delay=execution_delay,
         )
+        step = prepared.step
 
         fold_windows: list[WalkForwardWindow] = []
         fold_parameters: list[dict[str, Any]] = []
@@ -650,6 +673,7 @@ class WalkForwardValidator:
                 train_window=train_window,
                 validation_window=validation_window,
                 test_window=test_window,
+                step=step,
                 expanding=expanding,
                 execution_delay=execution_delay,
                 parameter_grid={k: list(v) for k, v in parameter_grid.items()},
@@ -740,6 +764,7 @@ class WalkForwardValidator:
             train_window,
             validation_window,
             test_window,
+            step,
             expanding,
             started,
         )
@@ -752,6 +777,7 @@ class WalkForwardValidator:
             train_window=train_window,
             validation_window=validation_window,
             test_window=test_window,
+            step=step,
             expanding=expanding,
             execution_delay=prepared.delay,
             base_config=self.base_config,
@@ -818,6 +844,10 @@ class WalkForwardValidator:
             ) from exc
 
         tradable = cache.data[cache.data[SYMBOL].isin(set(scenario_config.symbols))]
+        accounting_kwargs = _accounting_kwargs_for_config(scenario_config)
+        shared_calendar = uniform_calendar(
+            instrument.calendar for instrument in scenario_config.data.instruments
+        )
         fold_parameters: list[dict[str, Any]] = []
         fold_scores: list[float] = []
         target_pieces: list[pd.DataFrame] = []
@@ -852,6 +882,14 @@ class WalkForwardValidator:
                     execution_model,
                     scenario_config.initial_capital,
                     tradable=aligned_tradable,
+                    rebalance_date=_rebalance_date_for_run_accounting(
+                        candidate.validation_weights,
+                        scenario_config.portfolio.rebalance_frequency,
+                        shared_calendar,
+                        aligned_tradable,
+                        0,
+                    ),
+                    **accounting_kwargs,
                 )
                 equity = M.equity_from_returns(accounting.net_returns)
                 score = scorer(
@@ -887,6 +925,7 @@ class WalkForwardValidator:
             cache.train_window,
             cache.validation_window,
             cache.test_window,
+            cache.step,
             cache.expanding,
             started,
         )
@@ -901,6 +940,7 @@ class WalkForwardValidator:
         *,
         expanding: bool,
         execution_delay: int,
+        step: int | None = None,
     ) -> _PreparedWalkForward:
         """Validate inputs and compute what run() and run_with_weight_cache() share."""
         if not isinstance(data, pd.DataFrame):
@@ -938,18 +978,31 @@ class WalkForwardValidator:
                 "Walk-forward data is missing configured tradable symbol(s): "
                 f"{missing_symbols}. Refusing to validate a reduced universe."
             )
+        # train_window/validation_window/test_window are likewise never
+        # pre-validated here -- walk_forward_windows() below is the single
+        # place that validates every window parameter, `step` included.
         index = pd.DatetimeIndex(price_matrix(tradable, adjusted=True).index)
         windows = walk_forward_windows(
-            index, train_window, validation_window, test_window, expanding=expanding
+            index,
+            train_window,
+            validation_window,
+            test_window,
+            expanding=expanding,
+            step=step,
         )
+        # None resolves to test_window, matching walk_forward_windows()'s own
+        # default -- read back here (rather than reconstructed independently)
+        # only after the call above has already validated it.
+        resolved_step = test_window if step is None else int(step)
         if not windows:
             logger.warning(
                 "No walk-forward windows fit in %d observations with "
-                "train=%d validation=%d test=%d.",
+                "train=%d validation=%d test=%d step=%d.",
                 len(index),
                 train_window,
                 validation_window,
                 test_window,
+                resolved_step,
             )
 
         combinations = _grid_combinations(grid)
@@ -975,6 +1028,7 @@ class WalkForwardValidator:
             scorer=scorer,
             grid=grid,
             delay=delay,
+            step=resolved_step,
         )
 
     def _finalize(
@@ -993,6 +1047,7 @@ class WalkForwardValidator:
         train_window: int,
         validation_window: int,
         test_window: int,
+        step: int,
         expanding: bool,
         started: float,
     ) -> WalkForwardResult:
@@ -1008,22 +1063,49 @@ class WalkForwardValidator:
         # Applying rebalancing, turnover and accounting once preserves state
         # and transaction costs across fold boundaries.
         if target_pieces:
-            all_targets = pd.concat(target_pieces).sort_index()
-            if not all_targets.index.is_unique:
+            all_targets = pd.concat(target_pieces)
+            if step < test_window:
+                # An intentionally smaller step overlaps consecutive test
+                # blocks by design (see walk_forward_windows()'s docstring)
+                # -- target_pieces is in fold order, so keeping the LAST
+                # occurrence of a repeated date keeps the most recent
+                # fold's (more up-to-date training data) decision for it,
+                # done here, before sort_index() below, while "last in the
+                # concatenation" still unambiguously means "from the
+                # highest-numbered fold" (a stable post-sort tiebreak is
+                # not guaranteed).
+                all_targets = all_targets[~all_targets.index.duplicated(keep="last")]
+            elif not all_targets.index.is_unique:
                 duplicates = all_targets.index[all_targets.index.duplicated()].unique()
                 raise InvalidConfigurationError(
                     "Walk-forward test blocks overlap; duplicate target dates: "
                     f"{list(duplicates[:5])}."
                 )
+            all_targets = all_targets.sort_index()
             tradable_mask = _tradable_mask_if_mixed_calendar(
                 active_config, pd.DatetimeIndex(all_targets.index)
             )
             shared_calendar = uniform_calendar(
                 instrument.calendar for instrument in active_config.data.instruments
             )
+            # Mirrors engine.py's own `decision_portfolio_config`: when
+            # weight drift is enabled, `apply_weight_drift` (via
+            # run_accounting, below) is the sole place `maximum_turnover`
+            # is applied -- capping it here too would hand the drift layer
+            # an already-capped intermediate target instead of the true
+            # schedule target, letting it trade the portfolio backward
+            # toward that stale value once organic drift has carried it
+            # past it.
+            decision_portfolio_config = (
+                active_config.portfolio.revalidated_copy(
+                    update={"maximum_turnover": None}
+                )
+                if active_config.portfolio.model_weight_drift
+                else active_config.portfolio
+            )
             all_weights = rebalance_and_cap_turnover(
                 all_targets,
-                active_config.portfolio,
+                decision_portfolio_config,
                 tradable=tradable_mask,
                 calendar=shared_calendar,
             )
@@ -1061,6 +1143,24 @@ class WalkForwardValidator:
                     )
                 aligned_starts.append(all_weights.index[execution_location])
 
+            for previous_window, window, previous_start, start in zip(
+                fold_windows,
+                fold_windows[1:],
+                aligned_starts,
+                aligned_starts[1:],
+                strict=False,
+            ):
+                if start <= previous_start:
+                    raise InvalidConfigurationError(
+                        f"Fold {window.fold}'s first execution date ({start.date()}) "
+                        f"does not come after fold {previous_window.fold}'s "
+                        f"({previous_start.date()}) -- a small step combined with "
+                        "infrequent rebalancing collapsed these folds' reporting "
+                        "windows onto each other, which would attribute zero (or "
+                        "the wrong) observations to one of them; increase step or "
+                        "rebalance more often."
+                    )
+
             prices = price_matrix(tradable, adjusted=True)
             asset_returns = compute_asset_returns(prices).reindex(all_weights.index)
             execution_model = build_execution_from_config(active_config, data)
@@ -1075,10 +1175,10 @@ class WalkForwardValidator:
             if delay > 0:
                 if aligned_tradable_mask is not None:
                     # A raw row-count shift would delay execution onto a
-                    # date a symbol can't actually trade on -- same bug the
-                    # mandatory look-ahead-barrier shift inside
-                    # run_accounting avoids, so the extra configured delay
-                    # must avoid it too.
+                    # date a symbol can't actually trade on -- the mandatory
+                    # look-ahead-barrier shift inside run_accounting avoids
+                    # exactly this, and the extra configured delay must
+                    # avoid it too.
                     executed_weights = shift_respecting_tradability(
                         executed_weights, delay, aligned_tradable_mask
                     ).fillna(0.0)
@@ -1090,6 +1190,14 @@ class WalkForwardValidator:
                 execution_model,
                 active_config.initial_capital,
                 tradable=aligned_tradable_mask,
+                rebalance_date=_rebalance_date_for_run_accounting(
+                    all_weights,
+                    active_config.portfolio.rebalance_frequency,
+                    shared_calendar,
+                    aligned_tradable_mask,
+                    delay,
+                ),
+                **_accounting_kwargs_for_config(active_config),
             )
             oos_returns = accounting.net_returns
             oos_equity = accounting.equity
@@ -1109,6 +1217,7 @@ class WalkForwardValidator:
                 train_window,
                 validation_window,
                 test_window,
+                step,
                 expanding,
             )
         else:
@@ -1171,6 +1280,7 @@ class WalkForwardValidator:
         train_window: int,
         validation_window: int,
         test_window: int,
+        step: int,
         expanding: bool,
     ) -> BacktestResult:
         """Build a genuine BacktestResult from the stitched OOS series.
@@ -1184,6 +1294,16 @@ class WalkForwardValidator:
         or a cost-scenario config from :meth:`rescore_with_costs`), so its
         cost fields and metadata describe what was actually run.
         """
+        # No trigger_*/adjustment_*/position_strategy_origin_* provenance is
+        # passed here: attribution is unavailable in this aggregated
+        # walk-forward reconstruction. The stitched out-of-sample series is
+        # rebuilt from per-fold weights, not from a single engine run's
+        # diagnostic frames -- each fold reruns the pipeline independently
+        # with its own warmup/fit, and those frames do not survive the
+        # cut/restitch across folds. `build_trade_log` leaves the reason
+        # columns `None`/`NaT` whenever these kwargs are omitted (its
+        # documented legacy/no-attribution path), which is correct here, not
+        # a bug to fix.
         trades = build_trade_log(
             accounting.executed_weights,
             accounting.weight_changes,
@@ -1271,7 +1391,26 @@ class WalkForwardValidator:
                 "train_window": train_window,
                 "validation_window": validation_window,
                 "test_window": test_window,
+                "step": step,
                 "expanding": expanding,
+            },
+            # Consolidated view for full reproducibility -- mirrors the two
+            # keys just above (never a replacement for them: other code
+            # reads those by their own exact name, see e.g.
+            # `load_previous_walk_forward_robustness`). `result.save()`
+            # later adds `signal_price_type` to this same dict.
+            "resolved_config": {
+                "walk_forward": {
+                    "train_window": train_window,
+                    "validation_window": validation_window,
+                    "test_window": test_window,
+                    "step": step,
+                    "expanding": expanding,
+                    "parameter_grid": dict(grid),
+                    "optimization_metric": str(
+                        active_config.validation.optimization_metric
+                    ),
+                }
             },
         }
         # Mirrored under these exact keys because
@@ -1548,6 +1687,90 @@ def _tradable_mask_if_mixed_calendar(
     return tradable_mask_for(index, config.symbols, symbol_calendars)
 
 
+def _accounting_kwargs_for_config(config: ExperimentConfig) -> dict[str, Any]:
+    """The non-``tradable`` ``run_accounting`` keyword arguments a full run would use.
+
+    Mirrors :class:`~quantlab.backtesting.engine.BacktestEngine`'s own call
+    exactly (including its ``maximum_gross_exposure``/``maximum_leverage``
+    combined-cap convention). Every accounting call site in this module
+    must use this (candidate scoring, cost-only rescoring, final OOS
+    stitching) so walk-forward's own numbers stay in parity with the main
+    backtest under the same YAML, instead of silently ignoring stop-loss/
+    take-profit/position-groups/weight-drift/exposure-limit configuration.
+    """
+    strategy = build_strategy_from_config(config)
+    portfolio = config.portfolio
+    maximum_gross_exposure = (
+        min(portfolio.maximum_gross_exposure, portfolio.maximum_leverage)
+        if portfolio.maximum_gross_exposure is not None
+        else portfolio.maximum_leverage
+    )
+    return {
+        "stop_loss_pct": strategy.stop_loss_pct,
+        "take_profit_pct": strategy.take_profit_pct,
+        "position_groups": strategy.position_groups(),
+        "model_weight_drift": portfolio.model_weight_drift,
+        "maximum_weight": portfolio.maximum_weight,
+        "maximum_gross_exposure": maximum_gross_exposure,
+        "maximum_net_exposure": portfolio.maximum_net_exposure,
+        "long_only": portfolio.long_only,
+        "maximum_turnover": portfolio.maximum_turnover,
+    }
+
+
+def _rebalance_date_for_run_accounting(
+    decision_weights: pd.DataFrame,
+    frequency: RebalanceFrequency | str,
+    calendar: str | None,
+    tradable_mask: pd.DataFrame | None,
+    delay: int,
+) -> pd.DataFrame:
+    """Boolean, aligned exactly like `run_accounting`'s own `rebalance_date`.
+
+    Mirrors `BacktestEngine.run()`'s identical construction: a genuine
+    scheduled-rebalance-date flag, broadcast across every column at the
+    DECISION cadence, shifted onto the EXECUTED timeline the same way
+    ``decision_weights`` itself becomes executed (any extra configured
+    delay, then the mandatory look-ahead-barrier shift) -- required so
+    `apply_weight_drift`'s own anchor detection (see its docstring) can
+    catch a scheduled rebalance whose freshly-decided target happens to
+    numerically match the immediately preceding one, which plain
+    value-diffing `executed` against its own previous row cannot.
+    Per-column, NOT collapsed with `.any(axis=1)`: a closed instrument
+    must never be forced to anchor just because another instrument's own
+    schedule/value-change fires the same row.
+    """
+    schedule = compute_rebalance_dates(
+        pd.DatetimeIndex(decision_weights.index), frequency, calendar=calendar
+    )
+    is_rebalance_date = pd.DataFrame(
+        np.broadcast_to(
+            decision_weights.index.isin(schedule)[:, None], decision_weights.shape
+        ),
+        index=decision_weights.index,
+        columns=decision_weights.columns,
+        dtype=float,
+    )
+    if delay > 0:
+        is_rebalance_date = (
+            shift_respecting_tradability(is_rebalance_date, delay, tradable_mask)
+            if tradable_mask is not None
+            else is_rebalance_date.shift(delay)
+        ).fillna(0.0)
+    aligned = compute_executed_weights(is_rebalance_date, tradable=tradable_mask)
+    flag = aligned > 0.5
+    # `compute_executed_weights` is built for *weights*, where a closed row
+    # correctly repeats the last tradable row's value. Applied to a boolean
+    # flag, that same repetition would keep it True for every row a column
+    # stays closed after it lands True once -- wrong for a flag, which must
+    # describe THIS row's own event. AND with `tradable_mask` so a closed
+    # row's flag is always False, matching apply_weight_drift's own
+    # documented precondition.
+    if tradable_mask is not None:
+        flag = flag & tradable_mask
+    return flag
+
+
 def _slice_between(
     data: pd.DataFrame, start: pd.Timestamp, end: pd.Timestamp
 ) -> pd.DataFrame:
@@ -1625,12 +1848,31 @@ def _weights_and_returns_for_validation(
         if tradable_mask is not None
         else None
     )
+    shared_calendar = uniform_calendar(
+        instrument.calendar for instrument in config.data.instruments
+    )
     accounting = run_accounting(
         window_weights,
         asset_returns,
         execution_model,
         config.initial_capital,
         tradable=aligned_tradable,
+        # `window_weights` (from `_weights_for_window`, via
+        # `run_backtest_from_config(..., execution_delay=execution_delay)`)
+        # already has `execution_delay` baked in -- it IS
+        # `BacktestResult.weights`, itself already `_apply_extra_delay`-ed.
+        # Passing `execution_delay` again here would shift it a SECOND
+        # time; `delay=0` matches the sibling call site at this module's
+        # own candidate-scoring loop, which passes the same kind of
+        # already-delayed frame the same way.
+        rebalance_date=_rebalance_date_for_run_accounting(
+            window_weights,
+            config.portfolio.rebalance_frequency,
+            shared_calendar,
+            aligned_tradable,
+            0,
+        ),
+        **_accounting_kwargs_for_config(config),
     )
     return window_weights, accounting.net_returns
 
@@ -1689,7 +1931,7 @@ def _minimum_observations_for_executable_weight(config: ExperimentConfig) -> int
         signal_observations = int(parameters["slow_window"])
     elif strategy_name == "pairs_trading":
         signal_observations = int(parameters["formation_window"]) + int(
-            parameters["zscore_window"]
+            parameters["indicator_window"]
         )
 
     allocator_observations = 1

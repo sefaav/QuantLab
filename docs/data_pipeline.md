@@ -24,9 +24,11 @@ consistency, coverage gaps).
 
 `DataConfig.instruments` is a list of `InstrumentConfig` entries
 (`symbol`/`source`/`calendar`), each fully explicit — no global source or
-calendar for the whole experiment. A single portfolio can freely mix sources
-and calendars, e.g. US equities from Yahoo (`XNYS`) alongside crypto from
-Binance (`24/7`). `ExperimentConfig.benchmark` is itself an `InstrumentConfig`;
+calendar for the whole experiment. A portfolio can mix sources and
+calendars, e.g. US equities from Yahoo (`XNYS`) alongside crypto from
+Binance (`24/7`), at daily frequency; see
+[Limitations](limitations.md#data) for what that support does and does not
+cover (rebalancing, windowed-feature dilution, intraday). `ExperimentConfig.benchmark` is itself an `InstrumentConfig`;
 if its symbol duplicates a tradable instrument it must match that instrument's
 source/calendar exactly and is never re-downloaded, and it never contaminates
 the tradable universe's own timeline (an external 24/7 benchmark cannot inject

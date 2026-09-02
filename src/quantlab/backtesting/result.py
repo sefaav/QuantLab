@@ -83,6 +83,58 @@ _ROBUSTNESS_RUN_PARAMS_KEYS: dict[str, str] = {
     "sensitivity": "sensitivity_run_params",
 }
 
+#: Maps each `_ROBUSTNESS_ARTIFACT_FILES` key to its own section name inside
+#: the consolidated `resolved_config` metadata (see `cli._update_resolved_
+#: config`) -- only "stress_tests" differs from its resolved_config section
+#: name ("stress_test", matching `robustness.stress_test` in YAML).
+_ROBUSTNESS_RESOLVED_CONFIG_KEYS: dict[str, str] = {
+    "stress_tests": "stress_test",
+    "bootstrap": "bootstrap",
+    "permutation_test": "permutation_test",
+    "sensitivity": "sensitivity",
+}
+
+
+def _restore_resolved_config_section(
+    result: BacktestResult, old_metadata: Mapping[str, Any], section: str
+) -> None:
+    """Recover one `resolved_config` section from a prior save's metadata.
+
+    Never overwrites a section this run already computed fresh -- mirrors
+    the same "recovered value only fills a gap" precedence
+    `load_previous_robustness_artifacts` already applies to run-params
+    keys, so a technique actually recomputed this run always keeps its own
+    freshly resolved values.
+    """
+    old_resolved_config = old_metadata.get("resolved_config")
+    if not isinstance(old_resolved_config, Mapping):
+        return
+    value = old_resolved_config.get(section)
+    if value is None:
+        return
+    resolved_config = result.metadata.setdefault("resolved_config", {})
+    resolved_config.setdefault(section, value)
+
+
+def resolve_experiment_directory(
+    config: ExperimentConfig, *, default_root: Path | None = None
+) -> Path:
+    """Return where a run's bundle belongs absent an explicit call-time override.
+
+    ``config.output.directory`` when set, else ``default_root`` (or the
+    documented default ``reports/generated/``) joined with
+    ``experiment_name``. Shared by :meth:`BacktestResult.save` and every
+    caller (CLI commands, the dashboard) that needs to know this same
+    location before a result even exists yet -- e.g. to place a checkpoint
+    file alongside where the eventual save will land. Callers that expose
+    their own ``GENERATED_REPORTS_DIR`` binding (so it can be redirected in
+    tests) should pass it as ``default_root``.
+    """
+    if config.output.directory is not None:
+        return Path(config.output.directory)
+    root = GENERATED_REPORTS_DIR if default_root is None else default_root
+    return root / config.experiment_name
+
 
 def _bundle_lock_path(output_directory: Path) -> Path:
     """Return the persistent sibling lock used to serialize bundle saves."""
@@ -197,7 +249,7 @@ class BacktestResult:
             f"Max drawdown       : {m.get('max_drawdown', 0):>10.2%}",
             f"Hit rate (non-zero periods): {m.get('hit_rate', 0):>5.2%}",
             f"Total costs (currency units): {self.total_costs():>7.2f}",
-            f"Number of trades   : {self.number_of_trades():>10d}",
+            f"Number of fills    : {self.number_of_trades():>10d}",
         ]
         if self.benchmark_returns is not None and "beta" in m:
             lines += [
@@ -351,11 +403,14 @@ class BacktestResult:
         """Persist the result's managed outputs to a reproducible directory.
 
         Writes ``config.yaml``, ``metadata.json``, ``metrics.json`` and CSVs for
-        the equity curve, benchmark, trades, positions and costs, plus a
-        ``figures/`` folder and an HTML report.
+        the equity curve, benchmark, trades, positions and costs
+        unconditionally. The ``figures/`` folder and the HTML report are
+        each written only when ``config.output.save_figures`` /
+        ``.save_html_report`` is true (both default true).
 
         Args:
             output_directory: Destination. Defaults to
+                ``config.output.directory`` when set, else
                 ``reports/generated/<experiment_name>/``.
             robustness: Extra sections (e.g. walk-forward / stress tables) to
                 fold into the saved report's Robustness section.
@@ -384,7 +439,7 @@ class BacktestResult:
         out = Path(
             output_directory
             if output_directory is not None
-            else GENERATED_REPORTS_DIR / self.config.experiment_name
+            else resolve_experiment_directory(self.config)
         )
         artifacts = dict(validation_artifacts or {})
         unsupported = set(artifacts) - _VALIDATION_ARTIFACTS
@@ -497,41 +552,51 @@ class BacktestResult:
         }
 
         # Render once, then reuse the same images on disk and in the HTML.
+        # `save_html_report`/`save_figures` (config.output) skip only this
+        # presentation layer when disabled -- every artefact written above
+        # is unconditional, so `quantlab report` can always regenerate the
+        # HTML afterwards even from a run that skipped it here.
         self.save_warnings = []
         rendered_figures: dict[str, str] = {}
-        try:
-            from quantlab.reporting.charts import report_figures
+        render_figures = (
+            self.config.output.save_html_report or self.config.output.save_figures
+        )
+        if render_figures:
+            try:
+                from quantlab.reporting.charts import report_figures
 
-            rendered_figures = report_figures(self, self.save_warnings)
-        except Exception as exc:  # pragma: no cover - rendering is optional
-            msg = f"Could not render figures: {exc}"
-            logger.warning(msg)
-            self.save_warnings.append(msg)
-        try:
-            from quantlab.reporting.charts import save_figures
+                rendered_figures = report_figures(self, self.save_warnings)
+            except Exception as exc:  # pragma: no cover - rendering is optional
+                msg = f"Could not render figures: {exc}"
+                logger.warning(msg)
+                self.save_warnings.append(msg)
+        if self.config.output.save_figures:
+            try:
+                from quantlab.reporting.charts import save_figures
 
-            save_figures(
-                self,
-                out / "figures",
-                self.save_warnings,
-                rendered=rendered_figures,
-            )
-        except Exception as exc:  # pragma: no cover - rendering is optional
-            msg = f"Could not save figures: {exc}"
-            logger.warning(msg)
-            self.save_warnings.append(msg)
-        try:
-            # Embedded chart failures append to the same warning collector.
-            self.to_html(
-                out / "report.html",
-                robustness=robustness,
-                warnings=self.save_warnings,
-                figures=rendered_figures,
-            )
-        except Exception as exc:  # pragma: no cover - rendering is optional
-            msg = f"Could not render HTML report: {exc}"
-            logger.warning(msg)
-            self.save_warnings.append(msg)
+                save_figures(
+                    self,
+                    out / "figures",
+                    self.save_warnings,
+                    rendered=rendered_figures,
+                )
+            except Exception as exc:  # pragma: no cover - rendering is optional
+                msg = f"Could not save figures: {exc}"
+                logger.warning(msg)
+                self.save_warnings.append(msg)
+        if self.config.output.save_html_report:
+            try:
+                # Embedded chart failures append to the same warning collector.
+                self.to_html(
+                    out / "report.html",
+                    robustness=robustness,
+                    warnings=self.save_warnings,
+                    figures=rendered_figures,
+                )
+            except Exception as exc:  # pragma: no cover - rendering is optional
+                msg = f"Could not render HTML report: {exc}"
+                logger.warning(msg)
+                self.save_warnings.append(msg)
 
         # Explicit, persisted methodology marker: different CLI commands in
         # walk-forward mode save fundamentally different `self` objects to
@@ -544,10 +609,18 @@ class BacktestResult:
         # last. Recording which one `self.metrics` actually is removes the
         # ambiguity for anyone reading the bundle later, without needing to
         # know the CLI's own save conventions.
+        from quantlab.backtesting.trade_log import TRADE_LOG_SCHEMA_VERSION
         from quantlab.reporting.research_summary import out_of_sample_scope
 
         self.metadata["result_scope"] = out_of_sample_scope(self) or "full_sample"
         self.metadata["save_warnings"] = self.save_warnings
+        self.metadata["trade_log_schema_version"] = TRADE_LOG_SCHEMA_VERSION
+        # Always known (unlike the walk-forward/robustness fields other
+        # callers add to this same dict) -- a consolidated, always-current
+        # record of concrete values actually used, for full reproducibility.
+        self.metadata.setdefault("resolved_config", {})["signal_price_type"] = (
+            self.config.strategy.signal_price_type
+        )
         _write_text_atomic(
             out / "metrics.json",
             json.dumps(
@@ -755,15 +828,22 @@ def load_previous_walk_forward_robustness(
 
     if old_checksums:
         result.metadata["walk_forward_csv_checksums"] = old_checksums
+    _restore_resolved_config_section(result, old_metadata, "walk_forward")
     robustness: dict[str, Any] = {
         "walk_forward": pd.read_csv(exp_dir / "walk_forward_results.csv")
     }
     if stress_path.is_file():
         robustness["stress_tests"] = pd.read_csv(stress_path)
+        _restore_resolved_config_section(result, old_metadata, "stress_test")
     return robustness
 
 
-def save_with_walk_forward_reuse(result: BacktestResult, exp_dir: str | Path) -> Path:
+def save_with_walk_forward_reuse(
+    result: BacktestResult,
+    exp_dir: str | Path,
+    *,
+    robustness_extra: Mapping[str, Any] | None = None,
+) -> Path:
     """Save a result while preserving compatible walk-forward artefacts.
 
     Also preserves compatible bootstrap/permutation-test/sensitivity
@@ -772,6 +852,16 @@ def save_with_walk_forward_reuse(result: BacktestResult, exp_dir: str | Path) ->
     not that) would delete still-valid evidence a `bootstrap`/
     `permutation-test`/`sensitivity` run had just saved, since neither of
     those techniques is itself part of "walk-forward" evidence.
+
+    Args:
+        result: The freshly run backtest to save.
+        exp_dir: Destination directory for the saved bundle.
+        robustness_extra: Freshly computed sections (e.g. a Strategy
+            Explorer results diagnostic) to fold in on top of any reused
+            walk-forward/stress-test/bootstrap/permutation-test/sensitivity
+            evidence -- always wins on key overlap, matching how a
+            recomputed technique already takes precedence over a merely
+            recovered one below.
     """
     exp_dir = Path(exp_dir)
     exp_dir.mkdir(parents=True, exist_ok=True)
@@ -800,7 +890,13 @@ def save_with_walk_forward_reuse(result: BacktestResult, exp_dir: str | Path) ->
         # `robustness`'s own keys (from walk-forward reuse above) win on any
         # overlap -- same precedence `save_with_robustness_reuse` gives a
         # freshly-computed technique over a merely-recovered one.
-        merged_robustness = {**previous_robustness_artifacts, **(robustness or {})}
+        # `robustness_extra` (e.g. a Strategy Explorer diagnostic) is
+        # freshest of all, so it wins over both.
+        merged_robustness = {
+            **previous_robustness_artifacts,
+            **(robustness or {}),
+            **(robustness_extra or {}),
+        }
         validation_artifacts: dict[str, pd.Series | pd.DataFrame] = {}
         for key, frame in previous_robustness_artifacts.items():
             filename = _ROBUSTNESS_ARTIFACT_FILES[key]
@@ -960,6 +1056,14 @@ def load_previous_robustness_artifacts(
             and run_params_key not in result.metadata
         ):
             result.metadata[run_params_key] = old_metadata[run_params_key]
+        # Recover this technique's resolved_config section the same way --
+        # otherwise the surviving CSV's actual settings (stress-test
+        # magnitudes, sensitivity axes, ...) disappear from the
+        # consolidated view even though the raw CSV and its checksum are
+        # still right here.
+        _restore_resolved_config_section(
+            result, old_metadata, _ROBUSTNESS_RESOLVED_CONFIG_KEYS[key]
+        )
     return recovered
 
 

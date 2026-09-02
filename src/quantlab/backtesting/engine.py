@@ -34,6 +34,7 @@ from importlib import metadata as importlib_metadata
 from numbers import Integral
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 from quantlab.backtesting.accounting import (
@@ -48,6 +49,7 @@ from quantlab.config import BenchmarkKind, ExperimentConfig
 from quantlab.constants import (
     CALENDAR_DAYS_PER_YEAR,
     CRYPTO_FREQUENCY_TO_PERIODS_PER_YEAR,
+    EPSILON,
     FREQUENCY_TO_PERIODS_PER_YEAR,
     SYMBOL,
     TIMESTAMP,
@@ -60,6 +62,7 @@ from quantlab.data.storage import ParquetStorage
 from quantlab.exceptions import BacktestError, QuantLabError
 from quantlab.execution.execution_model import ExecutionModel
 from quantlab.execution.orders import (
+    executed_weights,
     shift_respecting_tradability,
     validate_execution_frame,
 )
@@ -70,12 +73,17 @@ from quantlab.execution.slippage import (
 )
 from quantlab.logging_config import get_logger
 from quantlab.portfolio.allocator import PortfolioAllocator, build_allocator
-from quantlab.portfolio.constraints import constraints_from_config
-from quantlab.portfolio.rebalancing import rebalance_and_cap_turnover
+from quantlab.portfolio.constraints import ConstraintTouch, constraints_from_config
+from quantlab.portfolio.rebalancing import (
+    apply_rebalancing,
+    rebalance_and_cap_turnover,
+    rebalance_dates,
+)
 from quantlab.portfolio.volatility_targeting import apply_volatility_target
 from quantlab.risk.metrics import compute_metrics
 from quantlab.strategies.base import (
     BaseStrategy,
+    SignalReasons,
     build_strategy,
     strategy_parameter_names,
 )
@@ -548,9 +556,51 @@ class BacktestEngine:
             )
         asset_returns = compute_asset_returns(prices)
 
+        # Engine-injected context (never a user-configured constructor
+        # hyperparameter, see BaseStrategy.symbol_calendars's own
+        # docstring), set before any strategy method that might compute a
+        # rolling-window feature is called, so every native-calendar call
+        # site (quantlab.features.native_calendar.compute_native_then_
+        # align) can compute on each symbol's own calendar rather than a
+        # closure-padded combined timeline.
+        symbol_calendars = {
+            instrument.symbol: instrument.calendar
+            for instrument in config.data.instruments
+        }
+        strategy.symbol_calendars = symbol_calendars
+
         # Require the strategy to cover the exact tradable panel.
         signals = strategy.generate_signals(tradable_data)
         signals = strategy._validate_signals(signals, prices)
+
+        # Optional, strategy-specific explanation of `signals` -- a pure,
+        # deterministic recomputation from the SAME tradable_data (see
+        # BaseStrategy.explain_signals's own docstring), never a cache of
+        # the call above. None for strategies that don't implement it
+        # (the default): the generic strategy_signal reason still works,
+        # just without a strategy-specific sub-code.
+        raw_signal_reasons = strategy.explain_signals(tradable_data)
+        signal_reasons: SignalReasons | None = (
+            None
+            if raw_signal_reasons is None
+            else BaseStrategy._validate_signal_reasons(
+                raw_signal_reasons.detail_code, raw_signal_reasons.details, prices
+            )
+        )
+
+        # Diagnostic decision proxy (optional, see BaseStrategy.decision_
+        # signal's own docstring): defaults to the raw signal itself, which
+        # is already a faithful decision proxy for every built-in strategy
+        # except pairs_trading (whose raw signal mixes a discrete decision
+        # with mechanical price/beta rescaling). Used ONLY for trigger
+        # detection and position_strategy_origin tracking below -- never
+        # substituted for `signals` in allocation, constraints or execution.
+        raw_decision_proxy = strategy.decision_signal(tradable_data)
+        decision_proxy = (
+            signals
+            if raw_decision_proxy is None
+            else BaseStrategy._validate_decision_signal(raw_decision_proxy, prices)
+        )
 
         # Convert signals to target weights.
         allocated = validate_execution_frame(
@@ -583,9 +633,23 @@ class BacktestEngine:
                 periods_per_year=config.periods_per_year,
             )
 
-        # Enforce portfolio constraints.
+        # Fully-desired weights, post-allocation and post-volatility-target
+        # but pre-constraint -- captured under its own stable name before
+        # `constrained` (below) overwrites what `target_weights` means, so
+        # the trade log can later tell "didn't reach its desired size" (a
+        # constraint) apart from "the desired size itself changed" (signal/
+        # rebalance/vol-target). See build_trade_log's own docstring.
+        desired_target = target_weights
+
+        # Enforce portfolio constraints. apply_with_provenance runs the
+        # exact same computation as apply() (see its own docstring) and
+        # additionally records, per constraint, which cells it actually
+        # changed -- real provenance from the real computation, not a
+        # parallel reconstruction.
         constraints = constraints_from_config(config.portfolio)
-        constrained = constraints.apply(target_weights)
+        constrained, constraint_touches = constraints.apply_with_provenance(
+            target_weights
+        )
 
         # Apply the shared stateful rebalancing/turnover pipeline once over
         # the full index so its state remains continuous. A closed symbol
@@ -598,39 +662,476 @@ class BacktestEngine:
         # real holiday set need not match every quirk of whatever data
         # happens to be loaded for a lone calendar.
         tradable = None
-        symbol_calendars = {
-            instrument.symbol: instrument.calendar
-            for instrument in config.data.instruments
-        }
         shared_calendar = uniform_calendar(symbol_calendars.values())
         if config.data.frequency == DAILY_FREQUENCY and shared_calendar is None:
+            # `prices.columns` (not `config.symbols`) is the order every
+            # other frame in this method is built and validated against
+            # (`allocated.columns.equals(prices.columns)` above, and
+            # transitively `constrained`/`held_weights`/the diagnostic
+            # frames below) -- `pivot_field` sorts symbols alphabetically,
+            # which need not match the instrument declaration order in
+            # `config.symbols`. `executed_weights(..., tradable=tradable)`
+            # (used throughout this method) requires its `tradable` frame
+            # to have EXACTLY matching columns, in the same order, so
+            # `tradable` must be built against `prices.columns` here too.
             tradable = tradable_mask_for(
-                pd.DatetimeIndex(prices.index), config.symbols, symbol_calendars
+                pd.DatetimeIndex(prices.index), list(prices.columns), symbol_calendars
             )
-        held_weights = rebalance_and_cap_turnover(
-            constrained, config.portfolio, tradable=tradable, calendar=shared_calendar
+            # Position-group-coherent tradability (e.g. pairs_trading's two
+            # legs): a per-column tradable mask alone only guarantees each
+            # LEG's own eligibility independently -- a declared group must
+            # be eligible to move as ONE unit, on a date every member is
+            # tradable, never a date only some of its legs are (no legging
+            # risk is modeled). `_rebalance_tradability_aware`'s per-column
+            # "pending debt, retried every day" scheduling then operates on
+            # this group-collapsed mask directly. A symbol never in any
+            # declared group keeps its own independent tradability.
+            groups = strategy.position_groups()
+            if groups:
+                for group in groups:
+                    members = [symbol for symbol in group if symbol in tradable.columns]
+                    if len(members) > 1:
+                        group_tradable = tradable[members].all(axis=1)
+                        for symbol in members:
+                            tradable[symbol] = group_tradable
+
+        # Diagnostic (not real-execution) frames used only to attribute a
+        # trade's reason -- signals/allocated/desired_target/constrained are
+        # recomputed fresh every row (never forward-filled the way
+        # held_weights is), so comparing them "yesterday vs today" would
+        # measure normal day-to-day drift, not "since the last rebalance
+        # decision". Resampling them the same way rebalance_and_cap_turnover
+        # itself samples `constrained` (via apply_rebalancing, using the
+        # same frequency/calendar) gives them the same rebalance-date
+        # cadence as held_weights, so a plain shift(1) inside
+        # build_trade_log correctly reads "value as of the previous
+        # rebalance decision". Never used to recompute an executed weight, cost or
+        # PnL figure -- only build_trade_log's reason classifier reads
+        # these. Centralised in one local helper so these frames can never
+        # drift out of sync with each other or with held_weights' own shift.
+        def _rebalance_diagnostic_frame(frame: pd.DataFrame) -> pd.DataFrame:
+            return apply_rebalancing(
+                frame, config.portfolio.rebalance_frequency, calendar=shared_calendar
+            )
+
+        # `rebalanced_signal` is built from `decision_proxy`, not `signals`
+        # directly: this is what prevents `strategy_signal` from firing on
+        # a strategy's purely mechanical rescaling (e.g. pairs_trading's
+        # price/beta drift at constant discrete state) that isn't a real
+        # new decision. `rebalanced_constrained` (new) is used only to
+        # build `target_episode_id` below.
+        rebalanced_signal = _rebalance_diagnostic_frame(decision_proxy)
+        rebalanced_allocated = _rebalance_diagnostic_frame(allocated)
+        rebalanced_desired = _rebalance_diagnostic_frame(desired_target)
+        rebalanced_constrained = _rebalance_diagnostic_frame(constrained)
+
+        # `target_episode_id`: a cell-level, monotonically increasing
+        # integer identifying which upstream decision produced the target
+        # currently being chased at each rebalance date -- the real
+        # identity a turnover-capped/tradability-deferred debt is scoped
+        # to (see rebalancing.py's `episode_id`), never a bare calendar
+        # counter (row-level) nor the target's own numeric value (two
+        # distinct decisions can coincidentally produce the same number).
+        # Increments a cell's counter only when a REAL upstream event
+        # concerns that cell: the exact same three diagnostic comparisons
+        # `_classify_reason` uses for trigger detection (signal/allocator/
+        # vol-target changed since the last rebalance), or -- when none of
+        # those fired -- the pre-turnover target itself still drifting
+        # (the same condition that drives the position_rescaling fallback
+        # below), which is how a continuously-rescaling target (pairs_
+        # trading) still gets a fresh episode per genuine change. A plain
+        # periodic re-sampling of the SAME still-pursued target increments
+        # nothing, so a turnover/tradability debt against it survives
+        # across rebalance dates as required.
+        def _changed_since_last_rebalance(frame: pd.DataFrame) -> pd.DataFrame:
+            values = frame.to_numpy()
+            previous = np.vstack([np.zeros((1, values.shape[1])), values[:-1]])
+            return pd.DataFrame(
+                np.abs(values - previous) > EPSILON,
+                index=frame.index,
+                columns=frame.columns,
+            )
+
+        signal_changed = _changed_since_last_rebalance(rebalanced_signal)
+        allocator_changed = _changed_since_last_rebalance(rebalanced_allocated)
+        vol_target_changed = _changed_since_last_rebalance(rebalanced_desired)
+        constrained_changed = _changed_since_last_rebalance(rebalanced_constrained)
+        no_trigger = ~(signal_changed | allocator_changed | vol_target_changed)
+        new_episode_this_row = (
+            signal_changed
+            | allocator_changed
+            | vol_target_changed
+            | (no_trigger & constrained_changed)
         )
-        if delay > 0:
+        target_episode_id = new_episode_this_row.astype(int).cumsum()
+
+        # When weight drift is enabled, `apply_weight_drift` (below, via
+        # run_accounting) is the SOLE place `maximum_turnover` is applied --
+        # capping it here too would make this decision-level step produce
+        # an INTERMEDIATE, not-yet-fully-walked target (e.g. 0.2 while the
+        # true schedule target is 1.0), which the drift layer would then
+        # treat as "the" target, capable of trading the portfolio BACKWARD
+        # toward that stale intermediate value even while organic price
+        # drift has already carried it past it. Scheduling and
+        # tradability-aware pending-debt-carrying are UNCHANGED (`None`
+        # is already this module's own "uncapped" convention, not a
+        # separate code path) -- only the cap itself is turned off here.
+        decision_portfolio_config = (
+            config.portfolio.revalidated_copy(update={"maximum_turnover": None})
+            if config.portfolio.model_weight_drift
+            else config.portfolio
+        )
+        held_weights, turnover_provenance = rebalance_and_cap_turnover(
+            constrained,
+            decision_portfolio_config,
+            tradable=tradable,
+            calendar=shared_calendar,
+            episode_id=target_episode_id,
+            return_provenance=True,
+        )
+
+        def _apply_extra_delay(frame: pd.DataFrame) -> pd.DataFrame:
+            if delay <= 0:
+                return frame
             if tradable is not None:
                 # A raw row-count shift would delay execution onto a date a
                 # symbol can't actually trade on (see
-                # shift_respecting_tradability's docstring) -- exactly the
-                # same bug the mandatory look-ahead-barrier shift below
-                # avoids, so the extra configured delay must avoid it too.
-                held_weights = shift_respecting_tradability(
-                    held_weights, delay, tradable
-                ).fillna(0.0)
-            else:
-                held_weights = held_weights.shift(delay).fillna(0.0)
+                # shift_respecting_tradability's docstring) -- the mandatory
+                # look-ahead-barrier shift below avoids exactly this, and the
+                # extra configured delay must avoid it too.
+                # Applied identically to held_weights and every reason
+                # frame, so they all stay aligned to the same decision date.
+                return shift_respecting_tradability(frame, delay, tradable).fillna(0.0)
+            return frame.shift(delay).fillna(0.0)
 
-        # Accounting contains the one-period look-ahead barrier.
+        held_weights = _apply_extra_delay(held_weights)
+        desired_target_aligned = _apply_extra_delay(desired_target)
+        constrained_aligned = _apply_extra_delay(constrained)
+        rebalanced_signal = _apply_extra_delay(rebalanced_signal)
+        rebalanced_allocated = _apply_extra_delay(rebalanced_allocated)
+        rebalanced_desired = _apply_extra_delay(rebalanced_desired)
+
+        # constraint_touches (from apply_with_provenance above) is already
+        # at the same raw daily cadence as `constrained` itself -- not a
+        # rebalance-sampled diagnostic frame -- so it only needs the same
+        # delay+executed_weights alignment as executed_constrained, never
+        # _rebalance_diagnostic_frame. Boolean frames are round-tripped
+        # through float so they can reuse the exact same real numeric
+        # functions, then thresholded back to bool (exact, since the only
+        # values ever produced are 0.0/1.0).
+        def _align_bool(frame: pd.DataFrame) -> pd.DataFrame:
+            # `executed_weights` is built for *weights*, where a closed row
+            # correctly repeats the last tradable row's value (frozen, no
+            # reallocation while closed). Applied to a boolean flag, that
+            # same repetition would keep the flag True for every row a
+            # column stays closed after it lands True once -- wrong for a
+            # flag, which must describe THIS row's own event, never a
+            # carried-forward one. AND with `tradable` (when given) so a
+            # closed row's flag is always False, matching
+            # apply_weight_drift's own documented precondition; with no
+            # tradable mask at all, every row is implicitly tradable and
+            # this repetition concern cannot arise.
+            flag = (
+                executed_weights(
+                    _apply_extra_delay(frame.astype(float)), tradable=tradable
+                )
+                > 0.5
+            )
+            return flag & tradable if tradable is not None else flag
+
+        # Genuine scheduled rebalance dates, aligned onto the executed
+        # timeline the same way held_weights becomes executed (extra
+        # delay, then the mandatory look-ahead-barrier shift) --
+        # apply_weight_drift's own anchor detection needs this, not just
+        # value-diffing `executed` against its own previous row: a
+        # rebalance whose freshly-decided target happens to numerically
+        # match the immediately preceding one (a constant-target
+        # schedule, or an unchanged signal) must still be treated as a
+        # real trade back to target, never silently absorbed into
+        # ongoing drift. See apply_weight_drift's own docstring.
+        schedule_dates = rebalance_dates(
+            pd.DatetimeIndex(constrained.index),
+            config.portfolio.rebalance_frequency,
+            calendar=shared_calendar,
+        )
+        is_rebalance_date_frame = pd.DataFrame(
+            np.broadcast_to(
+                constrained.index.isin(schedule_dates)[:, None], constrained.shape
+            ),
+            index=constrained.index,
+            columns=constrained.columns,
+        )
+        # Per-column, NOT collapsed with `.any(axis=1)`: a closed
+        # instrument must never be forced to anchor (and therefore trade)
+        # just because some OTHER instrument's own schedule/value-change
+        # fires the same row -- see apply_weight_drift's own docstring.
+        # `_align_bool` already routes this per-column through the exact
+        # same tradability-aware shift real weight values get, so a
+        # closed column's own flag correctly stays tied to ITS OWN next
+        # genuinely tradable session, never another column's.
+        rebalance_date = _align_bool(is_rebalance_date_frame)
+
+        aligned_constraint_touches: dict[str, ConstraintTouch] = {
+            name: ConstraintTouch(
+                touched=_align_bool(touch.touched),
+                before=executed_weights(
+                    _apply_extra_delay(touch.before), tradable=tradable
+                ),
+                after=executed_weights(
+                    _apply_extra_delay(touch.after), tradable=tradable
+                ),
+                direct=_align_bool(touch.direct),
+            )
+            for name, touch in constraint_touches.items()
+        }
+        # Split each redistribution-capable constraint's provenance into
+        # two entries -- the base name keeps only the directly-clipped
+        # cells, "*_redistribution" the touched-but-not-direct ones -- so
+        # build_trade_log can attribute each honestly, never a single
+        # winning constraint. Both entries share the SAME before/after
+        # (the real value immediately around this constraint's own
+        # effect); only which cells count as "touched" differs. Every
+        # other constraint (no redistribution concept, `direct == touched`
+        # by construction) passes through as a single entry unchanged.
+        redistribution_capable = frozenset(
+            {"maximum_weight", "minimum_weight", "maximum_positions"}
+        )
+        executed_constraint_touches: dict[str, ConstraintTouch] = {}
+        for name, touch in aligned_constraint_touches.items():
+            if name in redistribution_capable:
+                executed_constraint_touches[name] = ConstraintTouch(
+                    touched=touch.direct,
+                    before=touch.before,
+                    after=touch.after,
+                    direct=touch.direct,
+                )
+                redistribution_mask = touch.touched & ~touch.direct
+                executed_constraint_touches[f"{name}_redistribution"] = ConstraintTouch(
+                    touched=redistribution_mask,
+                    before=touch.before,
+                    after=touch.after,
+                    direct=pd.DataFrame(
+                        False, index=touch.touched.index, columns=touch.touched.columns
+                    ),
+                )
+            else:
+                executed_constraint_touches[name] = touch
+
+        # Real, cell-level turnover-cap/tradability provenance from
+        # rebalancing.py, aligned to executed_weights' index the same way
+        # as everything else above.
+        executed_turnover_actively_limited = _align_bool(
+            turnover_provenance.turnover_actively_limited
+        )
+        executed_turnover_touched = _align_bool(turnover_provenance.turnover_touched)
+        executed_tradability_touched = _align_bool(
+            turnover_provenance.tradability_touched
+        )
+        executed_tradability_compliance_limited = _align_bool(
+            turnover_provenance.tradability_compliance_limited
+        )
+
+        # Two seeds built from `decision_proxy` (never `signal_reasons.
+        # detail_code.notna()`, which would wrongly gate detection on
+        # whether a strategy-specific detail happens to exist -- a real
+        # transition without one must still be detected):
+        # - `trigger_detail_seed`: a plain, unbounded row-index pointer to
+        #   the MOST RECENT transition (any magnitude change > EPSILON),
+        #   never cleared -- consulted only when `strategy_signal` is
+        #   itself the trigger, so a stale pointer on non-firing rows is
+        #   harmless; reading the strategy's own detail_code/details AT
+        #   that exact row (rather than forward-filling the text itself)
+        #   means a detail-less transition correctly clears any earlier
+        #   detail rather than letting it leak forward.
+        # - `position_origin_seed`: a REGIME-based (flat/long/short via
+        #   sign) pointer for `position_strategy_origin` -- a continuous
+        #   signal's own magnitude drift never creates a new origin, only
+        #   a flat<->non-flat regime change does; a transition into flat
+        #   clears it, a transition out of flat (fresh entry or reversal)
+        #   replaces it. Independent of `trigger_detail_seed`: a
+        #   downstream layer holding the executed weight flat does not,
+        #   by itself, move this seed, since it only ever looks at
+        #   `decision_proxy`.
+        decision_values = decision_proxy.to_numpy()
+        row_index_1based = np.arange(1, len(signals.index) + 1, dtype=float)
+        decision_prev_values = np.vstack(
+            [np.zeros((1, decision_values.shape[1])), decision_values[:-1]]
+        )
+        has_transition_magnitude = (
+            np.abs(decision_values - decision_prev_values) > EPSILON
+        )
+        trigger_detail_seed = (
+            pd.DataFrame(
+                np.where(has_transition_magnitude, row_index_1based[:, None], np.nan),
+                index=signals.index,
+                columns=signals.columns,
+            )
+            .ffill()
+            .fillna(0.0)
+        )
+
+        def _regime(values: np.ndarray) -> np.ndarray:
+            return np.where(values > EPSILON, 1, np.where(values < -EPSILON, -1, 0))
+
+        regime_now = _regime(decision_values)
+        regime_prev = np.vstack(
+            [np.zeros((1, regime_now.shape[1]), dtype=int), regime_now[:-1]]
+        )
+        has_regime_transition = regime_now != regime_prev
+        position_origin_candidate = np.where(
+            has_regime_transition,
+            np.where(regime_now == 0, 0.0, row_index_1based[:, None]),
+            np.nan,
+        )
+        position_origin_seed = (
+            pd.DataFrame(
+                position_origin_candidate, index=signals.index, columns=signals.columns
+            )
+            .ffill()
+            .fillna(0.0)
+        )
+
+        def _source_row(seed: pd.DataFrame) -> np.ndarray:
+            executed_positions = executed_weights(
+                _apply_extra_delay(_rebalance_diagnostic_frame(seed)),
+                tradable=tradable,
+            )
+            return executed_positions.round().to_numpy().astype(int) - 1
+
+        trigger_source_row = _source_row(trigger_detail_seed)
+        position_origin_source_row = _source_row(position_origin_seed)
+
+        def _gather(raw: pd.DataFrame, source_row: np.ndarray) -> pd.DataFrame:
+            raw_values = raw.to_numpy(dtype=object)
+            gathered = np.full(source_row.shape, None, dtype=object)
+            for column_index in range(source_row.shape[1]):
+                valid = source_row[:, column_index] >= 0
+                gathered[valid, column_index] = raw_values[
+                    source_row[valid, column_index], column_index
+                ]
+            return pd.DataFrame(
+                gathered, index=raw.index, columns=raw.columns, dtype=object
+            )
+
+        executed_strategy_reason_code: pd.DataFrame | None = None
+        executed_strategy_reason_details: pd.DataFrame | None = None
+        if signal_reasons is not None:
+            executed_strategy_reason_code = _gather(
+                signal_reasons.detail_code, trigger_source_row
+            )
+            executed_strategy_reason_details = _gather(
+                signal_reasons.details, trigger_source_row
+            )
+            executed_position_strategy_origin_code = _gather(
+                signal_reasons.detail_code, position_origin_source_row
+            )
+            executed_position_strategy_origin_details = _gather(
+                signal_reasons.details, position_origin_source_row
+            )
+        else:
+            _empty_object = pd.DataFrame(
+                None, index=signals.index, columns=signals.columns, dtype=object
+            )
+            executed_position_strategy_origin_code = _empty_object
+            executed_position_strategy_origin_details = _empty_object.copy()
+
+        # Origin timestamp: independent of whether explain_signals() exists
+        # at all -- a strategy without strategy-specific detail codes still
+        # gets a temporally correct origin (point 2: the temporal tracking
+        # of position_strategy_origin is not gated on detail_code
+        # existing).
+        _dates = signals.index.to_numpy()
+        _origin_gathered = np.full(
+            position_origin_source_row.shape, pd.NaT, dtype=object
+        )
+        for _column_index in range(position_origin_source_row.shape[1]):
+            _valid = position_origin_source_row[:, _column_index] >= 0
+            _origin_gathered[_valid, _column_index] = _dates[
+                position_origin_source_row[_valid, _column_index]
+            ]
+        executed_position_strategy_origin_timestamp = pd.DataFrame(
+            _origin_gathered, index=signals.index, columns=signals.columns, dtype=object
+        )
+
+        # Accounting contains the one-period look-ahead barrier. A
+        # strategy's stop_loss_pct/take_profit_pct/position_groups() are
+        # read generically here (default None/None/None disables the
+        # check entirely) -- the mechanism itself lives in accounting.py,
+        # operating on the REAL executed position, never this strategy's
+        # raw `signals` above.
         accounting = run_accounting(
             held_weights,
             asset_returns,
             execution_model,
             config.initial_capital,
             tradable=tradable,
+            stop_loss_pct=strategy.stop_loss_pct,
+            take_profit_pct=strategy.take_profit_pct,
+            position_groups=strategy.position_groups(),
+            model_weight_drift=config.portfolio.model_weight_drift,
+            maximum_weight=config.portfolio.maximum_weight,
+            # Same combined-cap convention as rebalancing.py's own
+            # gross_cap = min(gross_caps): maximum_leverage always has a
+            # real (non-None) value, so it must be folded in here too, or
+            # the drift-compliance LP would silently miss it whenever
+            # maximum_gross_exposure itself is left unset.
+            maximum_gross_exposure=(
+                min(
+                    config.portfolio.maximum_gross_exposure,
+                    config.portfolio.maximum_leverage,
+                )
+                if config.portfolio.maximum_gross_exposure is not None
+                else config.portfolio.maximum_leverage
+            ),
+            maximum_net_exposure=config.portfolio.maximum_net_exposure,
+            long_only=config.portfolio.long_only,
+            rebalance_date=rebalance_date,
+            maximum_turnover=config.portfolio.maximum_turnover,
         )
+
+        # `maximum_turnover` is enforced at the decision level above ONLY
+        # when weight drift is disabled -- when it's enabled,
+        # `apply_weight_drift` is the sole place it's actually applied (see
+        # `decision_portfolio_config` above), so the decision-level
+        # `turnover_provenance` computed from it is empty in that case.
+        # OR-merging in `accounting`'s own turnover provenance keeps the
+        # trade log's `turnover_cap` attribution accurate either way -- a
+        # no-op when drift is disabled (accounting's own frames are then
+        # all-``False`` placeholders), the real signal when it's enabled.
+        # Already at `accounting.executed_weights`' own index -- no further
+        # alignment needed.
+        executed_turnover_actively_limited = (
+            executed_turnover_actively_limited
+            | accounting.drift_turnover_actively_limited
+        )
+        executed_turnover_touched = (
+            executed_turnover_touched | accounting.drift_turnover_touched
+        )
+
+        # Real, row-broadcast provenance: forced liquidation affects every
+        # column simultaneously and unconditionally once the portfolio is
+        # ruined -- a legitimate broadcast, not an approximation (see
+        # AccountingResult.ruined's own docstring). Already at
+        # accounting.executed_weights' own final index -- no further
+        # alignment needed.
+        executed_forced_liquidation = pd.DataFrame(
+            dict.fromkeys(accounting.executed_weights.columns, accounting.ruined),
+            index=accounting.executed_weights.index,
+        )
+
+        # Align every reason-attribution frame to accounting.executed_weights'
+        # own index using the exact same shift function run_accounting uses
+        # internally, so they can never misalign with the trade log's own
+        # date index. executed_desired/executed_constrained are real
+        # pipeline frames (just re-aligned, not resampled); the *_diag ones
+        # are the rebalance-sampled diagnostic frames from above.
+        executed_desired = executed_weights(desired_target_aligned, tradable=tradable)
+        executed_constrained = executed_weights(constrained_aligned, tradable=tradable)
+        executed_signal_diag = executed_weights(rebalanced_signal, tradable=tradable)
+        executed_allocated_diag = executed_weights(
+            rebalanced_allocated, tradable=tradable
+        )
+        executed_desired_diag = executed_weights(rebalanced_desired, tradable=tradable)
 
         # Align the benchmark to the simulated portfolio dates.
         benchmark_data = (
@@ -664,6 +1165,35 @@ class BacktestEngine:
             spread_bps=execution_model.spread.spread_bps,
             slippage_model=execution_model.slippage,
             slippage_equity=accounting.equity_for_costs,
+            executed_desired=executed_desired,
+            executed_constrained=executed_constrained,
+            executed_signal_diag=executed_signal_diag,
+            executed_allocated_diag=executed_allocated_diag,
+            executed_desired_diag=executed_desired_diag,
+            tradable=tradable,
+            executed_strategy_reason_code=executed_strategy_reason_code,
+            executed_strategy_reason_details=executed_strategy_reason_details,
+            constraint_provenance=executed_constraint_touches,
+            executed_turnover_actively_limited=executed_turnover_actively_limited,
+            executed_turnover_touched=executed_turnover_touched,
+            executed_tradability_touched=executed_tradability_touched,
+            executed_tradability_compliance_limited=(
+                executed_tradability_compliance_limited
+            ),
+            executed_forced_liquidation=executed_forced_liquidation,
+            executed_stop_loss_triggered=accounting.stop_loss_triggered,
+            executed_take_profit_triggered=accounting.take_profit_triggered,
+            executed_drift_compliance_forced=accounting.drift_compliance_forced,
+            executed_drift_compliance_pending=accounting.drift_compliance_pending,
+            executed_position_strategy_origin_timestamp=(
+                executed_position_strategy_origin_timestamp
+            ),
+            executed_position_strategy_origin_code=(
+                executed_position_strategy_origin_code
+            ),
+            executed_position_strategy_origin_details=(
+                executed_position_strategy_origin_details
+            ),
         )
 
         # Compute performance, risk and portfolio metrics.

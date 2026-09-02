@@ -147,7 +147,7 @@ def test_benchmark_outside_universe_is_loaded_but_not_tradable(
                     "symbol_a": "EWA",
                     "symbol_b": "EWC",
                     "formation_window": 40,
-                    "zscore_window": 15,
+                    "indicator_window": 15,
                 },
             },
             "portfolio": {"allocator": "signal_proportional"},

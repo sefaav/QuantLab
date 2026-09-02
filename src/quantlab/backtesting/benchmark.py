@@ -118,6 +118,15 @@ def _align_returns(
             ~is_session_day(calendar, pd.DatetimeIndex(combined_index)),
             index=combined_index,
         )
+        # `combined_index[0]` can precede the benchmark's own first date
+        # (e.g. a 24/7 portfolio instrument trading on a date the
+        # benchmark's calendar marks as a holiday closure): that leading
+        # slot has nothing to forward-fill from, so seed it exactly like a
+        # closure -- but *only* when it genuinely is one. A leading date
+        # that is missing for any other reason (a real gap) must still
+        # raise below, unmasked by this.
+        if pd.isna(equity_on_combined.iloc[0]) and bool(closure.iloc[0]):
+            equity_on_combined.iloc[0] = 1.0
         fillable = equity_on_combined.isna() & closure
         equity_on_combined = equity_on_combined.mask(
             fillable, equity_on_combined.ffill()

@@ -8,8 +8,9 @@ optional `FeaturePipeline` helper; the engine does not require that helper.
 
 ```mermaid
 flowchart LR
-    A[Market Data Sources] --> B[Data Cleaning]
-    B --> C[Data Validation]
+    A[Market Data Sources] --> A2[Raw Data Inspection]
+    A2 --> B[Data Cleaning]
+    B --> C[Final Validation]
     C --> E[Strategy using Feature Functions]
     E --> F[Portfolio Allocation]
     F --> G[Constraints]
@@ -49,9 +50,12 @@ src/quantlab/
 
 ## Why this separation
 
-- **Strategies emit signals only** (`[-1, 1]` per asset per date). They never
-  compute weights, costs, or returns. This makes each strategy trivially
-  unit-testable against a synthetic dataset with an obvious expected signal.
+- **Strategies emit bounded position intents** (`[-1, 1]` per asset per
+  date — a pair's two legs additionally encode their relative hedge-ratio
+  weighting in the signal magnitude, not a pure directional flag). They
+  never compute final portfolio weights, costs, or returns. This makes
+  each strategy trivially unit-testable against a synthetic dataset with
+  an obvious expected signal.
 - **Allocators turn signals into weights** and know nothing about execution
   costs or accounting.
 - **The execution model computes costs** from weight *changes*, independent of
@@ -59,13 +63,11 @@ src/quantlab/
 - **Signals, weights, costs and returns are combined in one fixed order**,
   with the weight-shift step as a hard, tested barrier against look-ahead
   bias. `BacktestEngine.run()` is that assembly for a single backtest.
-  `WalkForwardValidator._build_oos_result()` (`quantlab.validation.
-  walk_forward`) independently assembles the same stitched-OOS-series case,
-  reusing the same underlying accounting/trade-log/benchmark/metrics
-  functions in the same order rather than calling `BacktestEngine.run()`
-  itself — a fix that touches how that assembly step works (e.g. which
-  execution-model fields the trade log or metadata reads) currently needs
-  applying at both call sites, not one shared entry point.
+  **Known architectural duplication**: `WalkForwardValidator.
+  _build_oos_result()` independently re-assembles the same stitched-OOS-
+  series case from the same underlying functions rather than calling
+  `BacktestEngine.run()` itself — a fix to that assembly step currently
+  needs applying at both call sites, not one shared entry point.
 
 ## Data flow shapes
 

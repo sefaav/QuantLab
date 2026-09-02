@@ -140,7 +140,7 @@ def test_direct_strategy_data_requires_finite_positive_prices(
 @pytest.mark.parametrize(
     ("factory", "message"),
     [
-        (lambda: MeanReversionStrategy(entry_zscore=np.nan), "finite"),
+        (lambda: MeanReversionStrategy(entry_threshold=np.nan), "finite"),
         (lambda: MeanReversionStrategy(long_only=cast(Any, "false")), "boolean"),
         (
             lambda: TimeSeriesMomentumStrategy(lookback_period=cast(Any, True)),
@@ -185,7 +185,9 @@ def test_adf_inconclusive_is_explicit_and_never_passes_gate(
         PairsTradingStrategy("AAA", "BBB", adf_pvalue_threshold=1.0)
 
     monkeypatch.setattr(pairs_module, "adf_pvalue", lambda series: None)
-    strategy = PairsTradingStrategy("AAA", "BBB", formation_window=20, zscore_window=2)
+    strategy = PairsTradingStrategy(
+        "AAA", "BBB", formation_window=20, indicator_window=2
+    )
     index = pd.date_range("2020-01-01", periods=25)
     a = pd.Series(np.linspace(100.0, 120.0, 25), index=index)
     b = pd.Series(np.linspace(50.0, 60.0, 25), index=index)
@@ -204,7 +206,9 @@ def test_pairs_adf_uses_the_full_trailing_formation_residual(
         return 0.01
 
     monkeypatch.setattr(pairs_module, "adf_pvalue", _capture)
-    strategy = PairsTradingStrategy("AAA", "BBB", formation_window=20, zscore_window=2)
+    strategy = PairsTradingStrategy(
+        "AAA", "BBB", formation_window=20, indicator_window=2
+    )
     index = pd.date_range("2020-01-01", periods=25)
     b = pd.Series(np.linspace(50.0, 60.0, 25), index=index)
     a = 5.0 + 1.5 * b + pd.Series(np.sin(np.arange(25)), index=index)
@@ -232,7 +236,7 @@ def test_static_pairs_adf_tests_the_same_fixed_relationship(
         "AAA",
         "BBB",
         formation_window=20,
-        zscore_window=2,
+        indicator_window=2,
         dynamic_hedge_ratio=False,
     )
     index = pd.date_range("2020-01-01", periods=25)
@@ -270,7 +274,9 @@ def test_pairs_signals_convert_share_beta_to_dollar_neutral_legs(
         [make_ohlcv("AAA", np.full(25, 100.0)), make_ohlcv("BBB", np.full(25, 50.0))],
         ignore_index=True,
     )
-    strategy = PairsTradingStrategy("AAA", "BBB", formation_window=20, zscore_window=2)
+    strategy = PairsTradingStrategy(
+        "AAA", "BBB", formation_window=20, indicator_window=2
+    )
     last = strategy.generate_signals(data).iloc[-1]
     assert last["AAA"] == pytest.approx(1.0)
     assert last["BBB"] == pytest.approx(-1.0)
@@ -363,6 +369,9 @@ def test_trend_strategy_contains_direction_parameters_only() -> None:
         "fast_window": 10,
         "slow_window": 30,
         "long_only": True,
+        "price_type": "adjusted_close",
+        "stop_loss_pct": None,
+        "take_profit_pct": None,
     }
 
 
@@ -420,7 +429,7 @@ def test_unwrap_simple_type_returns_none_for_ambiguous_annotations() -> None:
 def test_prices_rejects_data_with_no_rows() -> None:
     empty = make_ohlcv("AAA", [100.0, 101.0]).iloc[0:0]
     with pytest.raises(StrategyError, match="at least one date and symbol"):
-        BaseStrategy._prices(empty)
+        BuyAndHoldStrategy()._prices(empty)
 
 
 def test_validate_signals_rejects_non_dataframe_input() -> None:
@@ -497,8 +506,8 @@ def test_walk_pairs_positions_requires_matching_lengths() -> None:
 
 
 def test_pairs_strategy_allows_no_stop_and_rejects_missing_symbol() -> None:
-    strategy = PairsTradingStrategy("AAA", "BBB", stop_zscore=None)
-    assert strategy.stop_zscore is None
+    strategy = PairsTradingStrategy("AAA", "BBB", stop_threshold=None)
+    assert strategy.stop_threshold is None
     data = make_ohlcv("AAA", [100.0] * 30)
     with pytest.raises(StrategyError, match="needs symbol"):
         strategy.generate_signals(data)

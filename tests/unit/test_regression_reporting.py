@@ -592,17 +592,98 @@ def test_report_fallback_discovers_a_bundled_yml_config(
         lambda loaded_data, loaded_cfg, *, data_quality_report: fake_result,
     )
 
-    def fake_save(result: object, exp_dir: Path) -> Path:
+    def fake_save(
+        result: object, exp_dir: Path, *, robustness_extra: object = None
+    ) -> Path:
         saved["result"] = result
         saved["exp_dir"] = exp_dir
         return exp_dir
 
     monkeypatch.setattr(result_module, "save_with_walk_forward_reuse", fake_save)
 
-    cli_module.report(experiment=experiment)
+    cli_module.report(experiment=experiment, config=None, shipped_config=None)
 
     assert saved["result"] is fake_result
     assert saved["exp_dir"] == (reports / experiment).resolve()
+
+
+def test_report_dash_config_finds_a_custom_output_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`--experiment` can only ever discover a config saved under
+    reports/generated/ (or a bundled config of the same name) -- a config
+    saved with its own `output.directory` elsewhere (never bundled) is
+    unreachable that way. `--config PATH`, pointing directly at the saved
+    config file, must still find and regenerate it."""
+    from types import SimpleNamespace
+
+    import quantlab.backtesting.result as result_module
+    import quantlab.backtesting.runner as runner_module
+    import quantlab.cli as cli_module
+    import quantlab.data.loader as loader_module
+
+    data, cfg = _holdout_config()
+    custom_output_dir = tmp_path / "somewhere" / "custom"
+    cfg = cfg.revalidated_copy(
+        update={
+            "output": cfg.output.revalidated_copy(
+                update={"directory": str(custom_output_dir)}
+            )
+        }
+    )
+    config_path = tmp_path / "not_bundled_config.yaml"
+    cfg.to_yaml(config_path)
+    saved: dict[str, object] = {}
+    fake_result = SimpleNamespace(save_warnings=[])
+
+    monkeypatch.setattr(
+        loader_module.DataLoader,
+        "load",
+        lambda _self, loaded_cfg: (data, SimpleNamespace(warnings=[])),
+    )
+    monkeypatch.setattr(
+        runner_module,
+        "run_backtest_from_config",
+        lambda loaded_data, loaded_cfg, *, data_quality_report: fake_result,
+    )
+
+    def fake_save(
+        result: object, exp_dir: Path, *, robustness_extra: object = None
+    ) -> Path:
+        saved["result"] = result
+        saved["exp_dir"] = exp_dir
+        return exp_dir
+
+    monkeypatch.setattr(result_module, "save_with_walk_forward_reuse", fake_save)
+
+    cli_module.report(experiment=None, config=config_path, shipped_config=None)
+
+    assert saved["result"] is fake_result
+    assert saved["exp_dir"] == custom_output_dir
+
+
+def test_report_experiment_and_config_are_mutually_exclusive() -> None:
+    import typer
+
+    import quantlab.cli as cli_module
+
+    with pytest.raises(typer.Exit) as raised:
+        cli_module.report(
+            experiment="some_experiment",
+            config=Path("some_config.yaml"),
+            shipped_config=None,
+        )
+    assert raised.value.exit_code == 1
+
+
+def test_report_requires_one_of_experiment_config_or_shipped_config() -> None:
+    import typer
+
+    import quantlab.cli as cli_module
+
+    with pytest.raises(typer.Exit) as raised:
+        cli_module.report(experiment=None, config=None, shipped_config=None)
+    assert raised.value.exit_code == 1
 
 
 def test_code_hash_changes_when_quantlab_source_changes(
@@ -749,6 +830,119 @@ def test_save_records_figure_failures_instead_of_masking_them(
     # The numeric artefacts must still be written despite the figure failure.
     assert (out / "metrics.json").is_file()
     assert (out / "equity_curve.csv").is_file()
+
+
+def test_save_records_trade_log_schema_version_in_metadata(tmp_path: Path) -> None:
+    """The trade log's schema version is not a CSV column (a raw export
+    carries no such metadata) -- it must be recoverable from the bundle's
+    `metadata.json` instead, alongside the other run-level facts."""
+    from quantlab.backtesting.runner import run_backtest_from_config
+    from quantlab.backtesting.trade_log import TRADE_LOG_SCHEMA_VERSION
+
+    data, cfg = _holdout_config()
+    result = run_backtest_from_config(data, cfg)
+    out = result.save(tmp_path / "out")
+
+    on_disk = json.loads((out / "metadata.json").read_text(encoding="utf-8"))
+    assert on_disk["trade_log_schema_version"] == TRADE_LOG_SCHEMA_VERSION == 2
+
+
+def test_save_records_signal_price_type_in_resolved_config(tmp_path: Path) -> None:
+    """resolved_config.signal_price_type must always be present and match
+    whatever the strategy was actually built with -- true whether or not
+    the YAML explicitly set strategy.signal_price_type."""
+    from quantlab.backtesting.runner import run_backtest_from_config
+
+    data, cfg = _holdout_config()
+    result = run_backtest_from_config(data, cfg)
+    out = result.save(tmp_path / "default")
+    on_disk = json.loads((out / "metadata.json").read_text(encoding="utf-8"))
+    assert on_disk["resolved_config"]["signal_price_type"] == "adjusted_close"
+
+    custom_cfg = cfg.revalidated_copy(
+        update={
+            "strategy": cfg.strategy.revalidated_copy(
+                update={"signal_price_type": "close"}
+            )
+        }
+    )
+    custom_result = run_backtest_from_config(data, custom_cfg)
+    custom_out = custom_result.save(tmp_path / "custom")
+    custom_on_disk = json.loads(
+        (custom_out / "metadata.json").read_text(encoding="utf-8")
+    )
+    assert custom_on_disk["resolved_config"]["signal_price_type"] == "close"
+
+
+def test_custom_research_question_and_hypothesis_appear_in_the_html_report() -> None:
+    """config.research_question/.hypothesis, when set, must reach the
+    rendered HTML report verbatim -- not just the standalone research_
+    summary functions in isolation."""
+    from quantlab.backtesting.runner import run_backtest_from_config
+
+    data, cfg = _holdout_config()
+    custom_cfg = cfg.revalidated_copy(
+        update={
+            "research_question": "Does this exact sentinel phrase survive?",
+            "hypothesis": "H1: sentinel survives. H0: it does not.",
+        }
+    )
+    result = run_backtest_from_config(data, custom_cfg)
+    html = result.to_html()
+    assert "Does this exact sentinel phrase survive?" in html
+    assert "H1: sentinel survives. H0: it does not." in html
+
+
+def test_output_directory_config_is_respected_by_save(tmp_path: Path) -> None:
+    """config.output.directory must be used when result.save() is called
+    with no explicit override -- an explicit call-time argument still wins."""
+    from quantlab.backtesting.runner import run_backtest_from_config
+
+    custom_dir = tmp_path / "configured_output"
+    data, cfg = _holdout_config()
+    cfg = cfg.revalidated_copy(update={"output": {"directory": str(custom_dir)}})
+    result = run_backtest_from_config(data, cfg)
+
+    out = result.save()
+    assert out == custom_dir
+    assert (out / "metrics.json").is_file()
+
+    explicit_dir = tmp_path / "explicit_override"
+    out2 = result.save(explicit_dir)
+    assert out2 == explicit_dir
+
+
+def test_output_save_toggles_skip_only_the_presentation_layer(tmp_path: Path) -> None:
+    """save_html_report=False/save_figures=False must skip only the HTML/
+    PNG rendering -- every numeric artefact stays unconditional, so
+    `quantlab report`-style regeneration can still work afterwards."""
+    from quantlab.backtesting.runner import run_backtest_from_config
+
+    data, cfg = _holdout_config()
+    cfg = cfg.revalidated_copy(
+        update={
+            "output": {
+                "directory": str(tmp_path / "out"),
+                "save_html_report": False,
+                "save_figures": False,
+            }
+        }
+    )
+    result = run_backtest_from_config(data, cfg)
+    out = result.save()
+
+    assert not (out / "report.html").exists()
+    assert (out / "figures").is_dir()
+    assert not any((out / "figures").iterdir())
+    assert (out / "trades.csv").is_file()
+    assert (out / "equity_curve.csv").is_file()
+    assert (out / "metrics.json").is_file()
+    assert (out / "metadata.json").is_file()
+
+    # A later, HTML-enabled save (e.g. `quantlab report`'s own regeneration
+    # path) must still be able to render the report from the same bundle.
+    html = result.to_html()
+    assert "<html" in html.lower()
 
 
 def test_save_clears_managed_stale_figures_but_preserves_foreign_files(
@@ -1044,7 +1238,7 @@ def test_report_command_rejects_experiment_path_traversal(
     )
 
     with pytest.raises(typer.Exit) as raised:
-        cli_module.report(experiment="../../../etc")
+        cli_module.report(experiment="../../../etc", config=None, shipped_config=None)
 
     assert raised.value.exit_code == 1
     assert any(

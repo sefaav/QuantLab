@@ -6,7 +6,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from quantlab.backtesting.benchmark import build_benchmark, cash_returns
+from quantlab.backtesting.benchmark import _align_returns, build_benchmark, cash_returns
 from quantlab.config import ExperimentConfig
 from quantlab.constants import (
     ADJUSTED_CLOSE,
@@ -67,6 +67,58 @@ def test_missing_benchmark_return_after_initial_period_raises() -> None:
 
     with pytest.raises(BacktestError, match="missing on portfolio dates"):
         build_benchmark(data, portfolio_index, benchmark_symbol="AAA")
+
+
+def test_align_returns_tolerates_a_coarser_datetime_resolution_than_the_schedule() -> (
+    None
+):
+    """Coverage gap the calendar-management research surfaced: `_align_
+    returns`'s `calendar=` branch previously had zero test coverage at all
+    (no call in this file passed `calendar=`). Guard it against a
+    lower-resolution `datetime64` benchmark index, mirroring the existing
+    `session_labels` regression test for the same class of issue."""
+    benchmark_index = pd.date_range("2024-01-02", periods=3, freq="B").astype(
+        "datetime64[ms]"
+    )
+    portfolio_index = pd.date_range("2024-01-02", periods=3, freq="B")
+    series = pd.Series([np.nan, 0.01, 0.02], index=benchmark_index)
+
+    result = _align_returns(series, portfolio_index, calendar="XNYS")
+
+    assert not result.isna().any()
+    assert result.tolist() == pytest.approx([0.0, 0.01, 0.02])
+
+
+def test_align_returns_seeds_a_leading_verified_closure_of_the_benchmark_calendar() -> (
+    None
+):
+    """BTCUSDT (24/7) trading on 2019-01-01 -- a date XNYS's own calendar
+    marks as a holiday closure, not a session -- must not raise just
+    because the benchmark has no observation for a date its own calendar
+    says isn't a session at all."""
+    portfolio_index = pd.DatetimeIndex(["2019-01-01", "2019-01-02", "2019-01-03"])
+    benchmark_index = pd.DatetimeIndex(["2019-01-02", "2019-01-03"])
+    series = pd.Series([np.nan, 0.02], index=benchmark_index)
+
+    result = _align_returns(series, portfolio_index, calendar="XNYS")
+
+    assert result.tolist() == pytest.approx([0.0, 0.0, 0.02])
+
+
+def test_align_returns_still_raises_when_a_leading_missing_date_is_not_a_closure() -> (
+    None
+):
+    """The seed above must not overreach: a leading date missing for a
+    genuine reason (not a verified closure of the benchmark's own
+    calendar) must still raise, exactly as before."""
+    # 2019-01-02 is a real XNYS trading session; the benchmark's own data
+    # simply skips it (a genuine gap, not a holiday).
+    portfolio_index = pd.DatetimeIndex(["2019-01-02", "2019-01-03", "2019-01-04"])
+    benchmark_index = pd.DatetimeIndex(["2019-01-03", "2019-01-04"])
+    series = pd.Series([np.nan, 0.02], index=benchmark_index)
+
+    with pytest.raises(BacktestError, match="missing on portfolio dates"):
+        _align_returns(series, portfolio_index, calendar="XNYS")
 
 
 def test_first_benchmark_period_is_zero() -> None:

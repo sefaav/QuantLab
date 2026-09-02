@@ -14,9 +14,11 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 import pandas as pd
 
+from quantlab.backtesting.trade_log import stop_loss_take_profit_trigger_counts
 from quantlab.logging_config import get_logger
 from quantlab.reporting import research_summary as rs
 from quantlab.reporting.charts import report_figures
+from quantlab.reporting.sections import DiagnosticsSection
 from quantlab.reporting.tables import gross_net_table, metrics_table, subperiod_table
 
 if TYPE_CHECKING:
@@ -104,7 +106,17 @@ def _finite_number(value: object) -> float | None:
 def _format_cell(value: object, column: object) -> object:
     if value is None or value is pd.NA or value is pd.NaT:
         return "n/a"
-    if isinstance(value, Real) and _finite_number(value) is None:
+    # A bool IS a `Real` (bool subclasses int in Python), but it is always
+    # finite and displayable as-is ("True"/"False") -- excluding it here
+    # from the "not finite -> n/a" fallback is a DIFFERENT concern from
+    # `_finite_number`'s own bool exclusion below (scoped to designated
+    # percent/number/integer columns only, where a stray bool genuinely
+    # should not be formatted as 0.00/1.00).
+    if (
+        isinstance(value, Real)
+        and not isinstance(value, (bool, np.bool_))
+        and _finite_number(value) is None
+    ):
         return "n/a"
     key = _normalise_label(column)
     if key not in _PERCENT_COLUMNS | _NUMBER_COLUMNS | _INTEGER_COLUMNS:
@@ -187,7 +199,37 @@ def render_html_report(
     limitations_html = "".join(
         f"<li>{html.escape(item)}</li>" for item in rs.limitations(result)
     )
-    robustness_html = _render_robustness(robustness, warnings)
+    # A strategy's own results diagnostics (e.g. pairs trading's
+    # correlation/spread/ADF section) describe whether the strategy's
+    # ASSUMPTIONS hold on this data -- distinct from Robustness, which
+    # tests whether the RESULT survives cost/parameter/regime perturbation.
+    # Split them out of the same merged dict into their own section
+    # (rendered via `_render_strategy_diagnostics`) rather than nesting a
+    # correlation table or a full-sample ADF test under "Robustness".
+    diagnostics_sections = {
+        key: value
+        for key, value in (robustness or {}).items()
+        if isinstance(value, DiagnosticsSection)
+    }
+    robustness_only = {
+        key: value
+        for key, value in (robustness or {}).items()
+        if key not in diagnostics_sections
+    }
+    strategy_diagnostics_html = _render_strategy_diagnostics(diagnostics_sections)
+    trigger_counts = stop_loss_take_profit_trigger_counts(result.trades)
+    stop_loss_take_profit_html = (
+        f"<p>Stop-loss triggered on <strong>{trigger_counts['stop_loss']}</strong> "
+        "symbol-position(s); take-profit on "
+        f"<strong>{trigger_counts['take_profit']}</strong> symbol-position(s), "
+        "counted per trade-log row -- a declared multi-symbol position "
+        "(e.g. a hedge with more than one leg) that force-flattens "
+        "contributes one row per leg, so this is not necessarily the "
+        "count of distinct stop-loss/take-profit EVENTS.</p>"
+        if trigger_counts["stop_loss"] or trigger_counts["take_profit"]
+        else ""
+    )
+    robustness_html = _render_robustness(robustness_only, warnings)
     data_quality_html = _render_data_quality(result.metadata.get("data_quality"))
     # A walk-forward OOS result's `metrics` *are* the stitched out-of-sample
     # series (see WalkForwardValidator._build_oos_result) — labelling the
@@ -265,7 +307,14 @@ def render_html_report(
     {image("exposure", "Exposure")}
     {image("cumulative_costs", "Cumulative costs")}
     {image("returns_distribution", "Return distribution")}
+    {stop_loss_take_profit_html}
   </section>
+
+  {
+        f"<section><h2>Strategy diagnostics</h2>{strategy_diagnostics_html}</section>"
+        if diagnostics_sections
+        else ""
+    }
 
   <section><h2>Robustness</h2>{robustness_html}</section>
 
@@ -328,26 +377,58 @@ def _render_sensitivity_heatmap(
     return f'<img src="{data_uri}" alt="Parameter sensitivity heatmap"/>'
 
 
+def _render_strategy_diagnostics(sections: Mapping[str, DiagnosticsSection]) -> str:
+    """Render each strategy-declared results diagnostic in its own subsection.
+
+    Kept structurally separate from :func:`_render_robustness` -- a
+    correlation, spread or full-sample ADF test describes whether the
+    STRATEGY's own assumptions hold on this data, not evidence the backtest
+    RESULT is robust to cost/parameter/regime perturbation, so it must never
+    appear under the "Robustness" heading. Dispatched purely by the type of
+    each ``robustness`` dict value (see :func:`render_html_report`), never
+    by strategy name -- a future profile's own section needs no change here.
+    """
+    parts: list[str] = []
+    for key, section in sections.items():
+        heading = str(key).replace("_", " ").title()
+        parts.append(f"<h3>{html.escape(heading)}</h3>")
+        if section.note:
+            parts.append(f"<p>{html.escape(section.note)}</p>")
+        if section.chart_data_uri:
+            parts.append(f'<img src="{section.chart_data_uri}"/>')
+        parts.append(_table_html(_format_report_table(section.table)))
+    return "".join(parts)
+
+
 def _render_robustness(
     robustness: dict[str, Any] | None, warnings: list[str] | None = None
 ) -> str:
-    """Render supplied validation artefacts or explain how to generate them."""
+    """Render supplied validation artefacts or explain how to generate them.
+
+    Never receives a `DiagnosticsSection` value -- `render_html_report()`
+    filters those into `_render_strategy_diagnostics` before calling this.
+    """
     if not robustness:
         return (
             "<p><em>No robustness evidence is attached to this run.</em></p>"
             "<ul>"
             "<li><code>quantlab walk-forward</code> — out-of-sample folds plus "
             "stress-test evidence.</li>"
-            "<li><code>quantlab.validation.parameter_sensitivity."
-            "run_parameter_sensitivity</code> — stability across parameter "
-            "choices (Python API).</li>"
-            "<li><code>quantlab.validation.bootstrap.bootstrap_returns</code> "
-            "— resampled return-path uncertainty (Python API).</li>"
-            "<li><code>quantlab.validation.robustness.monte_carlo_permutation"
-            "</code> — significance against a random-sign null (Python API).</li>"
+            "<li><code>quantlab stress-test</code> — cost/delay/universe "
+            "perturbations.</li>"
+            "<li><code>quantlab sensitivity</code> — stability across "
+            "parameter choices.</li>"
+            "<li><code>quantlab bootstrap</code> — resampled return-path "
+            "uncertainty.</li>"
+            "<li><code>quantlab permutation-test</code> — significance "
+            "against a random-sign null.</li>"
+            "<li><code>quantlab robustness</code> — runs every technique "
+            "enabled under a config's <code>robustness:</code> block in one "
+            "pass.</li>"
             "</ul>"
             "<p><em>See <code>notebooks/05_robustness_analysis.ipynb</code> for "
-            "a worked example of all four.</em></p>"
+            "a worked example, or the Python API "
+            "(<code>quantlab.validation.*</code>) to call these directly.</em></p>"
         )
     parts: list[str] = []
     for key, value in robustness.items():
@@ -360,6 +441,17 @@ def _render_robustness(
                 "low p-value is evidence against that specific null, not a "
                 "probability of future profitability.</em></p>"
             )
+        elif key == "bootstrap":
+            parts.append(
+                "<p><em>p_lower/p_upper are the boundaries of a central "
+                "percentile interval over resampled histories (width set by "
+                "robustness.bootstrap.confidence_level; 0.90 -> the 5th/95th "
+                "percentiles).</em></p>"
+            )
+            if isinstance(value, pd.DataFrame) and len(value):
+                from quantlab.reporting.tables import format_bootstrap_summary
+
+                value = format_bootstrap_summary(value)
         elif key == "sensitivity" and isinstance(value, pd.DataFrame) and len(value):
             parts.append(_render_sensitivity_heatmap(value, warnings))
         parts.append(_render_robustness_value(value))

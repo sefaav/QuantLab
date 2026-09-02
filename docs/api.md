@@ -8,7 +8,7 @@ than from private modules or names beginning with an underscore.
 | --- | --- |
 | `quantlab.config` | `ExperimentConfig` and its validated configuration models |
 | `quantlab.data` | `DataLoader`, `DataValidator`, `DataCleaner`, `ParquetStorage`, `Universe`, schema and resampling helpers |
-| `quantlab.features` | Return, momentum, volatility, mean-reversion and technical features; optional `FeaturePipeline` |
+| `quantlab.features` | Return, momentum, volatility, mean-reversion, cross-sectional and technical features; stationarity/cointegration (`adf_test`, `cointegration_test`, `hurst_exponent`), correlation (`correlation_matrix`) and pairs-trading diagnostics (`compute_pair_diagnostics`); optional `FeaturePipeline` |
 | `quantlab.strategies` | Built-in strategies, registry helpers and `BaseStrategy` |
 | `quantlab.portfolio` | Allocators, constraints, rebalancing and volatility targeting |
 | `quantlab.execution` | Commission, spread, slippage and aggregate execution models |

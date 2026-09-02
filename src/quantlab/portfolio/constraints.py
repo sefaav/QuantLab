@@ -25,6 +25,86 @@ from quantlab.portfolio.position_sizing import (
 
 
 @dataclass(frozen=True)
+class ConstraintTouch:
+    """Per-constraint provenance from :meth:`ConstraintSet.apply_with_provenance`.
+
+    ``touched`` is True at every ``(date, symbol)`` cell this constraint
+    changed by more than ``EPSILON`` at ANY point during constraint
+    resolution -- including repeated passes inside the dust-cleanup
+    fixed-point loop (a cumulative OR across every application).
+
+    ``before`` holds the weight immediately before the FIRST pass that
+    ever changed a given cell; ``after`` holds the weight immediately
+    after the LAST pass that actually changed it -- never a snapshot from
+    a later pass that left the cell untouched (its value may have moved
+    for an unrelated reason between two passes of THIS constraint, and
+    attributing that movement to this constraint would be wrong). Both
+    are used only to build human-readable reason text, never to
+    redetermine ``touched`` itself.
+
+    ``direct`` is a cumulative OR (same convention as ``touched``)
+    restricted to cells whose OWN value triggered this constraint's
+    clip/drop decision at some point, as opposed to a cell only
+    redimensioned as a downstream consequence (redistribution/rescaling
+    of the survivors). For constraints with no redistribution concept
+    (``maximum_gross_exposure``, ``maximum_leverage``,
+    ``maximum_net_exposure``, ``long_only`` -- uniform whole-row
+    rescales), ``direct == touched`` always.
+    """
+
+    touched: pd.DataFrame
+    before: pd.DataFrame
+    after: pd.DataFrame
+    direct: pd.DataFrame
+
+
+def _mark_touched(
+    touched: dict[str, ConstraintTouch] | None,
+    name: str,
+    before: pd.DataFrame,
+    after: pd.DataFrame,
+    *,
+    direct_this_pass: pd.DataFrame | None = None,
+) -> None:
+    """Record one constraint's effect, cumulatively, when tracking is on.
+
+    ``touched`` (the mask) is a cumulative OR across every application of
+    this constraint during the call. ``before`` is refreshed only the
+    first time a cell is ever touched; ``after`` is refreshed only on a
+    pass that actually retouches the cell -- a later no-op pass (e.g.
+    once the dust-cleanup loop has converged, or a pass where some OTHER
+    constraint moved this cell instead) must not overwrite an earlier,
+    informative before/after pair with an unrelated snapshot.
+
+    ``direct_this_pass``, when given, is the real (peek-based, no
+    reconstructed threshold) predicate for which cells THIS constraint's
+    own clip/drop decision fired on, at exactly this pass -- it is
+    combined with ``changed`` before being OR-ed into the cumulative
+    ``direct`` mask. ``None`` (the default) means every changed cell is
+    direct (constraints with no redistribution concept).
+    """
+    if touched is None:
+        return
+    changed = (after - before).abs() > EPSILON
+    direct_this_pass_mask = (
+        changed if direct_this_pass is None else (direct_this_pass & changed)
+    )
+    if name in touched:
+        existing = touched[name]
+        first_touch_this_pass = changed & ~existing.touched
+        touched[name] = ConstraintTouch(
+            touched=existing.touched | changed,
+            before=existing.before.where(~first_touch_this_pass, before),
+            after=existing.after.where(~changed, after),
+            direct=existing.direct | direct_this_pass_mask,
+        )
+    else:
+        touched[name] = ConstraintTouch(
+            touched=changed, before=before, after=after, direct=direct_this_pass_mask
+        )
+
+
+@dataclass(frozen=True)
 class ConstraintSet:
     """Immutable collection of optional target-portfolio constraints."""
 
@@ -70,27 +150,82 @@ class ConstraintSet:
 
     def apply(self, weights: pd.DataFrame) -> pd.DataFrame:
         """Return finite weights satisfying every configured constraint."""
+        return self._apply_impl(weights, None)
+
+    def apply_with_provenance(
+        self, weights: pd.DataFrame
+    ) -> tuple[pd.DataFrame, dict[str, ConstraintTouch]]:
+        """Same computation as :meth:`apply`, plus per-constraint provenance.
+
+        For each configured constraint, records which cells it actually
+        changed. The weight computation itself is identical to
+        :meth:`apply` -- both delegate to the same ``_apply_impl``, which
+        only records provenance when asked to. This is real provenance
+        captured directly from the actual execution, not a parallel
+        reconstruction, so it can never diverge from what ``apply()``
+        itself would have produced.
+        """
+        touched: dict[str, ConstraintTouch] = {}
+        result = self._apply_impl(weights, touched)
+        return result, touched
+
+    def _apply_impl(
+        self, weights: pd.DataFrame, touched: dict[str, ConstraintTouch] | None
+    ) -> pd.DataFrame:
         out = validate_frame(weights, name="weights").copy().astype(float)
         if self.long_only:
+            before = out
             out = out.clip(lower=0.0)
+            _mark_touched(touched, "long_only", before, out)
         if self.maximum_positions is not None:
+            before = out
             pre_drop_gross = gross_exposure(out)
-            out = _cap_positions(out, self.maximum_positions)
-            out = _redistribute_to_target(out, pre_drop_gross)
+            after_cap = _cap_positions(out, self.maximum_positions)
+            direct_this_pass = after_cap.ne(before)
+            out = _redistribute_to_target(after_cap, pre_drop_gross)
+            _mark_touched(
+                touched,
+                "maximum_positions",
+                before,
+                out,
+                direct_this_pass=direct_this_pass,
+            )
         if self.minimum_weight is not None:
+            before = out
             pre_drop_gross = gross_exposure(out)
-            out = out.where(out.abs() >= self.minimum_weight, 0.0)
-            out = _redistribute_to_target(out, pre_drop_gross)
+            after_drop = out.where(out.abs() >= self.minimum_weight, 0.0)
+            direct_this_pass = after_drop.ne(before)
+            out = _redistribute_to_target(after_drop, pre_drop_gross)
+            _mark_touched(
+                touched,
+                "minimum_weight",
+                before,
+                out,
+                direct_this_pass=direct_this_pass,
+            )
         if self.maximum_weight is not None:
+            before = out
             pre_cap_gross = gross_exposure(out)
+            after_clip = out.astype(float).clip(
+                -self.maximum_weight, self.maximum_weight
+            )
+            direct_this_pass = after_clip.ne(before)
             out = renormalize_within_cap(
                 out, target_gross=pre_cap_gross, cap=self.maximum_weight
             )
+            _mark_touched(
+                touched,
+                "maximum_weight",
+                before,
+                out,
+                direct_this_pass=direct_this_pass,
+            )
 
         pre_exposure_cap = out.copy()
-        out = self._apply_exposure_caps(out)
+        out = self._apply_exposure_caps(out, touched)
         if self.minimum_weight is not None:
-            out = self._clean_dust_to_fixed_point(out)
+            out = self._clean_dust_to_fixed_point(out, touched)
+            before = out
             out = _rescue_needless_full_liquidation(
                 out,
                 pre_exposure_cap,
@@ -100,34 +235,70 @@ class ConstraintSet:
                 maximum_leverage=self.maximum_leverage,
                 maximum_net_exposure=self.maximum_net_exposure,
             )
+            _mark_touched(touched, "minimum_weight", before, out)
         self._assert_satisfied(out)
         return out
 
-    def _apply_exposure_caps(self, weights: pd.DataFrame) -> pd.DataFrame:
+    def _apply_exposure_caps(
+        self,
+        weights: pd.DataFrame,
+        touched: dict[str, ConstraintTouch] | None = None,
+    ) -> pd.DataFrame:
         out = weights
         if self.maximum_gross_exposure is not None:
+            before = out
             out = _cap_gross(out, self.maximum_gross_exposure)
+            _mark_touched(touched, "maximum_gross_exposure", before, out)
         if self.maximum_leverage is not None:
+            before = out
             out = _cap_gross(out, self.maximum_leverage)
+            _mark_touched(touched, "maximum_leverage", before, out)
         if self.maximum_net_exposure is not None:
+            before = out
             out = _cap_net(out, self.maximum_net_exposure)
+            _mark_touched(touched, "maximum_net_exposure", before, out)
         return out
 
-    def _clean_dust_to_fixed_point(self, weights: pd.DataFrame) -> pd.DataFrame:
+    def _clean_dust_to_fixed_point(
+        self,
+        weights: pd.DataFrame,
+        touched: dict[str, ConstraintTouch] | None = None,
+    ) -> pd.DataFrame:
         """Repeat dust removal because exposure caps can create new dust."""
         assert self.minimum_weight is not None
         out = weights
         for _ in range(max(out.shape[1] + 1, 1)):
             before = out.copy()
+            step_before = out
             pre_drop_gross = gross_exposure(out)
-            out = out.where(out.abs() >= self.minimum_weight, 0.0)
-            out = _redistribute_to_target(out, pre_drop_gross)
+            after_drop = out.where(out.abs() >= self.minimum_weight, 0.0)
+            direct_this_pass = after_drop.ne(step_before)
+            out = _redistribute_to_target(after_drop, pre_drop_gross)
+            _mark_touched(
+                touched,
+                "minimum_weight",
+                step_before,
+                out,
+                direct_this_pass=direct_this_pass,
+            )
             if self.maximum_weight is not None:
+                step_before = out
                 pre_cap_gross = gross_exposure(out)
+                after_clip = out.astype(float).clip(
+                    -self.maximum_weight, self.maximum_weight
+                )
+                direct_this_pass = after_clip.ne(step_before)
                 out = renormalize_within_cap(
                     out, target_gross=pre_cap_gross, cap=self.maximum_weight
                 )
-            out = self._apply_exposure_caps(out)
+                _mark_touched(
+                    touched,
+                    "maximum_weight",
+                    step_before,
+                    out,
+                    direct_this_pass=direct_this_pass,
+                )
+            out = self._apply_exposure_caps(out, touched)
             if np.allclose(out.to_numpy(), before.to_numpy(), atol=1e-10, rtol=0.0):
                 return out
         raise InvalidConfigurationError(

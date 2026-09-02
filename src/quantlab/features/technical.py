@@ -61,6 +61,42 @@ def rolling_min(prices: PandasT, window: int) -> PandasT:
     return validated.rolling(valid_window, min_periods=valid_window).min()
 
 
+def efficiency_ratio(prices: PandasT, window: int) -> PandasT:
+    """Kaufman's Efficiency Ratio: net directional move over total path length.
+
+    ``|P_t - P_{t-window}| / sum(|ΔP_i|)`` over the trailing window, in
+    ``[0, 1]``. Near 1 means price moved efficiently in one direction (a
+    clean trend); near 0 means the same net move took a much longer,
+    choppier path (noise dominating direction -- the classic failure mode
+    for a trend-following signal). A flat window (net move and path
+    length both zero) is neutral at ``0.5`` rather than an undefined
+    division by zero.
+    """
+    validated = numeric_pandas(prices, name="prices", strictly_positive=True)
+    length = positive_int(window, name="window")
+    net_move = (validated - validated.shift(length)).abs()
+    path_length = validated.diff().abs().rolling(length, min_periods=length).sum()
+    if isinstance(validated, pd.Series):
+        if not isinstance(net_move, pd.Series) or not isinstance(
+            path_length, pd.Series
+        ):
+            raise TypeError(
+                "Efficiency ratio inputs produced incompatible pandas objects."
+            )
+        ratio = net_move / path_length.where(path_length.abs() > EPSILON)
+        result = ratio.mask(path_length.abs() <= EPSILON, 0.5)
+    else:
+        if not isinstance(net_move, pd.DataFrame) or not isinstance(
+            path_length, pd.DataFrame
+        ):
+            raise TypeError(
+                "Efficiency ratio inputs produced incompatible pandas objects."
+            )
+        ratio = net_move / path_length.where(path_length.abs() > EPSILON)
+        result = ratio.mask(path_length.abs() <= EPSILON, 0.5)
+    return cast(PandasT, result)  # type: ignore[redundant-cast]
+
+
 def donchian_position(prices: PandasT, window: int) -> PandasT:
     """Return the price position in its trailing channel.
 

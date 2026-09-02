@@ -1,8 +1,12 @@
 """Rebalancing schedules and stateful turnover limits.
 
 Targets are sampled on rebalance dates and represented as constant portfolio
-weights between them. This vectorised approximation does not model weight
-drift caused by relative asset-price moves between rebalances.
+weights between them -- this module's own output is a decision-timeline
+step function. Real, price-driven weight drift between genuine trades is
+modeled separately and downstream, on the EXECUTED timeline, by
+:func:`quantlab.backtesting.accounting.apply_weight_drift` (gated by
+``PortfolioConfig.model_weight_drift``); this module's own output is
+identical regardless of whether that gate is on or off.
 
 Timing convention: every function in this module produces *decided* weights,
 not executed ones -- including a row where a closed symbol's pending target
@@ -20,6 +24,9 @@ on day T+1 -- never on day T itself.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+from typing import Literal, overload
+
 import numpy as np
 import pandas as pd
 from pandas.api.types import is_bool_dtype
@@ -34,6 +41,29 @@ from quantlab.portfolio._validation import (
     validate_datetime_index,
     validate_frame,
 )
+
+
+@dataclass(frozen=True)
+class TurnoverProvenance:
+    """Cell-level, real provenance from a turnover-capped rebalance.
+
+    ``turnover_actively_limited`` is True where the turnover budget itself
+    bound this row's move for that cell. ``turnover_touched`` is the
+    broader, *episode-scoped* provenance -- also True on a later row that
+    is still catching up a debt created by an earlier turnover-limited
+    move toward the SAME upstream decision (see ``episode_id`` on
+    :func:`cap_turnover`/:func:`rebalance_and_cap_turnover`), even when
+    that later row is no longer itself actively binding. ``tradability_
+    touched``/``tradability_compliance_limited`` are always all-``False``
+    for :func:`cap_turnover` (no tradability concept); populated for
+    :func:`_rebalance_tradability_aware`.
+    """
+
+    turnover_actively_limited: pd.DataFrame
+    turnover_touched: pd.DataFrame
+    tradability_touched: pd.DataFrame
+    tradability_compliance_limited: pd.DataFrame
+
 
 _PERIOD_ALIAS = {
     RebalanceFrequency.WEEKLY: "W",
@@ -128,13 +158,39 @@ def compute_turnover(held_weights: pd.DataFrame) -> pd.Series:
     return (validated - previous).abs().sum(axis=1)
 
 
+@overload
 def rebalance_and_cap_turnover(
     target_weights: pd.DataFrame,
     portfolio_config: PortfolioConfig,
     *,
     tradable: pd.DataFrame | None = None,
     calendar: str | None = None,
-) -> pd.DataFrame:
+    episode_id: pd.DataFrame | None = None,
+    return_provenance: Literal[False] = False,
+) -> pd.DataFrame: ...
+
+
+@overload
+def rebalance_and_cap_turnover(
+    target_weights: pd.DataFrame,
+    portfolio_config: PortfolioConfig,
+    *,
+    tradable: pd.DataFrame | None = None,
+    calendar: str | None = None,
+    episode_id: pd.DataFrame | None = None,
+    return_provenance: Literal[True],
+) -> tuple[pd.DataFrame, TurnoverProvenance]: ...
+
+
+def rebalance_and_cap_turnover(
+    target_weights: pd.DataFrame,
+    portfolio_config: PortfolioConfig,
+    *,
+    tradable: pd.DataFrame | None = None,
+    calendar: str | None = None,
+    episode_id: pd.DataFrame | None = None,
+    return_provenance: bool = False,
+) -> pd.DataFrame | tuple[pd.DataFrame, TurnoverProvenance]:
     """Apply the stateful schedule and turnover cap over one continuous index.
 
     Minimum-weight and position-count constraints apply to targets upstream.
@@ -161,17 +217,40 @@ def rebalance_and_cap_turnover(
             real trading sessions instead of raw UTC dates. Only meaningful
             when every instrument shares one calendar; omit for a mixed
             universe (see :func:`rebalance_dates`).
+        episode_id: Forwarded to :func:`cap_turnover`/the tradability-aware
+            path -- see :func:`cap_turnover`'s own docstring.
+        return_provenance: Forwarded the same way -- see :func:`cap_turnover`.
     """
     if tradable is not None:
+        # Branched (rather than forwarding the plain `bool` variable
+        # directly) so mypy can select the correct @overload -- a
+        # non-literal bool cannot match either `Literal[True]`/
+        # `Literal[False]` overload variant.
+        if return_provenance:
+            return _rebalance_tradability_aware(
+                target_weights,
+                portfolio_config,
+                tradable,
+                calendar=calendar,
+                episode_id=episode_id,
+                return_provenance=True,
+            )
         return _rebalance_tradability_aware(
-            target_weights, portfolio_config, tradable, calendar=calendar
+            target_weights,
+            portfolio_config,
+            tradable,
+            calendar=calendar,
+            episode_id=episode_id,
+            return_provenance=False,
         )
 
     held = apply_rebalancing(
         target_weights, portfolio_config.rebalance_frequency, calendar=calendar
     )
     if portfolio_config.maximum_turnover is None:
-        return held
+        if not return_provenance:
+            return held
+        return held, _no_provenance(held)
 
     gross_caps = [portfolio_config.maximum_leverage]
     if portfolio_config.maximum_gross_exposure is not None:
@@ -182,6 +261,18 @@ def rebalance_and_cap_turnover(
         portfolio_config.rebalance_frequency,
         calendar=calendar,
     )
+    if return_provenance:
+        return cap_turnover(
+            held,
+            portfolio_config.maximum_turnover,
+            rebalance_index=dates,
+            maximum_weight=portfolio_config.maximum_weight,
+            maximum_gross_exposure=effective_gross_cap,
+            maximum_net_exposure=portfolio_config.maximum_net_exposure,
+            long_only=portfolio_config.long_only,
+            episode_id=episode_id,
+            return_provenance=True,
+        )
     return cap_turnover(
         held,
         portfolio_config.maximum_turnover,
@@ -190,7 +281,39 @@ def rebalance_and_cap_turnover(
         maximum_gross_exposure=effective_gross_cap,
         maximum_net_exposure=portfolio_config.maximum_net_exposure,
         long_only=portfolio_config.long_only,
+        episode_id=episode_id,
+        return_provenance=False,
     )
+
+
+@overload
+def cap_turnover(
+    held_weights: pd.DataFrame,
+    maximum_turnover: float,
+    *,
+    rebalance_index: pd.DatetimeIndex | None = None,
+    maximum_weight: float | None = None,
+    maximum_gross_exposure: float | None = None,
+    maximum_net_exposure: float | None = None,
+    long_only: bool = False,
+    episode_id: pd.DataFrame | None = None,
+    return_provenance: Literal[False] = False,
+) -> pd.DataFrame: ...
+
+
+@overload
+def cap_turnover(
+    held_weights: pd.DataFrame,
+    maximum_turnover: float,
+    *,
+    rebalance_index: pd.DatetimeIndex | None = None,
+    maximum_weight: float | None = None,
+    maximum_gross_exposure: float | None = None,
+    maximum_net_exposure: float | None = None,
+    long_only: bool = False,
+    episode_id: pd.DataFrame | None = None,
+    return_provenance: Literal[True],
+) -> tuple[pd.DataFrame, TurnoverProvenance]: ...
 
 
 def cap_turnover(
@@ -202,13 +325,46 @@ def cap_turnover(
     maximum_gross_exposure: float | None = None,
     maximum_net_exposure: float | None = None,
     long_only: bool = False,
-) -> pd.DataFrame:
+    episode_id: pd.DataFrame | None = None,
+    return_provenance: bool = False,
+) -> pd.DataFrame | tuple[pd.DataFrame, TurnoverProvenance]:
     """Partially move toward each scheduled target within an L1 budget.
 
     The result is a straight-line interpolation from the previous holding to
     an already-compliant target. Per-asset, gross, net and long-only bounds are
     convex, so compliant endpoints keep every intermediate point compliant.
     Cardinality and minimum-position-size constraints remain target-only.
+
+    Args:
+        held_weights: Scheduled targets to move toward, one row per date
+            (constant between rebalance dates -- see :func:`apply_rebalancing`).
+        maximum_turnover: Maximum L1 weight change allowed on any single row
+            (a rebalance whose full target exceeds this lands partially and
+            keeps closing the gap over subsequent rows).
+        rebalance_index: Dates on which a new target is actually chased;
+            every other date holds the previous value. ``None`` treats
+            every date as a rebalance date.
+        maximum_weight: Optional per-asset cap, enforced on the target
+            (upstream) and therefore on every intermediate point.
+        maximum_gross_exposure: Optional gross exposure cap, same convexity
+            argument.
+        maximum_net_exposure: Optional net exposure cap, same convexity
+            argument.
+        long_only: When True, rejects a target with any negative weight.
+        episode_id: Required when ``return_provenance`` is True. A ``dates
+            x symbols`` integer frame identifying, per cell, which upstream
+            decision produced the target currently being chased -- two
+            cells sharing the same value are the SAME still-unresolved
+            decision, even if the target happens to repeat a prior numeric
+            value; a different value always means a genuinely different
+            upstream decision. Built by the caller (see ``engine.py``),
+            never reconstructed here from the target's own numeric value
+            (which cannot tell two decisions with the same target apart).
+        return_provenance: When True, also return a :class:`TurnoverProvenance`
+            with real, cell-level attribution of which trades were caused
+            (directly or as an episode-scoped catch-up) by the turnover
+            cap. Does not affect the computed weights in any way -- the
+            numeric branch below is identical whether or not this is set.
     """
     validated = validate_frame(held_weights, name="held_weights")
     turnover_cap = finite_real(maximum_turnover, name="maximum_turnover", minimum=0.0)
@@ -224,6 +380,27 @@ def cap_turnover(
     row_count, column_count = targets.shape
     output = np.zeros((row_count, column_count), dtype=float)
     previous = np.zeros(column_count, dtype=float)
+
+    # Always bound with cheap placeholders, even though they are only ever
+    # read (below and by the caller) under `if return_provenance:` -- the
+    # same unchanged flag that guards their real assignment just below. A
+    # static analyzer cannot follow "guarded by the same boolean flag"
+    # across the loop in between; this changes no behaviour.
+    episode_values = np.empty((row_count, column_count), dtype=float)
+    pending_episode_id = np.full(column_count, -1.0)
+    actively_limited_out = np.zeros((row_count, column_count), dtype=bool)
+    touched_out = np.zeros((row_count, column_count), dtype=bool)
+    if return_provenance:
+        if episode_id is None:
+            raise BacktestError(
+                "episode_id is required when return_provenance is True."
+            )
+        episode_values = (
+            validate_frame(episode_id, name="episode_id")
+            .reindex(index=validated.index, columns=validated.columns)
+            .to_numpy(dtype=float)
+        )
+
     for row_number in range(row_count):
         if not is_rebalance_date[row_number]:
             output[row_number] = previous
@@ -243,9 +420,50 @@ def cap_turnover(
             current = target
         else:
             current = previous + (turnover_cap / requested_turnover) * change
+        if return_provenance:
+            row_actively_limited = requested_turnover > turnover_cap + EPSILON
+            changed_this_row = np.abs(change) > EPSILON
+            generation = episode_values[row_number]
+            debt_still_relevant = (pending_episode_id != -1.0) & (
+                pending_episode_id == generation
+            )
+            actively_limited_out[row_number] = changed_this_row & row_actively_limited
+            touched_out[row_number] = changed_this_row & (
+                row_actively_limited | debt_still_relevant
+            )
+            still_outstanding = np.abs(current - target) > EPSILON
+            pending_episode_id = np.where(still_outstanding, generation, -1.0)
         output[row_number] = current
         previous = current
-    return pd.DataFrame(output, index=validated.index, columns=validated.columns)
+    result = pd.DataFrame(output, index=validated.index, columns=validated.columns)
+    if not return_provenance:
+        return result
+    provenance = TurnoverProvenance(
+        turnover_actively_limited=pd.DataFrame(
+            actively_limited_out, index=validated.index, columns=validated.columns
+        ),
+        turnover_touched=pd.DataFrame(
+            touched_out, index=validated.index, columns=validated.columns
+        ),
+        tradability_touched=pd.DataFrame(
+            False, index=validated.index, columns=validated.columns
+        ),
+        tradability_compliance_limited=pd.DataFrame(
+            False, index=validated.index, columns=validated.columns
+        ),
+    )
+    return result, provenance
+
+
+def _no_provenance(frame: pd.DataFrame) -> TurnoverProvenance:
+    """All-``False`` provenance for a path where nothing can be attributed."""
+    empty = pd.DataFrame(False, index=frame.index, columns=frame.columns)
+    return TurnoverProvenance(
+        turnover_actively_limited=empty,
+        turnover_touched=empty,
+        tradability_touched=empty,
+        tradability_compliance_limited=empty,
+    )
 
 
 def _compliance_violations(
@@ -376,13 +594,39 @@ def _assert_holdings_compliant(
         )
 
 
+@overload
 def _rebalance_tradability_aware(
     target_weights: pd.DataFrame,
     portfolio_config: PortfolioConfig,
     tradable: pd.DataFrame,
     *,
     calendar: str | None = None,
-) -> pd.DataFrame:
+    episode_id: pd.DataFrame | None = None,
+    return_provenance: Literal[False] = False,
+) -> pd.DataFrame: ...
+
+
+@overload
+def _rebalance_tradability_aware(
+    target_weights: pd.DataFrame,
+    portfolio_config: PortfolioConfig,
+    tradable: pd.DataFrame,
+    *,
+    calendar: str | None = None,
+    episode_id: pd.DataFrame | None = None,
+    return_provenance: Literal[True],
+) -> tuple[pd.DataFrame, TurnoverProvenance]: ...
+
+
+def _rebalance_tradability_aware(
+    target_weights: pd.DataFrame,
+    portfolio_config: PortfolioConfig,
+    tradable: pd.DataFrame,
+    *,
+    calendar: str | None = None,
+    episode_id: pd.DataFrame | None = None,
+    return_provenance: bool = False,
+) -> pd.DataFrame | tuple[pd.DataFrame, TurnoverProvenance]:
     """Rebalance while respecting per-symbol tradability.
 
     A symbol that is closed on a rebalance date never trades that date; its
@@ -391,6 +635,8 @@ def _rebalance_tradability_aware(
     executed — even if that takes several sessions under a turnover cap. A
     symbol that is always tradable is completely unaffected: its cadence
     (rebalance-date-only catch-up) is byte-identical to :func:`cap_turnover`.
+
+    See :func:`cap_turnover` for ``episode_id``/``return_provenance``.
     """
     validated = validate_frame(
         target_weights, name="target_weights", require_datetime_index=True
@@ -455,8 +701,33 @@ def _rebalance_tradability_aware(
     pending_target = np.zeros(column_count, dtype=float)
     pending_due_to_closure = np.zeros(column_count, dtype=bool)
 
+    # Always bound with cheap placeholders, even though they are only ever
+    # read (below and by the caller) under `if return_provenance:` -- the
+    # same unchanged flag that guards their real assignment. A static
+    # analyzer cannot follow "guarded by the same boolean flag" across the
+    # loop in between; this changes no behaviour.
+    episode_values = np.empty((row_count, column_count), dtype=float)
+    pending_turnover_episode_id = np.full(column_count, -1.0)
+    actively_limited_out = np.zeros((row_count, column_count), dtype=bool)
+    turnover_touched_out = np.zeros((row_count, column_count), dtype=bool)
+    tradability_touched_out = np.zeros((row_count, column_count), dtype=bool)
+    compliance_limited_out = np.zeros((row_count, column_count), dtype=bool)
+    pending_before = np.zeros(column_count, dtype=bool)
+    if return_provenance:
+        if episode_id is None:
+            raise BacktestError(
+                "episode_id is required when return_provenance is True."
+            )
+        episode_values = (
+            validate_frame(episode_id, name="episode_id")
+            .reindex(index=validated.index, columns=validated.columns)
+            .to_numpy(dtype=float)
+        )
+
     for row_number in range(row_count):
         row_tradable = tradable_np[row_number]
+        if return_provenance:
+            pending_before = pending_due_to_closure.copy()
         if is_rebalance_date[row_number]:
             target_row = targets[row_number]
             _validate_target_row_compliant(
@@ -510,9 +781,58 @@ def _rebalance_tradability_aware(
             pending_due_to_closure | (eligible & unresolved & compliance_limited)
         ) & unresolved
 
+        if return_provenance:
+            changed_this_row = np.abs(change) > EPSILON
+            # tradability: this row's move is (at least partly) a catch-up
+            # of a delta previously blocked by a closure (pending_before),
+            # or a feasibility limit reached only because another column
+            # stayed frozen by a closure (compliance_limited, proven in
+            # _max_feasible_fraction's own docstring to be a tradability
+            # artifact, never a turnover-budget one).
+            tradability_touched_out[row_number] = changed_this_row & (
+                pending_before | compliance_limited
+            )
+            compliance_limited_out[row_number] = changed_this_row & compliance_limited
+            # turnover: independent of tradability, scoped to the same
+            # episode-id convention as cap_turnover. `~pending_before`
+            # avoids double-counting a cell whose shortfall this row is
+            # already explained by tradability's own domain.
+            generation = episode_values[row_number]
+            debt_still_relevant = (
+                (pending_turnover_episode_id != -1.0)
+                & (pending_turnover_episode_id == generation)
+                & ~pending_before
+            )
+            row_turnover_limited = fraction_from_turnover < 1.0 - EPSILON
+            actively_limited_out[row_number] = changed_this_row & row_turnover_limited
+            turnover_touched_out[row_number] = changed_this_row & (
+                row_turnover_limited | debt_still_relevant
+            )
+            still_outstanding_turnover = eligible & unresolved
+            pending_turnover_episode_id = np.where(
+                still_outstanding_turnover, generation, -1.0
+            )
+
         output[row_number] = current
         previous = current
-    return pd.DataFrame(output, index=validated.index, columns=validated.columns)
+    result = pd.DataFrame(output, index=validated.index, columns=validated.columns)
+    if not return_provenance:
+        return result
+    provenance = TurnoverProvenance(
+        turnover_actively_limited=pd.DataFrame(
+            actively_limited_out, index=validated.index, columns=validated.columns
+        ),
+        turnover_touched=pd.DataFrame(
+            turnover_touched_out, index=validated.index, columns=validated.columns
+        ),
+        tradability_touched=pd.DataFrame(
+            tradability_touched_out, index=validated.index, columns=validated.columns
+        ),
+        tradability_compliance_limited=pd.DataFrame(
+            compliance_limited_out, index=validated.index, columns=validated.columns
+        ),
+    )
+    return result, provenance
 
 
 def _rebalance_mask(

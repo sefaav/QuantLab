@@ -8,6 +8,7 @@ from quantlab.reporting.charts import (
     save_figures,
 )
 from quantlab.reporting.html_report import render_html_report
+from quantlab.reporting.sections import DiagnosticsSection
 from quantlab.reporting.tables import (
     gross_net_table,
     metrics_table,
@@ -17,6 +18,7 @@ from quantlab.reporting.tables import (
 )
 
 __all__ = [
+    "DiagnosticsSection",
     "equity_and_drawdown_figure",
     "gross_net_table",
     "metrics_table",

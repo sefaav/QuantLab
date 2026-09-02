@@ -23,6 +23,7 @@ from quantlab.data.base import price_matrix, volume_matrix
 from quantlab.data.calendar import is_247, uniform_calendar
 from quantlab.data.validator import DataQualityReport
 from quantlab.execution.execution_model import ExecutionModel
+from quantlab.features.native_calendar import compute_native_then_align
 from quantlab.portfolio.allocator import PortfolioAllocator, build_allocator
 from quantlab.strategies.base import (
     BaseStrategy,
@@ -58,12 +59,16 @@ def build_strategy_from_config(config: ExperimentConfig) -> BaseStrategy:
     """Instantiate the configured strategy with its parameter dict.
 
     Injects the experiment's annualisation factor when the strategy accepts
-    ``periods_per_year`` and the YAML does not override it.
+    ``periods_per_year`` and the YAML does not override it, and likewise
+    injects ``strategy.signal_price_type`` under the ``price_type`` keyword
+    every built-in strategy accepts.
     """
     parameters = dict(config.strategy_parameters)
     accepted = strategy_parameter_names(config.strategy_name)
     if "periods_per_year" in accepted and "periods_per_year" not in parameters:
         parameters["periods_per_year"] = config.periods_per_year
+    if "price_type" in accepted and "price_type" not in parameters:
+        parameters["price_type"] = config.strategy.signal_price_type
     return build_strategy(config.strategy_name, parameters)
 
 
@@ -77,8 +82,16 @@ def build_execution_from_config(
     frequency and market calendar determine the bars per day; an explicit
     metrics annualisation override does not alter this physical conversion.
 
-    When instruments trade on different calendars, this window falls back to
-    the equity (252-day, non-24/7) convention — a documented, accepted
+    The window's CONTENT is computed on each symbol's own native calendar
+    (see :func:`quantlab.features.native_calendar.compute_native_then_
+    align`): a closure-padded row (e.g. a session-bound equity's weekend
+    sharing the timeline with an always-open crypto instrument) never
+    dilutes that symbol's own trailing-volume estimate. The window's SIZE
+    in bars is a separate, smaller approximation that remains: when
+    instruments trade on different calendars, there is no single "bars per
+    day" that is simultaneously correct for every symbol sharing one
+    ``.rolling(window)`` call, so the bar count itself still falls back to
+    the equity (252-day, non-24/7) convention -- a documented, accepted
     approximation, since it only sizes a nominal liquidity window for
     volume-based slippage rather than multiplying directly into reported
     metrics the way ``periods_per_year`` does.
@@ -102,8 +115,17 @@ def build_execution_from_config(
         )
         bars_per_day = frequency_table[str(config.frequency)] / days_per_year
         window = max(1, round(21 * bars_per_day))
+        symbol_calendars = {
+            instrument.symbol: instrument.calendar
+            for instrument in config.data.instruments
+        }
         adv = (
-            bar_dollar_volume.rolling(window, min_periods=1).mean().shift(1)
+            compute_native_then_align(
+                lambda v: v.rolling(window, min_periods=1).mean(),
+                bar_dollar_volume,
+                symbol_calendars,
+                pd.DatetimeIndex(bar_dollar_volume.index),
+            ).shift(1)
             * bars_per_day
         )
     return ExecutionModel.from_config(config.execution, average_daily_volume=adv)

@@ -61,6 +61,13 @@ def boolean(value: object, *, name: str) -> bool:
     return bool(value)
 
 
+def choice(value: object, *, name: str, options: frozenset[str]) -> str:
+    """Return a string restricted to a fixed set of accepted values."""
+    if not isinstance(value, str) or value not in options:
+        raise ValueError(f"{name} must be one of {sorted(options)}, got {value!r}.")
+    return value
+
+
 def numeric_pandas(
     data: PandasT,
     *,

@@ -67,11 +67,11 @@ def test_known_strategy_parameters_still_accepted() -> None:
             },
             "strategy": {
                 "name": "mean_reversion",
-                "parameters": {"lookback_period": 20, "entry_zscore": 2.0},
+                "parameters": {"lookback_period": 20, "entry_threshold": 2.0},
             },
         }
     )
-    assert cfg.strategy.parameters == {"lookback_period": 20, "entry_zscore": 2.0}
+    assert cfg.strategy.parameters == {"lookback_period": 20, "entry_threshold": 2.0}
 
 
 def test_var_keyword_catch_all_does_not_admit_bogus_parameters() -> None:
@@ -194,8 +194,8 @@ def test_time_series_momentum_unknown_signal_scaling_rejected() -> None:
 
 
 def test_int_accepted_for_float_strategy_parameter() -> None:
-    """`entry_zscore: 2` (an int) is semantically identical to `2.0` and
-    must not be rejected just because the annotation says `float`."""
+    """`entry_threshold: 2` (an int) is semantically identical to `2.0`
+    and must not be rejected just because the annotation says `float`."""
     cfg = ExperimentConfig.from_dict(
         {
             "experiment_name": "x",
@@ -208,20 +208,28 @@ def test_int_accepted_for_float_strategy_parameter() -> None:
             },
             "strategy": {
                 "name": "mean_reversion",
-                "parameters": {"entry_zscore": 2, "exit_zscore": 0.5},
+                "parameters": {"entry_threshold": 2, "exit_threshold": 0.5},
             },
         }
     )
-    assert cfg.strategy.parameters["entry_zscore"] == 2
+    assert cfg.strategy.parameters["entry_threshold"] == 2
 
 
-def test_any_annotated_custom_strategy_parameter_does_not_crash() -> None:
-
+def test_any_annotated_custom_strategy_parameter_does_not_crash(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import quantlab.strategies.base as strategy_base
     from quantlab.strategies.base import (
         BaseStrategy,
         register_strategy,
         validate_strategy_parameters,
     )
+
+    # Registering a strategy mutates the module-level global registry --
+    # isolate it to this test (matching test_strategies_hardening.py's own
+    # pattern) so `any_param_test` never leaks into another test's own
+    # `available_strategies()`/`available_profiles()` check.
+    monkeypatch.setattr(strategy_base, "_REGISTRY", dict(strategy_base._REGISTRY))
 
     @register_strategy("any_param_test")
     class _AnyParamStrategy(BaseStrategy):
@@ -321,7 +329,7 @@ def test_mean_reversion_stop_below_entry_rejected() -> None:
     with pytest.raises(InvalidConfigurationError):
         _try_strategy(
             "mean_reversion",
-            {"entry_zscore": 2.0, "exit_zscore": 0.5, "stop_zscore": 1.0},
+            {"entry_threshold": 2.0, "exit_threshold": 0.5, "stop_threshold": 1.0},
         )
 
 
@@ -334,8 +342,8 @@ def test_pairs_trading_entry_below_exit_rejected() -> None:
             {
                 "symbol_a": "AAA",
                 "symbol_b": "BBB",
-                "entry_zscore": 0.5,
-                "exit_zscore": 2.0,
+                "entry_threshold": 0.5,
+                "exit_threshold": 2.0,
             },
         )
 
@@ -347,9 +355,9 @@ def test_pairs_trading_stop_below_entry_rejected() -> None:
             {
                 "symbol_a": "AAA",
                 "symbol_b": "BBB",
-                "entry_zscore": 2.0,
-                "exit_zscore": 0.5,
-                "stop_zscore": 1.0,
+                "entry_threshold": 2.0,
+                "exit_threshold": 0.5,
+                "stop_threshold": 1.0,
             },
         )
 
@@ -362,28 +370,30 @@ def test_pairs_trading_zero_formation_window_rejected() -> None:
         )
 
 
-def test_pairs_trading_zero_zscore_window_rejected() -> None:
+def test_pairs_trading_zero_indicator_window_rejected() -> None:
     with pytest.raises(InvalidConfigurationError):
         _try_strategy(
             "pairs_trading",
-            {"symbol_a": "AAA", "symbol_b": "BBB", "zscore_window": 0},
+            {"symbol_a": "AAA", "symbol_b": "BBB", "indicator_window": 0},
         )
 
 
-def test_mean_reversion_negative_zscore_rejected() -> None:
+def test_mean_reversion_negative_threshold_rejected() -> None:
     with pytest.raises(InvalidConfigurationError):
-        _try_strategy("mean_reversion", {"entry_zscore": -1.0, "exit_zscore": -2.0})
+        _try_strategy(
+            "mean_reversion", {"entry_threshold": -1.0, "exit_threshold": -2.0}
+        )
 
 
-def test_pairs_trading_negative_zscore_rejected() -> None:
+def test_pairs_trading_negative_threshold_rejected() -> None:
     with pytest.raises(InvalidConfigurationError):
         _try_strategy(
             "pairs_trading",
             {
                 "symbol_a": "AAA",
                 "symbol_b": "BBB",
-                "entry_zscore": -1.0,
-                "exit_zscore": -2.0,
+                "entry_threshold": -1.0,
+                "exit_threshold": -2.0,
             },
         )
 
@@ -420,9 +430,32 @@ def test_time_series_momentum_continuous_scaling_small_lookback_works() -> None:
     assert signals.shape == (100, 1)
 
 
-def test_cross_sectional_momentum_non_binary_signal_scaling_rejected() -> None:
+def test_cross_sectional_momentum_continuous_signal_scaling_accepted() -> None:
+    config = _try_strategy(
+        "cross_sectional_momentum",
+        {"signal_scaling": "continuous"},
+        portfolio={"allocator": "signal_proportional"},
+    )
+    assert config.strategy.parameters["signal_scaling"] == "continuous"
+
+
+def test_cross_sectional_momentum_continuous_scaling_rejects_equal_weight() -> None:
+    """Mirrors time_series_momentum's identical guard: equal_weight discards
+    signal magnitude (np.sign only), silently degenerating continuous
+    scaling to binary -- must be rejected at config load, not silently
+    accepted."""
     with pytest.raises(InvalidConfigurationError):
         _try_strategy("cross_sectional_momentum", {"signal_scaling": "continuous"})
+
+
+def test_cross_sectional_momentum_volatility_adjusted_signal_scaling_rejected() -> None:
+    """`volatility_adjusted` is a real signal_scaling value, but only for
+    `time_series_momentum` -- cross_sectional_momentum only accepts
+    'binary'/'continuous'."""
+    with pytest.raises(InvalidConfigurationError):
+        _try_strategy(
+            "cross_sectional_momentum", {"signal_scaling": "volatility_adjusted"}
+        )
 
 
 def test_time_series_momentum_continuous_scaling_needs_lookback_ge_2() -> None:
@@ -450,19 +483,24 @@ def test_cross_sectional_momentum_zero_top_fraction_accepted_for_short_only() ->
     assert config.strategy.parameters["top_fraction"] == 0.0
 
 
-def test_mean_reversion_zero_entry_zscore_rejected_with_clear_message() -> None:
-    with pytest.raises(InvalidConfigurationError, match=r"entry_zscore must be > 0\.0"):
-        _try_strategy("mean_reversion", {"entry_zscore": 0.0, "exit_zscore": -0.5})
+def test_mean_reversion_zero_entry_threshold_rejected_with_clear_message() -> None:
+    with pytest.raises(
+        InvalidConfigurationError, match=r"entry_threshold must be > 0\.0"
+    ):
+        _try_strategy(
+            "mean_reversion", {"entry_threshold": 0.0, "exit_threshold": -0.5}
+        )
 
 
-def test_pairs_trading_zero_entry_zscore_rejected_with_clear_message() -> None:
-    """See `test_mean_reversion_zero_entry_zscore_rejected_with_clear_message`
-    — `pairs_trading` walks the same z-score state machine and must give
-    the same direct error naming `entry_zscore`."""
-    with pytest.raises(InvalidConfigurationError, match=r"entry_zscore must be > 0\.0"):
+def test_pairs_trading_zero_entry_threshold_rejected_with_clear_message() -> None:
+    """`pairs_trading` walks the same state machine as mean_reversion and
+    must give the same direct error naming `entry_threshold`."""
+    with pytest.raises(
+        InvalidConfigurationError, match=r"entry_threshold must be > 0\.0"
+    ):
         _try_strategy(
             "pairs_trading",
-            {"symbol_a": "AAA", "symbol_b": "BBB", "entry_zscore": 0.0},
+            {"symbol_a": "AAA", "symbol_b": "BBB", "entry_threshold": 0.0},
         )
 
 

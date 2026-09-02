@@ -2,8 +2,9 @@
 
 QuantLab is a research and education platform. It is designed to make its own
 limitations visible rather than hide them — every generated report includes
-this list automatically. Read this before drawing conclusions from any
-result.
+an automatically generated limitations section (see `research_summary.
+STANDARD_LIMITATIONS`); this page provides the more complete, project-level
+discussion. Read this before drawing conclusions from any result.
 
 ## Data
 
@@ -15,47 +16,60 @@ result.
   them implicitly assume today's constituents existed throughout the period,
   which can overstate results.
 - **Single venue** for crypto data (Binance): no consolidated tape.
-- **Per-instrument calendars are an approximation, not a live feed**: each
+- **Multi-calendar support is an approximation, not a live feed.** Each
   instrument declares its own source and calendar (any name recognised by
-  `pandas_market_calendars`, or `24/7`), and a mixed-calendar portfolio (e.g.
-  US equities alongside crypto) is supported at daily frequency — closed
+  `pandas_market_calendars`, or `24/7`); a mixed-calendar portfolio (e.g. US
+  equities alongside crypto) is supported at daily frequency — closed
   sessions are detected per symbol, valued at the last known price with zero
-  return and zero volume, and never traded. Weekly/monthly bucket settlement
-  and Yahoo's daily timestamps resolve against each instrument's own
-  calendar rather than a UTC-midnight approximation — but weekly/monthly
-  **rebalancing** only does so when every instrument in the portfolio shares
-  one calendar; a genuinely mixed-calendar portfolio (e.g. equities
-  alongside crypto) still buckets rebalance dates against the raw UTC
-  boundary, the same documented approximation used elsewhere for a
-  mixed-calendar universe. This coverage is deliberately narrower than "fully
-  supported" for two reasons: it does not extend to every calendar detail
-  (e.g. an official intraday session break, like XHKG's lunch recess, is
-  handled for hourly cache-coverage and gap-detection checks but not modelled
-  anywhere else), and it has not been exercised against every calendar
-  `pandas_market_calendars` recognises — only the ones this project's own
-  test suite covers (XNYS, XHKG, XASX, XSAU, 24/7). But the calendar is
-  still a static,
-  best-effort schedule (holidays, weekends), not a real-time venue-status
-  feed, so an unscheduled closure (an exchange halt, an outage) is not
-  detected as a closure and instead falls under the ordinary
-  `missing_value_policy` handling for gaps. Intraday (`1h`) frequency does
-  not support mixed calendars at all yet and is rejected at config load —
-  verified-closure handling only operates at daily frequency.
-- **Rolling-window features are diluted in a mixed-calendar universe**: a
-  verified closure's synthetic bar is exactly flat (zero return, zero
-  volume), but momentum lookbacks, volatility windows, ADV windows and
-  technical indicators all still count it as one more *period* — for a
-  session-bound instrument sharing a combined timeline with an always-open
-  one (e.g. equities alongside crypto), a "252-period" window therefore spans
-  *more* than 252 real trading sessions, and the flat bars pull volatility/ADV
-  estimates down. QuantLab warns about this at config load
-  (`DataConfig._warn_if_mixed_calendars_dilute_windowed_features`) but does
-  not correct it: doing so properly would mean computing every instrument's
-  features on its own native calendar before aligning signals, a
-  substantially larger redesign than today's shared-timeline architecture.
-  Prefer a single shared calendar per experiment when window-based estimates
-  need to be precise; treat mixed-calendar results as directionally
-  informative rather than exact until this is addressed.
+  return and zero volume, and never traded.
+
+  *Handled on each instrument's own native calendar*: every built-in
+  strategy's own signal generation (momentum lookbacks, technical
+  indicators, every mean-reversion indicator), a pairs-trading spread's
+  hedge fit and indicator (computed on the intersection of both legs' own
+  native session dates), and `runner.py`'s ADV computation — each symbol is
+  sliced to its own verified native session rows before computing, then
+  reindexed/forward-filled back onto the combined timeline
+  (`quantlab.features.native_calendar.compute_native_then_align`), so a
+  session-bound instrument sharing a timeline with an always-open one is
+  never diluted by the always-open instrument's own extra sessions in what
+  actually gets traded. Weekly/monthly bucket settlement and Yahoo's daily
+  timestamps also resolve against each instrument's own calendar rather
+  than a UTC-midnight approximation.
+
+  *Still computed on the combined, closure-padded timeline, not yet
+  native-calendar-aware*: the `inverse_volatility`/`volatility_targeting`
+  portfolio allocators' realized-volatility estimate, so a mixed-calendar
+  universe's allocator weights can still be diluted by the always-open
+  instrument's own extra sessions; weekly/monthly **rebalancing** buckets
+  against the raw UTC boundary whenever the portfolio's instruments do not
+  all share one calendar; and the Strategy Explorer's Results-tab
+  diagnostics, which recompute their own illustrative indicators
+  independently of the live strategy's signal path for `pairs_trading`
+  (hedge fit, spread, indicator, and rolling ADF p-value — the last calls
+  the same `periodic_stationarity_pvalues` function the live entry gate
+  uses, but on the combined timeline rather than the native intersection
+  the live gate itself feeds it, so calling the same function does not by
+  itself make the result match), `time_series_momentum`,
+  `cross_sectional_momentum` and `trend_following`. `mean_reversion`'s own
+  Results-tab diagnostic is the one exception, wired onto the same
+  native-calendar path the live strategy uses. The Strategy Explorer's
+  interactive labs additionally assume the XNYS calendar for any Yahoo or
+  CSV symbol (not detected/configurable there the way the main dashboard's
+  per-instrument table is), so a non-US instrument may not be represented
+  faithfully in a lab.
+
+  *Not yet supported at all*: an official intraday session break (e.g.
+  XHKG's lunch recess) is handled for hourly cache-coverage/gap-detection
+  checks but not modelled anywhere else; coverage has only been exercised
+  against the calendars this project's own test suite covers (XNYS, XHKG,
+  XASX, XSAU, 24/7), not every calendar `pandas_market_calendars`
+  recognises; the calendar itself is a static, best-effort schedule
+  (holidays, weekends), not a real-time venue-status feed, so an
+  unscheduled closure (an exchange halt, an outage) is not detected as a
+  closure and instead falls under the ordinary `missing_value_policy`
+  handling for gaps; and intraday (`1h`) frequency does not support mixed
+  calendars at all and is rejected at config load.
 
 ## Execution
 
@@ -73,9 +87,18 @@ result.
 
 ## Methodology
 
-- **Rebalancing is a step function**: weights are held constant between
-  rebalance dates, ignoring intra-period drift from price moves — the
-  standard simplification for a vectorised backtest.
+- **Weight drift between rebalances is modeled by default**
+  (`portfolio.model_weight_drift`, `True` by default): each asset's own
+  price move drifts its executed weight between real trades, rather than
+  holding it constant until the next scheduled rebalance, with hard
+  portfolio-level risk limits re-checked every row and restored via a
+  linear-programming projection (never a "clip and scale" heuristic) if
+  breached off-schedule — see [Weight drift](backtesting.md#weight-drift)
+  and [the compliance-restoration LP](drift_compliance.md) for the full
+  mechanism. `model_weight_drift=False` remains available as an optional
+  constant-weight compatibility mode, not the recommended path.
+  The compliance-restoration LP's own basis is gross/pre-cost, the same
+  disclosed convention already used by `stop_loss_pct`/`take_profit_pct`.
 - **Possible data-snooping**: trying many strategies, parameters or universes
   and reporting only the best one overstates expected performance. QuantLab's
   walk-forward and sensitivity tooling exists to mitigate this, but no

@@ -451,7 +451,7 @@ def test_cap_turnover_rejects_invalid_public_api_parameters() -> None:
     for name in ("maximum_weight", "maximum_gross_exposure", "maximum_net_exposure"):
         for bad in (-0.1, float("nan")):
             with pytest.raises(InvalidConfigurationError):
-                cap_turnover(targets, maximum_turnover=0.5, **{name: bad})  # type: ignore[arg-type]
+                cap_turnover(targets, maximum_turnover=0.5, **{name: bad})  # type: ignore[call-overload]
     # Sanity: ordinary usage remains unaffected.
     out = cap_turnover(targets, maximum_turnover=0.3)
     assert out.to_numpy().tolist() == [[0.3], [0.5]]
@@ -943,6 +943,16 @@ def test_turnover_cap_completes_a_full_rotation_between_disjoint_sets() -> None:
 
 
 def test_engine_turnover_cap_never_exceeds_the_configured_budget() -> None:
+    """`maximum_turnover` bounds the REAL trade size (`result.turnover`,
+    built from `apply_weight_drift`'s own `trade_changes` -- exactly zero
+    on a pure-drift row, the real size on an anchor or a landed
+    correction), not a raw row-to-row diff of `result.positions`. With
+    `model_weight_drift` at its default (`True`), `result.positions`
+    itself keeps moving every day from organic price drift independently
+    of the turnover cap -- that is the whole point of the feature, not a
+    violation of this cap, which only throttles genuine trades (see
+    docs/backtesting.md's Rebalancing & turnover / Weight drift
+    sections)."""
     from quantlab.backtesting.runner import run_backtest_from_config
 
     frames = [
@@ -991,10 +1001,8 @@ def test_engine_turnover_cap_never_exceeds_the_configured_budget() -> None:
     assert result.target_weights is not None
     target_nonzero = (result.target_weights.abs() > 1e-9).sum(axis=1)
     assert target_nonzero.max() <= 2
-    realised_turnover = (
-        (result.positions - result.positions.shift(1).fillna(0.0)).abs().sum(axis=1)
-    )
-    assert realised_turnover.max() <= 0.1 + 1e-9
+    assert result.turnover is not None
+    assert result.turnover.max() <= 0.1 + 1e-9
 
 
 def test_infeasible_position_weight_combo_warns(caplog: Any) -> None:
@@ -1287,7 +1295,15 @@ def test_cap_turnover_preserves_float_precision_for_integer_input() -> None:
 
 def test_engine_only_trades_cap_turnover_on_rebalance_dates() -> None:
     """End-to-end: a monthly-rebalanced, turnover-capped backtest must not
-    trade on non-rebalance dates."""
+    trade on non-rebalance dates.
+
+    `model_weight_drift` is explicitly disabled: this test is specifically
+    about the turnover-cap/rebalance-schedule mechanism producing a
+    constant-weight step function between rebalances -- with drift enabled
+    (the default), `result.positions` genuinely changes every day from
+    organic price movement, which is the whole point of that feature, not
+    a violation of this one's own scope.
+    """
     from quantlab.backtesting.runner import run_backtest_from_config
 
     data, cfg = _rf_test_setup()
@@ -1297,6 +1313,7 @@ def test_engine_only_trades_cap_turnover_on_rebalance_dates() -> None:
                 update={
                     "maximum_turnover": 0.1,
                     "rebalance_frequency": "monthly",
+                    "model_weight_drift": False,
                 }
             )
         }

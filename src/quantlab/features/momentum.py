@@ -18,7 +18,8 @@ from quantlab.features._validation import (
     numeric_pandas,
     positive_int,
 )
-from quantlab.features.returns import simple_returns
+from quantlab.features.cross_sectional import select_top_bottom
+from quantlab.features.returns import forward_returns, simple_returns
 from quantlab.features.volatility import realized_volatility
 
 PandasT = TypeVar("PandasT", pd.Series, pd.DataFrame)
@@ -114,3 +115,100 @@ def volatility_adjusted_momentum(
             raise TypeError("Momentum and volatility have incompatible pandas types.")
         result = raw / vol.where(vol > 0.0, np.nan)
     return cast(PandasT, result)  # type: ignore[redundant-cast]
+
+
+def momentum_persistence(
+    prices: pd.Series,
+    lookback_period: int,
+    skip_period: int,
+    holding_period: int,
+) -> pd.DataFrame:
+    """Pair each date's trailing momentum score with its subsequent return.
+
+    Returns a two-column ``(past_momentum, future_return)`` DataFrame, one
+    row per date where both are defined -- the basic building block for
+    checking whether momentum actually persists on a given series (does a
+    high past score tend to be followed by a high subsequent return, on
+    this data): a positive relationship is descriptive-sample evidence FOR
+    the strategy's premise, a flat or negative one against it -- not a
+    hypothesis test (rows from overlapping holding periods are not
+    independent observations, so this is not a significance claim).
+    ``future_return`` looks strictly ahead of each row's own date -- these
+    pairs describe the data, they are never a tradable signal themselves
+    (see ``forward_returns``). This asks the TIME-SERIES question (does
+    THIS asset's own past predict its own future); for the cross-sectional
+    question (do higher-RANKED assets outperform lower-ranked ones), see
+    :func:`cross_sectional_momentum_persistence`.
+    """
+    if not isinstance(prices, pd.Series):
+        raise TypeError("prices must be a pandas Series.")
+    past = momentum(prices, lookback_period, skip_period)
+    horizon = positive_int(holding_period, name="holding_period")
+    future = forward_returns(prices, horizon)
+    return pd.concat({"past_momentum": past, "future_return": future}, axis=1).dropna()
+
+
+def cross_sectional_momentum_persistence(
+    prices: pd.DataFrame,
+    lookback_period: int,
+    skip_period: int,
+    holding_period: int,
+    *,
+    top_fraction: float = 0.25,
+    bottom_fraction: float | None = None,
+) -> pd.DataFrame:
+    """Date-by-date evidence for CROSS-SECTIONAL momentum persistence.
+
+    Unlike :func:`momentum_persistence` (a single asset's own past-vs-
+    future relationship -- the TIME-SERIES momentum question), this asks
+    the question cross-sectional momentum actually trades: on each date,
+    do assets ranked higher on trailing momentum go on to earn higher
+    subsequent returns than assets ranked lower, RELATIVE TO EACH OTHER?
+    An asset's own serial autocorrelation is neither necessary nor
+    sufficient for that.
+
+    Returns one row per date with at least 3 assets scored, containing the
+    Spearman rank correlation between that date's momentum scores and
+    subsequent ``holding_period``-period returns across the universe
+    (``rank_correlation``), plus the realized ``top_return``/
+    ``bottom_return``/``top_minus_bottom`` spread for the
+    ``top_fraction``/``bottom_fraction`` selection (mirroring
+    ``CrossSectionalMomentumStrategy``'s own selection via
+    :func:`~quantlab.features.cross_sectional.select_top_bottom`) over the
+    same horizon. Descriptive sample evidence, not a hypothesis test --
+    overlapping holding periods across consecutive dates are not
+    independent observations.
+    """
+    if not isinstance(prices, pd.DataFrame):
+        raise TypeError("prices must be a pandas DataFrame.")
+    bottom = bottom_fraction if bottom_fraction is not None else top_fraction
+    scores = momentum(prices, lookback_period, skip_period)
+    horizon = positive_int(holding_period, name="holding_period")
+    future = forward_returns(prices, horizon)
+    selection = select_top_bottom(scores, top_fraction, bottom)
+
+    rows: list[dict[str, object]] = []
+    for date in scores.index:
+        score_row = scores.loc[date]
+        future_row = future.loc[date]
+        valid = score_row.notna() & future_row.notna()
+        if int(valid.sum()) < 3:
+            continue
+        rank_correlation = score_row[valid].corr(future_row[valid], method="spearman")
+        top_mask = valid & (selection.loc[date] == 1.0)
+        bottom_mask = valid & (selection.loc[date] == -1.0)
+        top_return = future_row[top_mask].mean() if top_mask.any() else np.nan
+        bottom_return = future_row[bottom_mask].mean() if bottom_mask.any() else np.nan
+        rows.append(
+            {
+                "date": date,
+                "rank_correlation": rank_correlation,
+                "top_return": top_return,
+                "bottom_return": bottom_return,
+                "top_minus_bottom": top_return - bottom_return,
+            }
+        )
+    columns = ["rank_correlation", "top_return", "bottom_return", "top_minus_bottom"]
+    if not rows:
+        return pd.DataFrame(columns=columns).rename_axis("date")
+    return pd.DataFrame(rows).set_index("date")[columns]
