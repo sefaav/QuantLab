@@ -1,0 +1,921 @@
+
+<!doctype html>
+<html lang="en" class="no-js">
+  <head>
+    
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width,initial-scale=1">
+      
+        <meta name="description" content="Reproducible quantitative research and backtesting platform">
+      
+      
+      
+        <link rel="canonical" href="https://sefaav.github.io/QuantLab/drift_compliance/">
+      
+      
+        <link rel="prev" href="../backtesting/">
+      
+      
+        <link rel="next" href="../validation/">
+      
+      
+        
+      
+      
+      <link rel="icon" href="../assets/images/favicon.png">
+      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.7.7">
+    
+    
+      
+        <title>Drift compliance - QuantLab</title>
+      
+    
+    
+      <link rel="stylesheet" href="../assets/stylesheets/main.ec1eaa64.min.css">
+      
+        
+        <link rel="stylesheet" href="../assets/stylesheets/palette.ab4e12ef.min.css">
+      
+      
+
+
+    
+    
+      
+    
+    
+      
+        
+        
+        <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+        <link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Roboto:300,300i,400,400i,700,700i%7CRoboto+Mono:400,400i,700,700i&display=fallback">
+        <style>:root{--md-text-font:"Roboto";--md-code-font:"Roboto Mono"}</style>
+      
+    
+    
+    <script>__md_scope=new URL("..",location),__md_hash=e=>[...e].reduce(((e,_)=>(e<<5)-e+_.charCodeAt(0)),0),__md_get=(e,_=localStorage,t=__md_scope)=>JSON.parse(_.getItem(t.pathname+"."+e)),__md_set=(e,_,t=localStorage,a=__md_scope)=>{try{t.setItem(a.pathname+"."+e,JSON.stringify(_))}catch(e){}}</script>
+    
+      
+
+    
+    
+  </head>
+  
+  
+    
+    
+      
+    
+    
+    
+    
+    <body dir="ltr" data-md-color-scheme="default" data-md-color-primary="indigo" data-md-color-accent="indigo">
+  
+    
+    <input class="md-toggle" data-md-toggle="drawer" type="checkbox" id="__drawer" autocomplete="off">
+    <input class="md-toggle" data-md-toggle="search" type="checkbox" id="__search" autocomplete="off">
+    <label class="md-overlay" for="__drawer"></label>
+    <div data-md-component="skip">
+      
+        
+        <a href="#weight-drift-mechanics-and-the-compliance-restoration-lp" class="md-skip">
+          Skip to content
+        </a>
+      
+    </div>
+    <div data-md-component="announce">
+      
+    </div>
+    
+    
+      
+
+  
+
+<header class="md-header md-header--shadow" data-md-component="header">
+  <nav class="md-header__inner md-grid" aria-label="Header">
+    <a href=".." title="QuantLab" class="md-header__button md-logo" aria-label="QuantLab" data-md-component="logo">
+      
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a3 3 0 0 0 3-3 3 3 0 0 0-3-3 3 3 0 0 0-3 3 3 3 0 0 0 3 3m0 3.54C9.64 9.35 6.5 8 3 8v11c3.5 0 6.64 1.35 9 3.54 2.36-2.19 5.5-3.54 9-3.54V8c-3.5 0-6.64 1.35-9 3.54"/></svg>
+
+    </a>
+    <label class="md-header__button md-icon" for="__drawer">
+      
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M3 6h18v2H3zm0 5h18v2H3zm0 5h18v2H3z"/></svg>
+    </label>
+    <div class="md-header__title" data-md-component="header-title">
+      <div class="md-header__ellipsis">
+        <div class="md-header__topic">
+          <span class="md-ellipsis">
+            QuantLab
+          </span>
+        </div>
+        <div class="md-header__topic" data-md-component="header-topic">
+          <span class="md-ellipsis">
+            
+              Drift compliance
+            
+          </span>
+        </div>
+      </div>
+    </div>
+    
+      
+        <form class="md-header__option" data-md-component="palette">
+  
+    
+    
+    
+    <input class="md-option" data-md-color-media="" data-md-color-scheme="default" data-md-color-primary="indigo" data-md-color-accent="indigo"  aria-label="Switch to dark mode"  type="radio" name="__palette" id="__palette_0">
+    
+      <label class="md-header__button md-icon" title="Switch to dark mode" for="__palette_1" hidden>
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a4 4 0 0 0-4 4 4 4 0 0 0 4 4 4 4 0 0 0 4-4 4 4 0 0 0-4-4m0 10a6 6 0 0 1-6-6 6 6 0 0 1 6-6 6 6 0 0 1 6 6 6 6 0 0 1-6 6m8-9.31V4h-4.69L12 .69 8.69 4H4v4.69L.69 12 4 15.31V20h4.69L12 23.31 15.31 20H20v-4.69L23.31 12z"/></svg>
+      </label>
+    
+  
+    
+    
+    
+    <input class="md-option" data-md-color-media="" data-md-color-scheme="slate" data-md-color-primary="indigo" data-md-color-accent="indigo"  aria-label="Switch to light mode"  type="radio" name="__palette" id="__palette_1">
+    
+      <label class="md-header__button md-icon" title="Switch to light mode" for="__palette_0" hidden>
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 18c-.89 0-1.74-.2-2.5-.55C11.56 16.5 13 14.42 13 12s-1.44-4.5-3.5-5.45C10.26 6.2 11.11 6 12 6a6 6 0 0 1 6 6 6 6 0 0 1-6 6m8-9.31V4h-4.69L12 .69 8.69 4H4v4.69L.69 12 4 15.31V20h4.69L12 23.31 15.31 20H20v-4.69L23.31 12z"/></svg>
+      </label>
+    
+  
+</form>
+      
+    
+    
+      <script>var palette=__md_get("__palette");if(palette&&palette.color){if("(prefers-color-scheme)"===palette.color.media){var media=matchMedia("(prefers-color-scheme: light)"),input=document.querySelector(media.matches?"[data-md-color-media='(prefers-color-scheme: light)']":"[data-md-color-media='(prefers-color-scheme: dark)']");palette.color.media=input.getAttribute("data-md-color-media"),palette.color.scheme=input.getAttribute("data-md-color-scheme"),palette.color.primary=input.getAttribute("data-md-color-primary"),palette.color.accent=input.getAttribute("data-md-color-accent")}for(var[key,value]of Object.entries(palette.color))document.body.setAttribute("data-md-color-"+key,value)}</script>
+    
+    
+    
+      
+      
+        <label class="md-header__button md-icon" for="__search">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+        </label>
+        <div class="md-search" data-md-component="search" role="dialog">
+  <label class="md-search__overlay" for="__search"></label>
+  <div class="md-search__inner" role="search">
+    <form class="md-search__form" name="search">
+      <input type="text" class="md-search__input" name="query" aria-label="Search" placeholder="Search" autocapitalize="off" autocorrect="off" autocomplete="off" spellcheck="false" data-md-component="search-query" required>
+      <label class="md-search__icon md-icon" for="__search">
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M20 11v2H8l5.5 5.5-1.42 1.42L4.16 12l7.92-7.92L13.5 5.5 8 11z"/></svg>
+      </label>
+      <nav class="md-search__options" aria-label="Search">
+        
+        <button type="reset" class="md-search__icon md-icon" title="Clear" aria-label="Clear" tabindex="-1">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg>
+        </button>
+      </nav>
+      
+    </form>
+    <div class="md-search__output">
+      <div class="md-search__scrollwrap" tabindex="0" data-md-scrollfix>
+        <div class="md-search-result" data-md-component="search-result">
+          <div class="md-search-result__meta">
+            Initializing search
+          </div>
+          <ol class="md-search-result__list" role="presentation"></ol>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+      
+    
+    
+      <div class="md-header__source">
+        <a href="https://github.com/sefaav/QuantLab" title="Go to repository" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M439.6 236.1 244 40.5c-5.4-5.5-12.8-8.5-20.4-8.5s-15 3-20.4 8.4L162.5 81l51.5 51.5c27.1-9.1 52.7 16.8 43.4 43.7l49.7 49.7c34.2-11.8 61.2 31 35.5 56.7-26.5 26.5-70.2-2.9-56-37.3L240.3 199v121.9c25.3 12.5 22.3 41.8 9.1 55-6.4 6.4-15.2 10.1-24.3 10.1s-17.8-3.6-24.3-10.1c-17.6-17.6-11.1-46.9 11.2-56v-123c-20.8-8.5-24.6-30.7-18.6-45L142.6 101 8.5 235.1C3 240.6 0 247.9 0 255.5s3 15 8.5 20.4l195.6 195.7c5.4 5.4 12.7 8.4 20.4 8.4s15-3 20.4-8.4l194.7-194.7c5.4-5.4 8.4-12.8 8.4-20.4s-3-15-8.4-20.4"/></svg>
+  </div>
+  <div class="md-source__repository">
+    GitHub
+  </div>
+</a>
+      </div>
+    
+  </nav>
+  
+</header>
+    
+    <div class="md-container" data-md-component="container">
+      
+      
+        
+          
+        
+      
+      <main class="md-main" data-md-component="main">
+        <div class="md-main__inner md-grid">
+          
+            
+              
+              <div class="md-sidebar md-sidebar--primary" data-md-component="sidebar" data-md-type="navigation" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+
+
+<nav class="md-nav md-nav--primary" aria-label="Navigation" data-md-level="0">
+  <label class="md-nav__title" for="__drawer">
+    <a href=".." title="QuantLab" class="md-nav__button md-logo" aria-label="QuantLab" data-md-component="logo">
+      
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a3 3 0 0 0 3-3 3 3 0 0 0-3-3 3 3 0 0 0-3 3 3 3 0 0 0 3 3m0 3.54C9.64 9.35 6.5 8 3 8v11c3.5 0 6.64 1.35 9 3.54 2.36-2.19 5.5-3.54 9-3.54V8c-3.5 0-6.64 1.35-9 3.54"/></svg>
+
+    </a>
+    QuantLab
+  </label>
+  
+    <div class="md-nav__source">
+      <a href="https://github.com/sefaav/QuantLab" title="Go to repository" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M439.6 236.1 244 40.5c-5.4-5.5-12.8-8.5-20.4-8.5s-15 3-20.4 8.4L162.5 81l51.5 51.5c27.1-9.1 52.7 16.8 43.4 43.7l49.7 49.7c34.2-11.8 61.2 31 35.5 56.7-26.5 26.5-70.2-2.9-56-37.3L240.3 199v121.9c25.3 12.5 22.3 41.8 9.1 55-6.4 6.4-15.2 10.1-24.3 10.1s-17.8-3.6-24.3-10.1c-17.6-17.6-11.1-46.9 11.2-56v-123c-20.8-8.5-24.6-30.7-18.6-45L142.6 101 8.5 235.1C3 240.6 0 247.9 0 255.5s3 15 8.5 20.4l195.6 195.7c5.4 5.4 12.7 8.4 20.4 8.4s15-3 20.4-8.4l194.7-194.7c5.4-5.4 8.4-12.8 8.4-20.4s-3-15-8.4-20.4"/></svg>
+  </div>
+  <div class="md-source__repository">
+    GitHub
+  </div>
+</a>
+    </div>
+  
+  <ul class="md-nav__list" data-md-scrollfix>
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href=".." class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Home
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../architecture/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Architecture
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../data_pipeline/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Data pipeline
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../strategies/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Strategies
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../strategy_explorer/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Strategy Explorer
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../api/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Python API
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../backtesting/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Backtesting
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+    
+  
+  
+  
+    <li class="md-nav__item md-nav__item--active">
+      
+      <input class="md-nav__toggle md-toggle" type="checkbox" id="__toc">
+      
+      
+        
+      
+      
+        <label class="md-nav__link md-nav__link--active" for="__toc">
+          
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Drift compliance
+  
+
+    
+  </span>
+  
+  
+
+          <span class="md-nav__icon md-icon"></span>
+        </label>
+      
+      <a href="./" class="md-nav__link md-nav__link--active">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Drift compliance
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+      
+        
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#per-column-debt" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Per-column debt
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#compliance-restoration-lp" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Compliance-restoration LP
+      
+    </span>
+  </a>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../validation/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Validation
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../limitations/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Limitations
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+  </ul>
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+            
+              
+              <div class="md-sidebar md-sidebar--secondary" data-md-component="sidebar" data-md-type="toc" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#per-column-debt" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Per-column debt
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#compliance-restoration-lp" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Compliance-restoration LP
+      
+    </span>
+  </a>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+          
+          
+            <div class="md-content" data-md-component="content">
+              
+              <article class="md-content__inner md-typeset">
+                
+                  
+
+
+  
+  
+
+
+<h1 id="weight-drift-mechanics-and-the-compliance-restoration-lp">Weight-drift mechanics and the compliance-restoration LP<a class="headerlink" href="#weight-drift-mechanics-and-the-compliance-restoration-lp" title="Permanent link">&para;</a></h1>
+<p>Detailed internal mechanism behind <code>portfolio.model_weight_drift</code> — see
+<a href="../backtesting/#weight-drift">Weight drift</a> for the conceptual summary,
+invariants and disclosed limitations. This page is for contributors
+modifying <code>quantlab.backtesting.accounting.apply_weight_drift</code> or
+<code>quantlab.portfolio.drift_compliance.restore_drift_compliance</code>, not
+general usage.</p>
+<h2 id="per-column-debt">Per-column debt<a class="headerlink" href="#per-column-debt" title="Permanent link">&para;</a></h2>
+<p><code>apply_weight_drift</code> evolves the already shifted, executed weights forward
+between genuine trades via a per-column dollar exposure and a single
+shared relative equity <code>E</code>:</p>
+<div class="highlight"><pre><span></span><code>weight[i] = dollar[i] / E
+</code></pre></div>
+<p>Output is always a <em>pre-period</em> value — the weight held going into a row,
+before that row's own return is applied — consistent with <code>executed_weights
+= held.shift(1)</code> elsewhere in the accounting module; returning the
+post-period value instead would double-count that row's own return once
+inside this recursion and again when it is multiplied by <code>asset_return</code> a
+second time.</p>
+<p>Two independent kinds of per-column debt drive every row's output, in this
+priority order:</p>
+<ol>
+<li><strong>Compliance debt</strong> — a hard-risk-limit breach (<code>maximum_weight</code>/
+   <code>maximum_gross_exposure</code>/<code>maximum_net_exposure</code>/<code>long_only</code>), corrected
+   via the minimal-L1-turnover linear program described below — never a
+   "clip and scale toward zero" heuristic, which can move exposure in the
+   wrong direction whenever some of the breaching exposure sits in a
+   currently-untradable column. A declared position group (e.g.
+   <code>pairs_trading</code>'s two legs, see <code>BaseStrategy.position_groups()</code>) is
+   corrected as one coherent unit via a single shared scaling factor,
+   never one leg moving alone. Re-solved fresh every row it is
+   outstanding, from that row's own current weights, never a stale stored
+   target — a column the LP leaves untouched (fixed/untradable, or simply
+   not needing to move) always reflects its own current, continued drift
+   when the correction lands, not a snapshot from whenever the breach was
+   first detected. Any improvement the LP finds is applied immediately,
+   whether or not it fully resolves the breach — a tradability-blocked
+   best-effort partial fix (recorded via <code>drift_compliance_pending</code>) still
+   lands, rather than being recomputed and silently discarded every day
+   while nothing improves. Never subject to <code>maximum_turnover</code> — a hard
+   risk-limit override, not an ordinary rebalance — and always takes
+   priority over ordinary debt below.</li>
+<li><strong>Ordinary rebalance debt</strong> — a fresh per-column decision (a column
+   anchors when its own value in the executed book changed since the
+   previous row — the same <code>EPSILON</code>-based "did a real trade happen"
+   convention the trade log itself uses — or <code>rebalance_date.loc[t,
+   column]</code> is <code>True</code>, a <code>dates x symbols</code> frame threaded down from
+   <code>engine.py</code>, itself gated by that column's own tradability; the second
+   condition catches a scheduled rebalance whose freshly-decided target
+   happens to numerically equal the immediately preceding one, otherwise
+   invisible to value-diffing alone), turnover-capped like a decision-level
+   rebalance when <code>PortfolioConfig.maximum_turnover</code> is set. A column's own
+   fresh decision replaces only that column's own debt, never any other
+   column's — an unrelated column's own outstanding debt, including one
+   belonging to a currently-closed instrument, survives untouched. All
+   columns with outstanding debt that are also currently tradable share
+   one combined per-row turnover budget; the unresolved remainder is
+   retried against a fresh budget each subsequent row. A column with debt
+   that is not currently tradable never trades — its debt simply waits,
+   exactly like a decision-level pending-due-to-closure debt — whether
+   that is its own fresh anchor or a multi-row catch-up already in
+   progress. A column compliance debt (1) already moved this row is
+   excluded from ordinary-debt eligibility this same row too — its landed
+   value already reflects the higher-priority correction; ordinary debt
+   resumes toward it again starting next row — which is what keeps the
+   two kinds of debt from fighting over the same cell within a single row.</li>
+</ol>
+<p>A closed asset's dollar exposure does not move (its return is <code>0</code> on a
+synthetic closure bar), but its weight still drifts purely through <code>E</code>'s
+own movement from every other tradable asset's real return — it is never
+force-reset to a stale decision just because another column anchors or a
+compliance correction lands the same row. Combining this row's own
+just-decided/corrected columns with another column's frozen or
+still-drifting value can itself create a new violation neither component
+had alone (mixing is not a convex combination the way interpolating along
+one line is) — unlike organic drift, which needs a one-row lag before
+reacting to it (correcting it retroactively would be look-ahead), every
+input to this combination is already known before the row's own output is
+finalized, so it is checked and, where achievable, resolved in the same
+row. A row where nothing was decided (pure drift) keeps the ordinary
+one-row-lag detect-then-queue behavior: a breach found there is recorded
+in <code>drift_compliance_pending</code> and only lands starting the next row, via
+compliance debt (1) above.</p>
+<p>If <code>E</code> (this anchor-episode's own relative equity — gross, pre-cost,
+distinct from the portfolio's absolute equity curve) falls to zero or
+below, that episode's positions are force-flattened and a warning is
+logged, mirroring <code>ruined</code>'s own "flatten and continue" handling rather
+than aborting.</p>
+<p>Whenever the row-walk believes no compliance debt remains outstanding for
+a row (no <code>drift_compliance_pending</code>), that row's landed weights are
+re-verified against the same constraints one more time before being
+finalized. A violation there is treated as an internal or numerical
+failure and raises <code>BacktestError</code> — a numerical solver failure remains
+possible in principle, so this is not asserted as strictly unreachable,
+but it should never be a legitimate, expected runtime outcome (mirrors
+<code>rebalancing._assert_holdings_compliant</code>'s identical "never trust the
+invariant blindly" philosophy).</p>
+<p><code>model_weight_drift=False</code> remains available as an optional constant-
+weight compatibility mode (byte-identical to the step function described
+in <a href="../backtesting/#rebalancing-turnover">Rebalancing &amp; turnover</a>), not
+the recommended path.</p>
+<h2 id="compliance-restoration-lp">Compliance-restoration LP<a class="headerlink" href="#compliance-restoration-lp" title="Permanent link">&para;</a></h2>
+<p><code>quantlab.portfolio.drift_compliance.restore_drift_compliance</code> is the
+minimal-L1-turnover linear program compliance debt (above) uses. Internal,
+low-level primitive: its sole caller, <code>apply_weight_drift</code>, is the
+validated public entry point (frame shape/dtype/finiteness, tradable mask,
+etc.) — this function only asserts array shapes match <code>columns</code>, trusting
+<code>drifted</code>/<code>tradable_row</code> are otherwise already clean numeric/boolean data.</p>
+<p><strong>Free variables</strong>: <code>w_i</code> for every independent (singleton-group) column,
+and one shared scalar <code>k_g</code> per multi-column group with <code>w_i := k_g *
+drifted_i</code> for every leg <code>i</code> of group <code>g</code> (a declared position group —
+e.g. <code>pairs_trading</code>'s two legs — must move together, preserving its
+current relative composition/hedge ratio exactly; <code>k_g</code> is bounded only by
+<code>k_g &gt;= 0</code>, never capped at <code>1</code>, since the L1 objective already penalizes
+any movement away from <code>drifted</code> and capping would incorrectly exclude a
+genuine minimal-L1 solution that requires growing a group). An untradable
+independent column, or any group with at least one untradable leg, is
+fixed at its drifted value (cannot move this row) — eligibility is the AND
+of every member's own native tradability, mirroring
+<code>quantlab.strategies.pairs_trading</code>'s own "both legs open" gate.</p>
+<p><strong>Sign/support-preserving bounds</strong>: an independent column's own
+free-variable bound never invents a position the drifted book does not
+already hold — a currently-long column (<code>drifted_i &gt; 0</code>) may shrink toward
+0 or grow further long, a currently-short column (<code>drifted_i &lt; 0</code>) may
+shrink toward 0 or grow further short, and a column already exactly at 0
+is fixed there. <code>long_only</code> additionally clamps every tradable independent
+column's lower bound to 0 (grouped legs are assumed already non-negative
+under <code>long_only</code> by construction — every anchor this module drifts from
+was itself validated compliant, and a positive quantity cannot cross zero
+under any return greater than -100%, so <code>k_g &gt;= 0</code> alone keeps a grouped
+leg non-negative too). That assumption covers every ordinary case, but is
+not itself enforced by anything for a fixed (untradable) column/group — an
+explicit <code>w_i &gt;= 0</code> (<code>k_g * drifted_i &gt;= 0</code> for a group leg) inequality is
+added for every independent column/group leg regardless of tradability, so
+a fixed value that does turn out negative under <code>long_only</code> is correctly
+reported as LP-infeasible (driving the tradability diagnosis below)
+instead of the strict LP trivially "succeeding" over a value that still
+violates <code>long_only</code>.</p>
+<p><strong>Objective</strong>: <code>minimize sum_i |w_i - drifted_i|</code> subject to <code>|w_i| &lt;=
+maximum_weight</code>, <code>sum_i |w_i| &lt;= maximum_gross_exposure</code> (or
+<code>maximum_leverage</code>, whichever is tighter — the caller passes the
+already-combined cap), <code>|sum_i w_i| &lt;= maximum_net_exposure</code>, and the
+sign-preserving bounds above. This is <strong>not</strong> solved by a "clip each
+weight, then scale the tradable columns toward 0" heuristic — that is
+provably wrong in general: e.g. a large untradable long position plus an
+already-open, tradable short position breaching <code>maximum_net_exposure</code> on
+the long side needs that short pushed more negative, not scaled toward 0
+(scaling toward 0 moves net exposure the wrong direction). The linear
+program gets this right because <code>w_i</code> for that tradable short is free to
+move further in its own direction (not constrained to move only toward
+zero) — while still never opening a brand-new position on a column the
+drifted book held at exactly zero.</p>
+<p><strong>Infeasibility handling</strong>: if that LP is infeasible, first diagnoses
+whether this is explained entirely by the fixed (untradable) columns'/
+groups' own values already violating a constraint on their own
+(tradability-caused, expected) rather than a genuinely contradictory
+constraint configuration (a bug — <code>_validate_target_row_compliant</code> should
+already have rejected that at the target itself, before drift ever ran).
+Tradability-caused infeasibility re-solves via an always-feasible,
+two-stage lexicographic LP instead of requiring zero violation: stage 1
+minimizes the sum of four non-negative slacks (one added to each cap's own
+right-hand side — <code>maximum_weight</code>, gross, net, <code>long_only</code>), finding the
+smallest unavoidable violation; stage 2 then fixes those slacks at their
+stage-1-optimal values and re-solves for the minimal-L1-deviation point
+among every solution achieving that same minimal violation — so an
+already-compliant, uninvolved free column is never moved (e.g. liquidated)
+just because nothing in a single-stage "minimize slack only" objective
+would have penalized doing so. The result is the best achievable
+correction using only what is currently tradable, returned with
+<code>pending=True</code>. A genuine misconfiguration instead raises <code>BacktestError</code>,
+mirroring <code>_assert_holdings_compliant</code>'s "a violation here means a bug in
+the algorithm" philosophy.</p>
+<p><strong>Two deliberate, disclosed scope limits</strong>:</p>
+<ul>
+<li>Only the hard risk limits above are enforced here — <code>target_minimum_
+  weight</code>/<code>target_maximum_positions</code> are not, consistent with
+  <code>PortfolioConfig</code>'s own documented convention that these non-convex,
+  target-portfolio-only constraints may be temporarily violated by any
+  transitional weights (turnover-capped rebalancing already has this exact
+  property; an off-schedule drift correction is the same kind of
+  transitional state, not a new target).</li>
+<li>Sign/support-preservation means the strict LP can, in principle, be
+  infeasible in a case an unrestricted LP (free to open a brand-new
+  position) would still solve — in practice this never actually happens:
+  shrinking every free tradable column toward 0 always drives
+  <code>maximum_weight</code>/gross/net exposure back toward whatever the fixed
+  (untradable) columns alone already produce, so whenever the fixed
+  columns alone are compliant, a fully sign-preserving compliant point is
+  always reachable by shrinking alone — the strict LP never spuriously
+  fails for this reason. When the LP has multiple equally-minimal-L1-cost
+  optimal solutions, HiGHS returns some optimal vertex with no secondary
+  preference toward leaving more columns untouched — the returned row is
+  always a genuinely minimal-L1, fully compliant, sign-preserving
+  correction, but is not guaranteed to be the unique one that moves the
+  fewest columns among several equally-cheap alternatives.</li>
+</ul>
+
+
+
+
+
+
+
+
+
+
+
+
+                
+              </article>
+            </div>
+          
+          
+<script>var target=document.getElementById(location.hash.slice(1));target&&target.name&&(target.checked=target.name.startsWith("__tabbed_"))</script>
+        </div>
+        
+          <button type="button" class="md-top md-icon" data-md-component="top" hidden>
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M13 20h-2V8l-5.5 5.5-1.42-1.42L12 4.16l7.92 7.92-1.42 1.42L13 8z"/></svg>
+  Back to top
+</button>
+        
+      </main>
+      
+        <footer class="md-footer">
+  
+  <div class="md-footer-meta md-typeset">
+    <div class="md-footer-meta__inner md-grid">
+      <div class="md-copyright">
+  
+  
+    Made with
+    <a href="https://squidfunk.github.io/mkdocs-material/" target="_blank" rel="noopener">
+      Material for MkDocs
+    </a>
+  
+</div>
+      
+    </div>
+  </div>
+</footer>
+      
+    </div>
+    <div class="md-dialog" data-md-component="dialog">
+      <div class="md-dialog__inner md-typeset"></div>
+    </div>
+    
+    
+    
+      
+      
+      <script id="__config" type="application/json">{"annotate": null, "base": "..", "features": ["navigation.sections", "navigation.top", "content.code.copy"], "search": "../assets/javascripts/workers/search.2c215733.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": null}</script>
+    
+    
+      <script src="../assets/javascripts/bundle.d7400e89.min.js"></script>
+      
+    
+  </body>
+</html>

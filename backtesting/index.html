@@ -1,0 +1,1174 @@
+
+<!doctype html>
+<html lang="en" class="no-js">
+  <head>
+    
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width,initial-scale=1">
+      
+        <meta name="description" content="Reproducible quantitative research and backtesting platform">
+      
+      
+      
+        <link rel="canonical" href="https://sefaav.github.io/QuantLab/backtesting/">
+      
+      
+        <link rel="prev" href="../api/">
+      
+      
+        <link rel="next" href="../drift_compliance/">
+      
+      
+        
+      
+      
+      <link rel="icon" href="../assets/images/favicon.png">
+      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.7.7">
+    
+    
+      
+        <title>Backtesting - QuantLab</title>
+      
+    
+    
+      <link rel="stylesheet" href="../assets/stylesheets/main.ec1eaa64.min.css">
+      
+        
+        <link rel="stylesheet" href="../assets/stylesheets/palette.ab4e12ef.min.css">
+      
+      
+
+
+    
+    
+      
+    
+    
+      
+        
+        
+        <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+        <link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Roboto:300,300i,400,400i,700,700i%7CRoboto+Mono:400,400i,700,700i&display=fallback">
+        <style>:root{--md-text-font:"Roboto";--md-code-font:"Roboto Mono"}</style>
+      
+    
+    
+    <script>__md_scope=new URL("..",location),__md_hash=e=>[...e].reduce(((e,_)=>(e<<5)-e+_.charCodeAt(0)),0),__md_get=(e,_=localStorage,t=__md_scope)=>JSON.parse(_.getItem(t.pathname+"."+e)),__md_set=(e,_,t=localStorage,a=__md_scope)=>{try{t.setItem(a.pathname+"."+e,JSON.stringify(_))}catch(e){}}</script>
+    
+      
+
+    
+    
+  </head>
+  
+  
+    
+    
+      
+    
+    
+    
+    
+    <body dir="ltr" data-md-color-scheme="default" data-md-color-primary="indigo" data-md-color-accent="indigo">
+  
+    
+    <input class="md-toggle" data-md-toggle="drawer" type="checkbox" id="__drawer" autocomplete="off">
+    <input class="md-toggle" data-md-toggle="search" type="checkbox" id="__search" autocomplete="off">
+    <label class="md-overlay" for="__drawer"></label>
+    <div data-md-component="skip">
+      
+        
+        <a href="#backtesting" class="md-skip">
+          Skip to content
+        </a>
+      
+    </div>
+    <div data-md-component="announce">
+      
+    </div>
+    
+    
+      
+
+  
+
+<header class="md-header md-header--shadow" data-md-component="header">
+  <nav class="md-header__inner md-grid" aria-label="Header">
+    <a href=".." title="QuantLab" class="md-header__button md-logo" aria-label="QuantLab" data-md-component="logo">
+      
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a3 3 0 0 0 3-3 3 3 0 0 0-3-3 3 3 0 0 0-3 3 3 3 0 0 0 3 3m0 3.54C9.64 9.35 6.5 8 3 8v11c3.5 0 6.64 1.35 9 3.54 2.36-2.19 5.5-3.54 9-3.54V8c-3.5 0-6.64 1.35-9 3.54"/></svg>
+
+    </a>
+    <label class="md-header__button md-icon" for="__drawer">
+      
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M3 6h18v2H3zm0 5h18v2H3zm0 5h18v2H3z"/></svg>
+    </label>
+    <div class="md-header__title" data-md-component="header-title">
+      <div class="md-header__ellipsis">
+        <div class="md-header__topic">
+          <span class="md-ellipsis">
+            QuantLab
+          </span>
+        </div>
+        <div class="md-header__topic" data-md-component="header-topic">
+          <span class="md-ellipsis">
+            
+              Backtesting
+            
+          </span>
+        </div>
+      </div>
+    </div>
+    
+      
+        <form class="md-header__option" data-md-component="palette">
+  
+    
+    
+    
+    <input class="md-option" data-md-color-media="" data-md-color-scheme="default" data-md-color-primary="indigo" data-md-color-accent="indigo"  aria-label="Switch to dark mode"  type="radio" name="__palette" id="__palette_0">
+    
+      <label class="md-header__button md-icon" title="Switch to dark mode" for="__palette_1" hidden>
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a4 4 0 0 0-4 4 4 4 0 0 0 4 4 4 4 0 0 0 4-4 4 4 0 0 0-4-4m0 10a6 6 0 0 1-6-6 6 6 0 0 1 6-6 6 6 0 0 1 6 6 6 6 0 0 1-6 6m8-9.31V4h-4.69L12 .69 8.69 4H4v4.69L.69 12 4 15.31V20h4.69L12 23.31 15.31 20H20v-4.69L23.31 12z"/></svg>
+      </label>
+    
+  
+    
+    
+    
+    <input class="md-option" data-md-color-media="" data-md-color-scheme="slate" data-md-color-primary="indigo" data-md-color-accent="indigo"  aria-label="Switch to light mode"  type="radio" name="__palette" id="__palette_1">
+    
+      <label class="md-header__button md-icon" title="Switch to light mode" for="__palette_0" hidden>
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 18c-.89 0-1.74-.2-2.5-.55C11.56 16.5 13 14.42 13 12s-1.44-4.5-3.5-5.45C10.26 6.2 11.11 6 12 6a6 6 0 0 1 6 6 6 6 0 0 1-6 6m8-9.31V4h-4.69L12 .69 8.69 4H4v4.69L.69 12 4 15.31V20h4.69L12 23.31 15.31 20H20v-4.69L23.31 12z"/></svg>
+      </label>
+    
+  
+</form>
+      
+    
+    
+      <script>var palette=__md_get("__palette");if(palette&&palette.color){if("(prefers-color-scheme)"===palette.color.media){var media=matchMedia("(prefers-color-scheme: light)"),input=document.querySelector(media.matches?"[data-md-color-media='(prefers-color-scheme: light)']":"[data-md-color-media='(prefers-color-scheme: dark)']");palette.color.media=input.getAttribute("data-md-color-media"),palette.color.scheme=input.getAttribute("data-md-color-scheme"),palette.color.primary=input.getAttribute("data-md-color-primary"),palette.color.accent=input.getAttribute("data-md-color-accent")}for(var[key,value]of Object.entries(palette.color))document.body.setAttribute("data-md-color-"+key,value)}</script>
+    
+    
+    
+      
+      
+        <label class="md-header__button md-icon" for="__search">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+        </label>
+        <div class="md-search" data-md-component="search" role="dialog">
+  <label class="md-search__overlay" for="__search"></label>
+  <div class="md-search__inner" role="search">
+    <form class="md-search__form" name="search">
+      <input type="text" class="md-search__input" name="query" aria-label="Search" placeholder="Search" autocapitalize="off" autocorrect="off" autocomplete="off" spellcheck="false" data-md-component="search-query" required>
+      <label class="md-search__icon md-icon" for="__search">
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M20 11v2H8l5.5 5.5-1.42 1.42L4.16 12l7.92-7.92L13.5 5.5 8 11z"/></svg>
+      </label>
+      <nav class="md-search__options" aria-label="Search">
+        
+        <button type="reset" class="md-search__icon md-icon" title="Clear" aria-label="Clear" tabindex="-1">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg>
+        </button>
+      </nav>
+      
+    </form>
+    <div class="md-search__output">
+      <div class="md-search__scrollwrap" tabindex="0" data-md-scrollfix>
+        <div class="md-search-result" data-md-component="search-result">
+          <div class="md-search-result__meta">
+            Initializing search
+          </div>
+          <ol class="md-search-result__list" role="presentation"></ol>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+      
+    
+    
+      <div class="md-header__source">
+        <a href="https://github.com/sefaav/QuantLab" title="Go to repository" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M439.6 236.1 244 40.5c-5.4-5.5-12.8-8.5-20.4-8.5s-15 3-20.4 8.4L162.5 81l51.5 51.5c27.1-9.1 52.7 16.8 43.4 43.7l49.7 49.7c34.2-11.8 61.2 31 35.5 56.7-26.5 26.5-70.2-2.9-56-37.3L240.3 199v121.9c25.3 12.5 22.3 41.8 9.1 55-6.4 6.4-15.2 10.1-24.3 10.1s-17.8-3.6-24.3-10.1c-17.6-17.6-11.1-46.9 11.2-56v-123c-20.8-8.5-24.6-30.7-18.6-45L142.6 101 8.5 235.1C3 240.6 0 247.9 0 255.5s3 15 8.5 20.4l195.6 195.7c5.4 5.4 12.7 8.4 20.4 8.4s15-3 20.4-8.4l194.7-194.7c5.4-5.4 8.4-12.8 8.4-20.4s-3-15-8.4-20.4"/></svg>
+  </div>
+  <div class="md-source__repository">
+    GitHub
+  </div>
+</a>
+      </div>
+    
+  </nav>
+  
+</header>
+    
+    <div class="md-container" data-md-component="container">
+      
+      
+        
+          
+        
+      
+      <main class="md-main" data-md-component="main">
+        <div class="md-main__inner md-grid">
+          
+            
+              
+              <div class="md-sidebar md-sidebar--primary" data-md-component="sidebar" data-md-type="navigation" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+
+
+<nav class="md-nav md-nav--primary" aria-label="Navigation" data-md-level="0">
+  <label class="md-nav__title" for="__drawer">
+    <a href=".." title="QuantLab" class="md-nav__button md-logo" aria-label="QuantLab" data-md-component="logo">
+      
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a3 3 0 0 0 3-3 3 3 0 0 0-3-3 3 3 0 0 0-3 3 3 3 0 0 0 3 3m0 3.54C9.64 9.35 6.5 8 3 8v11c3.5 0 6.64 1.35 9 3.54 2.36-2.19 5.5-3.54 9-3.54V8c-3.5 0-6.64 1.35-9 3.54"/></svg>
+
+    </a>
+    QuantLab
+  </label>
+  
+    <div class="md-nav__source">
+      <a href="https://github.com/sefaav/QuantLab" title="Go to repository" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M439.6 236.1 244 40.5c-5.4-5.5-12.8-8.5-20.4-8.5s-15 3-20.4 8.4L162.5 81l51.5 51.5c27.1-9.1 52.7 16.8 43.4 43.7l49.7 49.7c34.2-11.8 61.2 31 35.5 56.7-26.5 26.5-70.2-2.9-56-37.3L240.3 199v121.9c25.3 12.5 22.3 41.8 9.1 55-6.4 6.4-15.2 10.1-24.3 10.1s-17.8-3.6-24.3-10.1c-17.6-17.6-11.1-46.9 11.2-56v-123c-20.8-8.5-24.6-30.7-18.6-45L142.6 101 8.5 235.1C3 240.6 0 247.9 0 255.5s3 15 8.5 20.4l195.6 195.7c5.4 5.4 12.7 8.4 20.4 8.4s15-3 20.4-8.4l194.7-194.7c5.4-5.4 8.4-12.8 8.4-20.4s-3-15-8.4-20.4"/></svg>
+  </div>
+  <div class="md-source__repository">
+    GitHub
+  </div>
+</a>
+    </div>
+  
+  <ul class="md-nav__list" data-md-scrollfix>
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href=".." class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Home
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../architecture/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Architecture
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../data_pipeline/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Data pipeline
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../strategies/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Strategies
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../strategy_explorer/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Strategy Explorer
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../api/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Python API
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+    
+  
+  
+  
+    <li class="md-nav__item md-nav__item--active">
+      
+      <input class="md-nav__toggle md-toggle" type="checkbox" id="__toc">
+      
+      
+        
+      
+      
+        <label class="md-nav__link md-nav__link--active" for="__toc">
+          
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Backtesting
+  
+
+    
+  </span>
+  
+  
+
+          <span class="md-nav__icon md-icon"></span>
+        </label>
+      
+      <a href="./" class="md-nav__link md-nav__link--active">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Backtesting
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+      
+        
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#pipeline-order" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Pipeline order
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#preventing-look-ahead-bias" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Preventing look-ahead bias
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#equity-accounting" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Equity accounting
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#stop-loss-take-profit" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Stop-loss / take-profit
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#missing-data" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Missing data
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#short-positions" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Short positions
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#costs" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Costs
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#rebalancing-turnover" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Rebalancing &amp; turnover
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#weight-drift" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Weight drift
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#trade-log-reason-attribution" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Trade-log reason attribution
+      
+    </span>
+  </a>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../drift_compliance/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Drift compliance
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../validation/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Validation
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../limitations/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Limitations
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+  </ul>
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+            
+              
+              <div class="md-sidebar md-sidebar--secondary" data-md-component="sidebar" data-md-type="toc" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#pipeline-order" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Pipeline order
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#preventing-look-ahead-bias" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Preventing look-ahead bias
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#equity-accounting" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Equity accounting
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#stop-loss-take-profit" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Stop-loss / take-profit
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#missing-data" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Missing data
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#short-positions" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Short positions
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#costs" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Costs
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#rebalancing-turnover" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Rebalancing &amp; turnover
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#weight-drift" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Weight drift
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#trade-log-reason-attribution" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Trade-log reason attribution
+      
+    </span>
+  </a>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+          
+          
+            <div class="md-content" data-md-component="content">
+              
+              <article class="md-content__inner md-typeset">
+                
+                  
+
+
+  
+  
+
+
+<h1 id="backtesting">Backtesting<a class="headerlink" href="#backtesting" title="Permanent link">&para;</a></h1>
+<h2 id="pipeline-order">Pipeline order<a class="headerlink" href="#pipeline-order" title="Permanent link">&para;</a></h2>
+<p>The CLI and <code>BacktestEngine.run()</code> together execute this sequence:</p>
+<ol>
+<li>Load, clean and validate data in <code>DataLoader</code>.</li>
+<li>Isolate tradable symbols and compute adjusted-price returns.</li>
+<li>Compute features inside the strategy and generate signals at <code>t</code>.</li>
+<li>Transform signals into target weights with the allocator.</li>
+<li>Apply optional portfolio-level volatility targeting.</li>
+<li>Apply hard portfolio constraints.</li>
+<li>Apply the configured rebalance schedule and turnover cap.</li>
+<li>Apply any additional execution-delay stress assumption.</li>
+<li><strong>Shift held weights one period before computing returns</strong> — the
+   look-ahead barrier.</li>
+<li>When <code>portfolio.model_weight_drift</code> is enabled, evolve the shifted,
+    executed weights forward by organic price drift between real trades
+    (see <a href="#weight-drift">Weight drift</a>) — otherwise unchanged, holding
+    them constant until the next scheduled rebalance.</li>
+<li>Solve turnover, costs, gross/net returns and equity, including
+    equity-dependent volume slippage.</li>
+<li>Build the benchmark and trade log from the same dates and cost assumptions.</li>
+<li>Compute metrics and assemble the <code>BacktestResult</code>.</li>
+</ol>
+<h2 id="preventing-look-ahead-bias">Preventing look-ahead bias<a class="headerlink" href="#preventing-look-ahead-bias" title="Permanent link">&para;</a></h2>
+<p>The return earned in period <code>t</code> must come from a position <strong>decided before</strong>
+<code>t</code>. <code>quantlab.backtesting.accounting.run_accounting</code> enforces this via
+<code>quantlab.execution.orders.executed_weights</code>:</p>
+<div class="highlight"><pre><span></span><code><span class="n">executed_weights</span> <span class="o">=</span> <span class="n">compute_executed_weights</span><span class="p">(</span>
+    <span class="n">held_weights</span><span class="p">,</span>
+    <span class="n">tradable</span><span class="o">=</span><span class="n">tradable</span><span class="p">,</span>
+<span class="p">)</span>
+<span class="n">gross_returns</span> <span class="o">=</span> <span class="p">(</span><span class="n">executed_weights</span> <span class="o">*</span> <span class="n">asset_returns</span><span class="p">)</span><span class="o">.</span><span class="n">sum</span><span class="p">(</span><span class="n">axis</span><span class="o">=</span><span class="mi">1</span><span class="p">)</span>
+</code></pre></div>
+<p>For a single-calendar universe (<code>tradable=None</code>) this reduces to the simple
+mental model <code>held_weights.shift(1)</code> (first row zeroed); when a per-symbol
+<code>tradable</code> mask is given, the shift is per-symbol tradability-aware instead
+— a decision made right before a closure lands on that symbol's own next
+tradable row, not the raw next row, so it is never misattributed as trading
+during the closure itself.</p>
+<p>This is directly unit-tested (<code>tests/unit/test_accounting.py</code>): a signal that
+turns long on date <em>i</em> must show zero gain on date <em>i</em> and only starts
+capturing returns from date <em>i + 1</em>.</p>
+<h2 id="equity-accounting">Equity accounting<a class="headerlink" href="#equity-accounting" title="Permanent link">&para;</a></h2>
+<div class="highlight"><pre><span></span><code>equity_0 = initial_capital
+equity_t = equity_{t-1} * (1 + net_return_t)
+</code></pre></div>
+<p>Gross and net equity curves are both retained, so cost drag can be
+inspected via <code>result.gross_net_comparison()</code>.</p>
+<h2 id="stop-loss-take-profit">Stop-loss / take-profit<a class="headerlink" href="#stop-loss-take-profit" title="Permanent link">&para;</a></h2>
+<p>A strategy's <code>stop_loss_pct</code>/<code>take_profit_pct</code> (fractional, e.g. <code>0.10</code> =
+10%, <code>None</code> by default on every built-in strategy -- disabled with
+strictly no change to accounting's numbers) force-flatten a position when
+its cumulative return since entry breaches the configured threshold. This
+operates on the <strong>real executed position</strong> (<code>accounting.executed_weights</code>,
+after the allocator, portfolio constraints, rebalancing schedule and
+turnover cap), never on a strategy's raw signal -- a signal is not
+necessarily a realized position. For a symbol/group <code>G</code>, at each date:</p>
+<div class="highlight"><pre><span></span><code>gross_exposure = sum(|executed_weight| for each symbol in G)
+group_return   = sum(executed_weight * asset_return for each symbol in G) / gross_exposure
+</code></pre></div>
+<p><code>group_return</code> is per unit of the group's <em>own</em> realized exposure that
+date, not a dollar contribution to total portfolio equity — this makes it
+correct regardless of a static or dynamic hedge ratio, rebalancing,
+weight changes, long/short direction or partial fills. For a single
+symbol it reduces to <code>sign(executed_weight) * asset_return</code>, the standard
+price-based stop-loss/take-profit. A strategy declares a multi-symbol
+group via <code>BaseStrategy.position_groups()</code> (e.g. <code>pairs_trading</code>'s two
+legs, so a stop-loss triggers on the pair's <em>combined</em> P&amp;L, not either
+leg's own return in isolation) — every symbol not covered by a declared
+group is its own independent group. Thresholds are evaluated on <strong>gross
+(pre-cost) return</strong>: QuantLab's execution cost model is portfolio-level
+only (no per-symbol/per-group cost decomposition), so an exact net-of-cost
+trigger is not presently computable — a deliberate, disclosed design
+convention. Once triggered, no immediate re-entry at a rebased price: the
+position stays flat until its next real flat-to-non-flat transition. See
+<code>quantlab.backtesting.accounting._detect_stop_loss_take_profit</code>.</p>
+<h2 id="missing-data">Missing data<a class="headerlink" href="#missing-data" title="Permanent link">&para;</a></h2>
+<p>If an asset return is missing while a non-zero position is held, accounting
+raises <code>BacktestError</code>; it never invents a 0% move. A missing return on an
+unheld asset contributes nothing. A row with no held exposure is treated as a
+zero portfolio return.</p>
+<h2 id="short-positions">Short positions<a class="headerlink" href="#short-positions" title="Permanent link">&para;</a></h2>
+<p><code>portfolio_return = weight * asset_return</code>. A negative weight combined with a
+negative asset return correctly produces a gain — no special-casing needed;
+this is a straight consequence of the formula and is unit-tested.</p>
+<h2 id="costs">Costs<a class="headerlink" href="#costs" title="Permanent link">&para;</a></h2>
+<p>Three components are charged from traded notional (expressed as a fraction of
+equity when the model receives weight changes):</p>
+<ul>
+<li><strong>Commission</strong>: <code>traded_notional * commission_bps / 10_000</code></li>
+<li><strong>Spread</strong>: <code>traded_notional * spread_bps / 20_000</code> (half-spread)</li>
+<li><strong>Slippage</strong>: a constant rate (<code>bps / 10_000</code>) or a nonlinear volume-based
+  impact rate (<code>base_bps + impact_coefficient * sqrt(order / ADV)</code>). The
+  volume model requires finite positive ADV for every traded asset.</li>
+</ul>
+<p><code>ExecutionModel</code> aggregates all three; the trade log
+(<code>quantlab.backtesting.trade_log</code>) itemises every fill with its own cost
+breakdown.</p>
+<h2 id="rebalancing-turnover">Rebalancing &amp; turnover<a class="headerlink" href="#rebalancing-turnover" title="Permanent link">&para;</a></h2>
+<p>This section describes <code>rebalancing.py</code>'s own DECISION-timeline output --
+the <em>rebalance target</em> the strategy/allocator/constraints machinery
+decides to chase. It is not automatically the <em>weight actually held</em>, and
+its own turnover formula is not automatically the <em>real trade</em> executed:
+when <code>portfolio.model_weight_drift</code> is enabled (the default -- see
+<a href="#weight-drift">Weight drift</a> below), organic price drift between real
+trades changes the weight actually held continuously, and a genuine trade
+is instead reported by <code>apply_weight_drift</code>'s own <code>trade_changes</code> output --
+exactly zero on a pure-drift row (price moved; nothing was traded) and the
+real size on an anchor or a landed compliance/turnover-cap correction.</p>
+<p>Daily allocator output is a <em>target</em>; <code>apply_rebalancing</code> samples it on
+rebalance dates (daily / weekly / monthly / quarterly) and holds it constant
+between them — at THIS decision-timeline layer, trades, and therefore
+costs, only occur at rebalances. Turnover is <code>sum(|held_t - held_{t-1}|)</code>
+(<code>w_{-1} = 0</code>), directly matching the manual example of capital 100k,
+turnover 0.5, 10 bps → cost 50.</p>
+<p>For a mixed-calendar portfolio, <code>rebalance_and_cap_turnover</code> is
+tradability-aware: a closed instrument (per its own calendar, see
+<a href="../data_pipeline/#verified-closures-vs-missing-data">Data pipeline</a>) never
+trades on a closed date, and its rebalance target becomes a pending debt that
+keeps retrying — at every following tradable session, not only the next
+scheduled rebalance — until fully executed, even if <code>maximum_turnover</code> spreads
+that execution across several sessions. Portfolio constraints (gross/net
+exposure, max weight, long-only) are enforced on the actually-executed
+holdings after accounting for frozen/closed instruments, not just on the
+theoretical fully-open target, since freezing one instrument while others move
+can push the real portfolio out of its mandate even when the target was
+compliant. For a single-calendar experiment this machinery is a proven no-op:
+behaviour is byte-identical to the plain rebalance/turnover-cap path above.</p>
+<p><code>rebalance_and_cap_turnover</code>'s output — including a pending target resolving
+there on a reopening day — is still only a <em>decision</em>, dated that day. Every
+decision, on a reopening day or an ordinary rebalance date alike, is subject
+to the same one-period (tradability-respecting) look-ahead shift applied by
+the accounting layer before it affects executed weights, turnover or costs —
+a target that resolves in <code>held_weights</code> on a symbol's reopening day therefore
+does not reach the accounting layer until that symbol's <em>next</em> tradable
+session, not the reopening day itself.</p>
+<h2 id="weight-drift">Weight drift<a class="headerlink" href="#weight-drift" title="Permanent link">&para;</a></h2>
+<p>Everything above describes <code>rebalancing.py</code>'s own output: a decision-timeline
+step function, constant between rebalance dates. A real portfolio does not
+actually stay constant between trades — each asset's own price move drifts
+its dollar exposure, and therefore its weight, continuously. When
+<code>portfolio.model_weight_drift</code> is <code>True</code> (the default),
+<code>quantlab.backtesting.accounting.apply_weight_drift</code> evolves the already
+shifted, executed weights forward between genuine trades, via a per-column
+dollar exposure and a single shared relative equity <code>E</code> (<code>weight[i] =
+dollar[i] / E</code>).</p>
+<p>Conceptually, two independent kinds of debt drive every row's output, in
+priority order: a hard-risk-limit breach (<code>maximum_weight</code>/<code>maximum_gross_
+exposure</code>/<code>maximum_net_exposure</code>/<code>long_only</code>) is corrected first, via a
+genuine linear program — never a "clip and scale toward zero" heuristic,
+which can move exposure in the wrong direction — that finds the minimal-
+turnover point restoring compliance; an ordinary fresh rebalance decision
+is applied second, turnover-capped like a decision-level rebalance. See
+<a href="../drift_compliance/">Weight-drift mechanics and the compliance-restoration LP</a>
+for the full per-column debt priority order, anchor detection, the
+bankruptcy guard, and the LP's exact formulation — this section only
+states the invariants and limitations a caller needs to know:</p>
+<ul>
+<li>Output is always a <em>pre-period</em> value — the weight held going into a
+  row, before that row's own return is applied — never the post-period
+  value, which would double-count that row's own return.</li>
+<li>A declared position group (e.g. <code>pairs_trading</code>'s two legs, see
+  <code>BaseStrategy.position_groups()</code>) is always corrected as one coherent
+  unit via a single shared scaling factor, never one leg moving alone.</li>
+<li>The correction is sign/support-preserving: an existing long may shrink
+  or grow further long, an existing short may shrink or grow further
+  short, but neither crosses zero, and a column already at exactly zero
+  is never opened into a brand-new position — it can never invent a hedge
+  the strategy's own signal never asked for.</li>
+<li>A closed asset's dollar exposure does not move, but its weight still
+  drifts purely through <code>E</code>'s own movement from every other tradable
+  asset's real return.</li>
+<li>A hard risk-limit breach detected using row <code>t</code>'s own drift cannot
+  execute until row <code>t+1</code> at the earliest — the same look-ahead barrier
+  as every other decision in this module — and if the responsible
+  exposure sits in a currently-closed column, full correction may be
+  impossible until it reopens; the LP applies the best achievable fix
+  meanwhile, carrying the residual as a pending breach rather than
+  raising or silently dropping it.</li>
+<li>Never produces <code>inf</code>/<code>NaN</code>: a bankrupt anchor-episode (relative <code>E &lt;=
+  EPSILON</code>) is force-flattened and logged instead of dividing by
+  (near-)zero.</li>
+<li><code>model_weight_drift=False</code> remains available as an optional constant-
+  weight compatibility mode (byte-identical to the step function described
+  above), not the recommended path.</li>
+<li>The compliance-restoration LP's own basis is gross/pre-cost, the same
+  disclosed convention already used by <code>stop_loss_pct</code>/<code>take_profit_pct</code>.</li>
+</ul>
+<h2 id="trade-log-reason-attribution">Trade-log reason attribution<a class="headerlink" href="#trade-log-reason-attribution" title="Permanent link">&para;</a></h2>
+<p><code>quantlab.backtesting.trade_log._classify_reason</code> assigns every fill's
+<code>trigger_reason_code</code>/<code>adjustment_reason_codes</code> from real, per-layer
+provenance signals — never deduced after the fact from <code>new != desired</code>.
+<code>execution_delay</code>/the rebalance-sampling frequency are not adjustments:
+they are uniform timing conventions baked into every comparison below, so
+they shift <em>when</em> a trigger is consumed, never <em>what</em> explains one trade's
+execution differing from another's.</p>
+<p><strong>Trigger</strong> — the single most-upstream event currently consumed that
+initiated the target change (not exhaustive: when <code>strategy_signal</code> is the
+trigger, a downstream layer subsequently recomputing the target is a
+mechanical consequence of that same event, not separately lost
+information):</p>
+<table>
+<thead>
+<tr>
+<th>Priority</th>
+<th>Code</th>
+<th>Fires when</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1</td>
+<td><code>strategy_signal</code></td>
+<td>The strategy's own decision changed since the last rebalance (from its diagnostic decision proxy — <code>decision_signal()</code> when provided, else the raw signal).</td>
+</tr>
+<tr>
+<td>2</td>
+<td><code>portfolio_rebalance</code></td>
+<td>Only the allocator's output changed.</td>
+</tr>
+<tr>
+<td>3</td>
+<td><code>volatility_target_adjustment</code></td>
+<td>Only vol-targeting changed the target.</td>
+</tr>
+<tr>
+<td>—</td>
+<td><em>(none)</em></td>
+<td>Nothing above changed.</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Adjustment(s)</strong> — collected independently of trigger, from each layer's
+own real provenance signal; a higher-priority cause fully explains the row
+and suppresses lower-priority ones (the precise clip value of a lower
+layer becomes moot once a higher one applies). Priorities 1–3 never touch
+<code>trigger</code>, which keeps reflecting what the strategy actually wanted:</p>
+<table>
+<thead>
+<tr>
+<th>Priority</th>
+<th>Code(s)</th>
+<th>Fires when</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1</td>
+<td><code>forced_liquidation</code></td>
+<td>Portfolio ruin (<code>AccountingResult.ruined</code>) — overrides everything else.</td>
+</tr>
+<tr>
+<td>2</td>
+<td><code>stop_loss</code> / <code>take_profit</code></td>
+<td>A real force-flatten (<code>AccountingResult.stop_loss_triggered</code>/<code>take_profit_triggered</code>) — overrides ordinary constraints, overridden by <code>forced_liquidation</code>.</td>
+</tr>
+<tr>
+<td>3</td>
+<td><code>drift_compliance</code> / <code>drift_compliance_pending</code></td>
+<td>The drift-compliance LP restored (or attempted to restore) a hard risk limit breached by organic drift — overrides ordinary constraint/tradability/turnover_cap adjustments, overridden by a stop-loss/take-profit breach on that same corrected weight.</td>
+</tr>
+<tr>
+<td>4</td>
+<td>Constraint name(s), <code>tradability</code>, <code>turnover_cap</code></td>
+<td>A contributing constraint (direct/redistribution), a closure catch-up/feasibility limit, or the turnover budget itself.</td>
+</tr>
+<tr>
+<td>5</td>
+<td><code>position_rescaling</code> / <code>deferred_catchup</code></td>
+<td>Last-resort fallback: the target is still drifting with no known trigger (e.g. pairs_trading's price/beta rescaling), or the causal layer is genuinely unknown — reached only when nothing above explains the row.</td>
+</tr>
+</tbody>
+</table>
+
+
+
+
+
+
+
+
+
+
+
+
+                
+              </article>
+            </div>
+          
+          
+<script>var target=document.getElementById(location.hash.slice(1));target&&target.name&&(target.checked=target.name.startsWith("__tabbed_"))</script>
+        </div>
+        
+          <button type="button" class="md-top md-icon" data-md-component="top" hidden>
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M13 20h-2V8l-5.5 5.5-1.42-1.42L12 4.16l7.92 7.92-1.42 1.42L13 8z"/></svg>
+  Back to top
+</button>
+        
+      </main>
+      
+        <footer class="md-footer">
+  
+  <div class="md-footer-meta md-typeset">
+    <div class="md-footer-meta__inner md-grid">
+      <div class="md-copyright">
+  
+  
+    Made with
+    <a href="https://squidfunk.github.io/mkdocs-material/" target="_blank" rel="noopener">
+      Material for MkDocs
+    </a>
+  
+</div>
+      
+    </div>
+  </div>
+</footer>
+      
+    </div>
+    <div class="md-dialog" data-md-component="dialog">
+      <div class="md-dialog__inner md-typeset"></div>
+    </div>
+    
+    
+    
+      
+      
+      <script id="__config" type="application/json">{"annotate": null, "base": "..", "features": ["navigation.sections", "navigation.top", "content.code.copy"], "search": "../assets/javascripts/workers/search.2c215733.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": null}</script>
+    
+    
+      <script src="../assets/javascripts/bundle.d7400e89.min.js"></script>
+      
+    
+  </body>
+</html>
