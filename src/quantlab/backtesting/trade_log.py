@@ -3,6 +3,16 @@
 Each row records a non-zero change, its estimated notional and modelled costs.
 It does not simulate share quantities or partial order execution.
 
+``timestamp`` is the row's position in the EXECUTED timeline (``executed[
+timestamp] != executed[timestamp - 1]``), not a single unambiguous moment
+in wall-clock time: the underlying decision was always made from data
+through the PREVIOUS bar's close, but the fill itself lands at a different
+real moment depending on ``execution_timing`` -- that same previous
+close (``same_bar_close``/``immediate_after_close``) or this row's own
+open (``next_bar_open``). ``reference_price`` (see ``reference_prices``/
+``reference_price_needs_shift`` below) is the one column that actually
+encodes which of those the fill used.
+
 Reason attribution uses four independent concepts, which may legitimately
 differ on the same row without contradiction:
 
@@ -44,7 +54,7 @@ from quantlab.constants import BPS_TO_FRACTION, EPSILON
 from quantlab.exceptions import BacktestError
 from quantlab.execution.orders import (
     equity_before_period,
-    traded_notional,
+    validate_equity_series,
     validate_execution_frame,
 )
 from quantlab.execution.slippage import (
@@ -567,10 +577,12 @@ def build_trade_log(
     equity: pd.Series,
     reference_prices: pd.DataFrame,
     *,
+    reference_price_needs_shift: bool = True,
     commission_bps: float,
     spread_bps: float,
     slippage_model: SlippageModel,
     slippage_equity: pd.Series | None = None,
+    execution_equity: pd.Series | None = None,
     executed_desired: pd.DataFrame | None = None,
     executed_constrained: pd.DataFrame | None = None,
     executed_signal_diag: pd.DataFrame | None = None,
@@ -597,134 +609,105 @@ def build_trade_log(
 
     Args:
         executed_weights: Weights actually in force each period.
-        weight_changes: Per-symbol change in the executed book.
-        equity: Net equity curve (used to size notional off prior equity).
-        reference_prices: Price matrix for the reference price of each fill.
+        weight_changes: Per-symbol change in the executed book -- pass
+            ``AccountingResult.weight_changes_for_costs``, never its plain
+            ``weight_changes``, so the per-fill notional/action here sizes
+            off the SAME real trade delta ``AccountingResult.turnover``/
+            ``costs`` already used (identical to ``weight_changes`` itself
+            outside ``execution_timing="next_bar_open"``).
+        equity: Net equity curve (used to size notional off prior equity
+            when ``execution_equity`` is not given -- see its own doc
+            below).
+        reference_prices: Price matrix for the reference price of each fill
+            -- pass ``quantlab.backtesting.execution_prices.
+            reference_prices_for_config``'s own output (both elements) to
+            get the mode-correct price: close(T-1) for same_bar_close/
+            immediate_after_close, or open(T) for next_bar_open.
+        reference_price_needs_shift: Whether ``reference_prices`` still
+            needs the standard "lag by one row" treatment (True, default)
+            -- appropriate whenever it holds close prices and a fill on
+            row T was actually filled at row T-1's close. Pass ``False``
+            when ``reference_prices`` already IS the execution-moment
+            price for row T itself (e.g. an adjusted-open matrix under
+            next_bar_open) and must be read as-is, unshifted.
         commission_bps: Commission in bps.
         spread_bps: Full spread in bps (half applied).
         slippage_model: The same per-symbol model used by accounting.
         slippage_equity: Per-date equity passed to the slippage model's
             ``equity`` argument. Pass ``AccountingResult.equity_for_costs``
-            to reproduce volume-based accounting costs.
-        executed_desired: The fully-desired, pre-constraint target weights
-            (post-allocator, post-volatility-targeting), aligned to
-            ``executed_weights``' own index via the same
-            ``executed_weights()`` shift -- a *real* pipeline frame, not a
-            reconstruction. Required (with the 4 arguments below) to
-            populate the trigger/adjustment columns; when omitted, those
-            columns are ``None``/``NaT`` for every row (e.g. walk-forward's
-            own call site, which rebuilds trades from a stitched
-            out-of-sample weight series with no per-fold diagnostic frames
-            surviving the stitch -- attribution is genuinely unavailable
-            there, not merely unwired) while ``action`` is still always
-            computed.
-        executed_constrained: The post-``ConstraintSet``, pre-turnover-cap
-            target weights, aligned the same way as ``executed_desired``.
-        executed_signal_diag: The strategy's decision proxy (``decision_
-            signal()`` when the strategy provides one, else the raw
-            signal), resampled to rebalance dates and aligned to
-            ``executed_weights``' index -- a *diagnostic* frame (see
-            ``engine.py``'s ``_rebalance_diagnostic_frame``), used only to
-            detect "did the strategy's decision change since the last
-            rebalance", never to recompute an executed weight.
-        executed_allocated_diag: The allocator's raw output, diagnostic-
-            sampled the same way as ``executed_signal_diag``.
-        executed_desired_diag: ``executed_desired``, diagnostic-sampled the
-            same way, used to detect a volatility-targeting-driven change
-            since the last rebalance (as opposed to ``executed_desired``
-            itself, which is used unsampled here to detect a still-drifting
-            target for the position_rescaling/deferred_catchup fallback).
+            to reproduce volume-based accounting costs -- ignored when
+            ``execution_equity`` is given (see below).
+        execution_equity: The REAL equity a trade executes against, per
+            date -- pass ``AccountingResult.execution_equity`` so every
+            dollar figure here reconciles exactly with
+            ``AccountingResult.costs``/``turnover``. Unlike ``equity``/
+            ``slippage_equity``, this is used AS-IS, never shifted by one
+            row again here: it already IS "prior equity" (close(T-1) for
+            same_bar_close/immediate_after_close, or open(T), after that
+            date's own overnight leg, for next_bar_open) -- re-shifting it
+            would silently go back an extra period. ``None`` (default)
+            falls back to shifting ``equity``/``slippage_equity`` by one
+            row each here instead, matching every execution_timing mode
+            that has no overnight leg to adjust for.
+        executed_desired: The fully-desired pre-constraint target weight,
+            aligned to ``executed_weights``' own index. One of 5 real (or
+            diagnostic) pipeline frames needed to populate the
+            ``trigger``/``adjustment`` columns -- required together (or
+            omitted together, e.g. walk-forward's stitched-OOS call site,
+            which has no surviving per-fold diagnostics); see
+            docs/backtesting.md#trade-log-reason-attribution for what each
+            one feeds into and why. ``action`` is always computed
+            regardless. EVERY parameter below this point requires these
+            5 to also be supplied.
+        executed_constrained: The post-``ConstraintSet`` pre-turnover-cap
+            target weight. One of the 5 frames above.
+        executed_signal_diag: The strategy's own decision proxy,
+            rebalance-sampled. One of the 5 frames above.
+        executed_allocated_diag: The allocator's raw output,
+            rebalance-sampled. One of the 5 frames above.
+        executed_desired_diag: ``executed_desired``, rebalance-sampled.
+            One of the 5 frames above.
         tradable: Per-symbol tradability mask, real and already computed
-            by the engine. ``None`` means every symbol was always tradable
-            (no per-symbol calendar closures modeled) -- distinct from a
-            per-cell ``False``.
+            by the engine. ``None`` means every symbol was always tradable.
         executed_strategy_reason_code: The strategy's own per-cell
-            ``trigger_reason_detail_code`` (``str | None``), aligned to
-            ``executed_weights``' index the same way as the other reason
-            frames. Requires the 5 arguments above; both this and
-            ``executed_strategy_reason_details`` must be supplied
-            together or not at all. When present and a row resolves to
-            trigger ``"strategy_signal"``, overrides that branch's
-            generic text with the strategy's own attribution.
+            ``trigger_reason_detail_code``, overriding the generic
+            ``"strategy_signal"`` text. Paired with the parameter below.
         executed_strategy_reason_details: The strategy's own per-cell
-            free-text explanation, paired with
-            ``executed_strategy_reason_code``.
+            free-text explanation, paired with the parameter above.
         constraint_provenance: Per-constraint provenance from
             :meth:`ConstraintSet.apply_with_provenance`, keyed by
-            constraint name (including a ``"*_redistribution"`` entry for
-            a constraint split into direct/redistribution -- both keys
-            carry the SAME ``before``/``after`` as the base constraint,
-            only ``touched`` differs), with each ``ConstraintTouch``'s
-            frames already aligned to ``executed_weights``' index the same
-            way as the other reason frames. Requires the 5 arguments
-            above. Every constraint whose ``touched`` mask is set for a
-            given cell contributes its own entry (with its own
-            before/after text) to ``adjustment_reason_codes`` -- never a
-            single winning constraint.
-        executed_turnover_actively_limited: Real, cell-level provenance
-            from ``rebalancing.py``'s turnover-cap tracking (see
-            ``cap_turnover``/``rebalance_and_cap_turnover``'s
-            ``return_provenance``): True where the turnover budget itself
-            bound this row's move for that cell. Requires the 5 arguments
-            above; must be supplied together with
-            ``executed_turnover_touched`` or not at all.
-        executed_turnover_touched: The broader, episode-scoped turnover
-            provenance from the same source -- also True on a later row
-            still catching up a debt from an earlier turnover-limited move
-            toward the SAME still-unresolved upstream decision.
-        executed_tradability_touched: Real, cell-level provenance from
-            ``rebalancing.py``'s closure-catchup tracking: True where this
-            row's move is (at least partly) catching up a delta previously
-            blocked by a closure, or a feasibility limit reached only
-            because another symbol stayed closed. Must be supplied
-            together with ``executed_tradability_compliance_limited`` or
-            not at all; requires the 5 arguments above.
-        executed_tradability_compliance_limited: Sub-case of the above,
-            distinguishing the feasibility-limit case for detail text.
-        executed_forced_liquidation: Real, row-broadcast provenance from
-            ``AccountingResult.ruined``: True on every date the portfolio
-            was ruined and positions were forcibly flattened. Requires the
-            5 arguments above. Highest-priority adjustment -- see
-            docs/backtesting.md#trade-log-reason-attribution for the full
-            override order. Currently unreachable via the real pipeline
-            (``run_accounting`` zeroes ``weight_changes`` on every ruined
-            date), wired anyway so `_classify_reason` never falls back to
-            `unknown`/`deferred_catchup` should that ever change.
-        executed_stop_loss_triggered: Real, row-broadcast provenance from
-            ``AccountingResult.stop_loss_triggered``: True on every cell
-            whose position was force-flattened by a stop-loss breach on
-            the real executed position (see ``quantlab.backtesting.
-            accounting._detect_stop_loss_take_profit``). Unlike
-            ``executed_forced_liquidation``, this branch IS reachable in
-            practice -- a stop-loss-forced exit is a real, non-zero
-            weight change. Requires the 5 reason-attribution arguments
+            constraint name.
+        executed_turnover_actively_limited: Cell-level turnover-cap
+            provenance from ``rebalancing.py``. Paired with the parameter
+            below.
+        executed_turnover_touched: Episode-scoped turnover-cap provenance
+            from ``rebalancing.py``. Paired with the parameter above.
+        executed_tradability_touched: Closure-catchup provenance from
+            ``rebalancing.py``. Paired with the parameter below.
+        executed_tradability_compliance_limited: Feasibility-limit
+            provenance from ``rebalancing.py``. Paired with the parameter
             above.
-        executed_take_profit_triggered: Same as
-            ``executed_stop_loss_triggered``, for the favorable-side
-            threshold.
-        executed_drift_compliance_forced: Real, row-broadcast provenance
-            from ``AccountingResult.drift_compliance_forced``: True on
-            every cell whose executed weight was set by the drift-
-            compliance linear program landing a correction for a hard
-            risk limit organic price drift breached off-schedule (see
-            ``quantlab.backtesting.accounting.apply_weight_drift``).
-            Requires the 5 reason-attribution arguments above.
-        executed_drift_compliance_pending: Same as ``executed_drift_
-            compliance_forced``, for a still-unresolved breach (the
-            responsible symbol/group remains untradable) -- the best
-            achievable correction, retried every day it stays blocked.
+        executed_forced_liquidation: Row-broadcast provenance from
+            ``AccountingResult.ruined`` -- highest-priority adjustment
+            (see the docs link above for the full override order).
+        executed_stop_loss_triggered: Row-broadcast provenance from
+            ``AccountingResult.stop_loss_triggered``.
+        executed_take_profit_triggered: Row-broadcast provenance from
+            ``AccountingResult.take_profit_triggered``.
+        executed_drift_compliance_forced: Row-broadcast provenance from
+            ``AccountingResult.drift_compliance_forced`` (see
+            ``apply_weight_drift``).
+        executed_drift_compliance_pending: Row-broadcast provenance from
+            ``AccountingResult.drift_compliance_pending``.
         executed_position_strategy_origin_timestamp: The timestamp of the
-            most recent strategic regime transition (per the strategy's
-            own decision proxy) still active for this cell -- ``NaT`` when
-            no strategic position is currently active (the decision proxy
-            is flat). Must be supplied together with the 2 arguments below
-            or not at all; requires the 5 arguments above.
-        executed_position_strategy_origin_code: The strategy's own
-            ``explain_signals()`` detail code at that origin transition,
-            or ``None`` when unavailable -- a temporally correct origin is
-            tracked independently of whether a specific code exists for it.
+            most recent strategic regime transition still active for each
+            cell, per the strategy's own decision proxy. Paired with the
+            2 parameters below.
+        executed_position_strategy_origin_code: The strategy's own detail
+            code at that origin transition. Paired with the parameters
+            above/below.
         executed_position_strategy_origin_details: Free text paired with
-            the above.
+            the 2 parameters above.
 
     Returns:
         A DataFrame with :data:`TRADE_LOG_COLUMNS`, one row per non-zero fill.
@@ -739,8 +722,20 @@ def build_trade_log(
         raise BacktestError("equity must be a pandas Series.")
     if slippage_equity is not None and not isinstance(slippage_equity, pd.Series):
         raise BacktestError("slippage_equity must be a pandas Series.")
+    if execution_equity is not None and not isinstance(execution_equity, pd.Series):
+        raise BacktestError("execution_equity must be a pandas Series.")
     if not isinstance(slippage_model, SlippageModel):
         raise BacktestError("slippage_model must implement SlippageModel.")
+    if not isinstance(reference_price_needs_shift, bool | np.bool_):
+        # A truthy-but-wrong value (e.g. the string "False", which Python
+        # itself treats as truthy) would otherwise silently take the
+        # "needs shift" branch below regardless of what the caller
+        # actually meant, mispricing every fill against the wrong
+        # reference-price basis with no error at all.
+        raise BacktestError(
+            "reference_price_needs_shift must be a boolean, got "
+            f"{reference_price_needs_shift!r}."
+        )
 
     reason_frames = {
         "executed_desired": executed_desired,
@@ -956,7 +951,7 @@ def build_trade_log(
     # computed against (`new - previous == change` holds by definition,
     # not just as a property to verify), and reduces to the identical
     # previous-row-shifted value whenever `weight_changes` genuinely is a
-    # plain diff (the non-drift path, unchanged from before this fix).
+    # plain diff (the non-drift path).
     previous_values = executed_values - change_values
 
     # Placeholder defaults for every reason-attribution lookup array, always
@@ -1102,16 +1097,23 @@ def build_trade_log(
                 executed_position_strategy_origin_details.to_numpy(dtype=object)
             )
 
-    previous_equity_series = equity_before_period(equity, changes.index)
+    if execution_equity is not None:
+        # Already IS the real per-date execution equity (see this
+        # function's own docstring) -- used as-is, never re-shifted.
+        previous_equity_series = validate_equity_series(
+            execution_equity, changes.index, name="execution_equity"
+        )
+        previous_slippage_series = previous_equity_series
+    else:
+        previous_equity_series = equity_before_period(equity, changes.index)
+        slippage_ref = slippage_equity if slippage_equity is not None else equity
+        previous_slippage_series = equity_before_period(
+            slippage_ref,
+            changes.index,
+            name="slippage_equity",
+        )
     previous_equity = previous_equity_series.to_numpy()
-    notional_values = traded_notional(changes, equity).to_numpy()
-
-    slippage_ref = slippage_equity if slippage_equity is not None else equity
-    previous_slippage_series = equity_before_period(
-        slippage_ref,
-        changes.index,
-        name="slippage_equity",
-    )
+    notional_values = changes.abs().mul(previous_equity_series, axis=0).to_numpy()
 
     slippage_fraction = slippage_model.per_symbol_cost(
         changes, previous_slippage_series
@@ -1128,8 +1130,12 @@ def build_trade_log(
         reference_values = reference_aligned.to_numpy(dtype=float)
     except (TypeError, ValueError) as exc:
         raise BacktestError("reference_prices must contain numeric values.") from exc
-    lagged_reference_values = np.vstack(
-        [np.full((1, reference_values.shape[1]), np.nan), reference_values[:-1]]
+    lagged_reference_values = (
+        np.vstack(
+            [np.full((1, reference_values.shape[1]), np.nan), reference_values[:-1]]
+        )
+        if reference_price_needs_shift
+        else reference_values
     )
 
     records: list[dict[str, object]] = []
@@ -1149,8 +1155,13 @@ def build_trade_log(
             slippage = float(slippage_currency[row_number, column_index])
             price = float(lagged_reference_values[row_number, column_index])
             if not np.isfinite(price) or price <= 0.0:
+                basis = (
+                    "prior-period"
+                    if reference_price_needs_shift
+                    else "execution-moment"
+                )
                 raise BacktestError(
-                    "A positive finite prior-period reference price is required "
+                    f"A positive finite {basis} reference price is required "
                     f"for {symbol!r} on {timestamp!r}."
                 )
             previous = float(previous_values[row_number, column_index])

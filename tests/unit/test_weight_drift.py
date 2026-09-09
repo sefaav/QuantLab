@@ -16,8 +16,16 @@ import pandas as pd
 import pytest
 
 from quantlab.backtesting.accounting import apply_weight_drift, run_accounting
+from quantlab.config import ExecutionConfig
 from quantlab.constants import EPSILON
 from quantlab.exceptions import BacktestError
+from quantlab.execution.execution_model import ExecutionModel
+
+
+def _zero_cost_model() -> ExecutionModel:
+    return ExecutionModel.from_config(
+        ExecutionConfig(commission_bps=0.0, spread_bps=0.0, slippage_bps=0.0)
+    )
 
 
 def _reference_drift_from_prices(
@@ -350,6 +358,45 @@ def test_bankruptcy_guard_flattens_and_never_produces_inf_or_nan() -> None:
     assert drifted.loc[dates[2], "A"] == pytest.approx(0.0)
     # No phantom closing trade is charged for the forced flatten itself.
     assert trade_changes.loc[dates[2], "A"] == pytest.approx(0.0)
+
+
+def test_overnight_bankruptcy_forces_the_same_row_flat_not_the_scheduled_rotation() -> (
+    None
+):
+    """Regression test: unlike the previous test (bankruptcy via the
+    row's OWN return leg, which legitimately reports the real pre-ruin
+    weight it was actually held at), a bankruptcy caused by the
+    OVERNIGHT leg happens BEFORE this row's own trade decision is even
+    processed -- there is no real capital left at the open to fund
+    ANYTHING this row, including a scheduled rotation into a brand-new
+    symbol. That rotation must not be landed against the reset's own
+    fictitious equity=1.0 baseline as if real capital existed.
+
+    A = 200% leverage, held one row, then wiped out by a -50% overnight
+    move (2.0 * -0.5 = -100% exactly at the open) on the SAME row a
+    scheduled rotation into B (100%) was decided. The wiped-out row must
+    report flat (A=0, B=0), not B=100%, and charge no phantom trade for
+    a rotation no real capital could have funded."""
+    dates = pd.date_range("2024-01-01", periods=2, freq="D")
+    executed = pd.DataFrame({"A": [2.0, 0.0], "B": [0.0, 1.0]}, index=dates)
+    asset_returns = pd.DataFrame({"A": [0.0, -0.5], "B": [0.0, 0.0]}, index=dates)
+    overnight_returns = pd.DataFrame({"A": [0.0, -0.5], "B": [0.0, 0.0]}, index=dates)
+
+    drifted, trade_changes, _ = apply_weight_drift(
+        executed,
+        asset_returns,
+        None,
+        None,
+        maximum_weight=None,
+        maximum_gross_exposure=None,
+        maximum_net_exposure=None,
+        long_only=False,
+        overnight_returns=overnight_returns,
+    )
+    assert drifted.loc[dates[1], "A"] == pytest.approx(0.0)
+    assert drifted.loc[dates[1], "B"] == pytest.approx(0.0)
+    assert trade_changes.loc[dates[1], "A"] == pytest.approx(0.0)
+    assert trade_changes.loc[dates[1], "B"] == pytest.approx(0.0)
 
 
 def test_maximum_weight_breach_correction_lands_next_row_never_same_row() -> None:
@@ -1366,3 +1413,105 @@ def test_drift_invariants_hold_across_randomized_deterministic_scenarios() -> No
     # least once across 200 draws.
     assert exercised_compliance_forced
     assert exercised_maximum_turnover_binding
+
+
+def _next_bar_open_gap_scenario(
+    *, intraday_a: float = 0.0
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """50/50 A/B, entered on row 1, an overnight gap on A on row 2, daily
+    rebalance scheduled every row -- returns
+    ``(held, asset_returns, overnight_returns, rebalance_date)`` aligned to
+    a 4-row index. ``intraday_a`` lets a caller add an intraday leg to the
+    gap row on top of the overnight one.
+    """
+    idx = pd.date_range("2024-01-01", periods=4, freq="D")
+    held = pd.DataFrame({"A": [0.5] * 4, "B": [0.5] * 4}, index=idx)
+    overnight_a = 1.0
+    asset_return_a = (1.0 + overnight_a) * (1.0 + intraday_a) - 1.0
+    asset_returns = pd.DataFrame(
+        {"A": [0.0, 0.0, asset_return_a, 0.0], "B": [0.0, 0.0, 0.0, 0.0]}, index=idx
+    )
+    overnight_returns = pd.DataFrame(
+        {"A": [0.0, 0.0, overnight_a, 0.0], "B": [0.0, 0.0, 0.0, 0.0]}, index=idx
+    )
+    rebalance_date = pd.DataFrame({"A": [True] * 4, "B": [True] * 4}, index=idx)
+    return held, asset_returns, overnight_returns, rebalance_date
+
+
+def test_next_bar_open_drift_registers_a_gap_days_rebalance_that_same_day() -> None:
+    """A held 50/50 book, an overnight +100% gap on A, and a scheduled
+    daily rebalance back to 50/50: the corrective trade must land on the
+    SAME row the gap happens (turnover 1/3, restoring A from its
+    open-time 2/3 weight back to 1/2), never one row late. Verified by
+    dollar-tracing: $100 in A/$100 in B entering the gap; A -> $200 at the
+    open (portfolio $300, A at 2/3); rebalancing to 50/50 sells exactly
+    $50 of A and buys $50 of B, i.e. 50/300 = 1/6 of the book each way,
+    1/3 total L1 turnover.
+    """
+    held, asset_returns, overnight_returns, rebalance_date = (
+        _next_bar_open_gap_scenario()
+    )
+    result = run_accounting(
+        held,
+        asset_returns,
+        _zero_cost_model(),
+        100_000.0,
+        model_weight_drift=True,
+        rebalance_date=rebalance_date,
+        overnight_returns=overnight_returns,
+    )
+    assert result.turnover.tolist() == pytest.approx([0.0, 1.0, 1.0 / 3.0, 0.0])
+    assert result.executed_weights.iloc[2].tolist() == pytest.approx([0.5, 0.5])
+    # Overnight-only gap, restored at the open before any intraday move:
+    # the portfolio-wide overnight leg is exactly +50% (half the book in
+    # A, which doubled), the intraday leg is 0.
+    assert result.gross_returns.iloc[2] == pytest.approx(0.5)
+
+
+def test_next_bar_open_drift_respects_maximum_turnover_at_the_real_open() -> None:
+    """The same gap-day rebalance, capped by ``maximum_turnover=0.1``: the
+    cap must bind against the REAL open-time trade size (so exactly 0.1 of
+    turnover lands that day, not 0 as it would if the cap were evaluated
+    against the stale pre-gap weight and found "nothing to do")."""
+    held, asset_returns, overnight_returns, rebalance_date = (
+        _next_bar_open_gap_scenario()
+    )
+    result = run_accounting(
+        held,
+        asset_returns,
+        _zero_cost_model(),
+        100_000.0,
+        model_weight_drift=True,
+        rebalance_date=rebalance_date,
+        overnight_returns=overnight_returns,
+        maximum_turnover=0.1,
+    )
+    assert result.turnover.iloc[2] == pytest.approx(0.1)
+    assert (result.turnover.to_numpy() <= 0.1 + 1e-9).all()
+
+
+def test_next_bar_open_drift_compounds_overnight_and_intraday_on_the_gap_day() -> None:
+    """The gap row also earns a +10% intraday move on A (on top of the
+    +100% overnight gap), with the same-day rebalance back to 50/50 at the
+    open. Hand-derived: overnight leg = 0.5*1.00 + 0.5*0.0 = 0.50; the
+    rebalance restores 50/50 at the open; intraday leg on the now-50/50
+    book = 0.5*0.10 + 0.5*0.0 = 0.05; compounded return =
+    ``1.50*1.05 - 1 = 0.575``, never the naively-additive
+    ``0.50+0.05 = 0.55`` and never a same_bar_close-style ``1.2*0.5=0.60``
+    that ignores the rebalance's own effect on the intraday leg's basis.
+    """
+    held, asset_returns, overnight_returns, rebalance_date = (
+        _next_bar_open_gap_scenario(intraday_a=0.10)
+    )
+    result = run_accounting(
+        held,
+        asset_returns,
+        _zero_cost_model(),
+        100_000.0,
+        model_weight_drift=True,
+        rebalance_date=rebalance_date,
+        overnight_returns=overnight_returns,
+    )
+    assert result.gross_returns.iloc[2] == pytest.approx(0.575)
+    assert result.gross_returns.iloc[2] != pytest.approx(0.55)
+    assert result.gross_returns.iloc[2] != pytest.approx(0.60)

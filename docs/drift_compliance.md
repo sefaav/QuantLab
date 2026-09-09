@@ -18,11 +18,11 @@ weight[i] = dollar[i] / E
 ```
 
 Output is always a *pre-period* value — the weight held going into a row,
-before that row's own return is applied — consistent with `executed_weights
-= held.shift(1)` elsewhere in the accounting module; returning the
-post-period value instead would double-count that row's own return once
-inside this recursion and again when it is multiplied by `asset_return` a
-second time.
+before that row's own return is applied — consistent with
+`executed_weights = held.shift(1)` elsewhere in the accounting module;
+returning the post-period value instead would double-count that row's own
+return once inside this recursion and again when it is multiplied by
+`asset_return` a second time.
 
 Two independent kinds of per-column debt drive every row's output, in this
 priority order:
@@ -50,9 +50,10 @@ priority order:
 2. **Ordinary rebalance debt** — a fresh per-column decision (a column
    anchors when its own value in the executed book changed since the
    previous row — the same `EPSILON`-based "did a real trade happen"
-   convention the trade log itself uses — or `rebalance_date.loc[t,
-   column]` is `True`, a `dates x symbols` frame threaded down from
-   `engine.py`, itself gated by that column's own tradability; the second
+   convention the trade log itself uses — or
+   `rebalance_date.loc[t, column]` is `True`, a `dates x symbols` frame
+   threaded down from `engine.py`, itself gated by that column's own
+   tradability; the second
    condition catches a scheduled rebalance whose freshly-decided target
    happens to numerically equal the immediately preceding one, otherwise
    invisible to value-diffing alone), turnover-capped like a decision-level
@@ -120,8 +121,9 @@ etc.) — this function only asserts array shapes match `columns`, trusting
 `drifted`/`tradable_row` are otherwise already clean numeric/boolean data.
 
 **Free variables**: `w_i` for every independent (singleton-group) column,
-and one shared scalar `k_g` per multi-column group with `w_i := k_g *
-drifted_i` for every leg `i` of group `g` (a declared position group —
+and one shared scalar `k_g` per multi-column group with
+`w_i := k_g * drifted_i` for every leg `i` of group `g` (a declared
+position group —
 e.g. `pairs_trading`'s two legs — must move together, preserving its
 current relative composition/hedge ratio exactly; `k_g` is bounded only by
 `k_g >= 0`, never capped at `1`, since the L1 objective already penalizes
@@ -151,8 +153,8 @@ reported as LP-infeasible (driving the tradability diagnosis below)
 instead of the strict LP trivially "succeeding" over a value that still
 violates `long_only`.
 
-**Objective**: `minimize sum_i |w_i - drifted_i|` subject to `|w_i| <=
-maximum_weight`, `sum_i |w_i| <= maximum_gross_exposure` (or
+**Objective**: `minimize sum_i |w_i - drifted_i|` subject to
+`|w_i| <= maximum_weight`, `sum_i |w_i| <= maximum_gross_exposure` (or
 `maximum_leverage`, whichever is tighter — the caller passes the
 already-combined cap), `|sum_i w_i| <= maximum_net_exposure`, and the
 sign-preserving bounds above. This is **not** solved by a "clip each
@@ -189,8 +191,9 @@ the algorithm" philosophy.
 
 **Two deliberate, disclosed scope limits**:
 
-- Only the hard risk limits above are enforced here — `target_minimum_
-  weight`/`target_maximum_positions` are not, consistent with
+- Only the hard risk limits above are enforced here —
+  `target_minimum_weight`/`target_maximum_positions` are not, consistent
+  with
   `PortfolioConfig`'s own documented convention that these non-convex,
   target-portfolio-only constraints may be temporarily violated by any
   transitional weights (turnover-capped rebalancing already has this exact

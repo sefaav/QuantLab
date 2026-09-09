@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any
 import pandas as pd
 
 from quantlab.dashboard.explorer.profile import (
+    PRICE_TYPE_EXECUTION_NOTE,
     ParameterDoc,
     ResultsDiagnostics,
     StrategyProfile,
@@ -238,8 +239,7 @@ _PARAMETERS = [
     ParameterDoc(
         name="price_type",
         what="Which price series ('adjusted_close' or 'close') "
-        "generate_signals() reads. Execution/costs always use the raw "
-        "close regardless.",
+        f"generate_signals() reads -- {PRICE_TYPE_EXECUTION_NOTE}",
         where="Feeds the momentum score in step 1.",
         why="A split or large dividend shows up as a price jump in raw "
         "close but not in adjusted close -- unadjusted, it would look "

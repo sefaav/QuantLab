@@ -1546,6 +1546,84 @@ def test_advanced_execution_settings_are_accepted_by_the_config() -> None:
     assert result.config.execution.impact_coefficient == pytest.approx(0.25)
 
 
+def test_execution_timing_defaults_to_same_bar_close_and_is_configurable() -> None:
+    at = AppTest.from_file(APP_PATH, default_timeout=60)
+    at.run()
+    _configure_offline_pairs_trade(at)
+
+    timing = _sidebar_selectbox(at, "Execution timing")
+    assert timing.value == "same_bar_close"
+
+    timing.set_value("next_bar_open").run()
+    _run_button(at).click().run()
+
+    assert not at.exception
+    assert not at.error
+    result = at.session_state["result"]
+    assert result.config.execution.execution_timing == "next_bar_open"
+
+
+# A 24/7-calendar combination (the remaining two cells of the full
+# frequency x calendar matrix) is not covered here: the per-instrument
+# "Calendar" column is a `st.data_editor`, which this Streamlit version's
+# `AppTest` harness exposes no way to read or drive (`hasattr(at,
+# "data_editor")` is False), and the only calendar-auto-detecting source
+# that reaches "24/7" without it (Binance) needs live network access,
+# inconsistent with this file's offline-only convention (see its own
+# module docstring). `compatible_execution_timings`'s own unit coverage
+# in `test_config.py` exercises that combination directly instead.
+def test_execution_timing_options_for_daily_xnys_exclude_immediate_after_close() -> (
+    None
+):
+    """Daily + a session-based calendar (XNYS, the offline default) is
+    compatible with same_bar_close/next_bar_open but never
+    immediate_after_close (24/7-only) -- see
+    ``compatible_execution_timings`` in ``config.py``, the single source
+    of truth both this picker and ``ExperimentConfig``'s own validators
+    call."""
+    at = AppTest.from_file(APP_PATH, default_timeout=60)
+    at.run()
+    _configure_offline_pairs_trade(at)
+
+    timing = _sidebar_selectbox(at, "Execution timing")
+    assert timing.options == ["same_bar_close", "next_bar_open"]
+
+
+def test_execution_timing_options_for_hourly_xnys_only_offer_same_bar_close() -> None:
+    """Hourly frequency is incompatible with next_bar_open (its adjusted-
+    open derivation is only coherent for a native daily bar) regardless
+    of calendar, and a session-based calendar is incompatible with
+    immediate_after_close -- only same_bar_close survives both."""
+    at = AppTest.from_file(APP_PATH, default_timeout=60)
+    at.run()
+    _configure_offline_pairs_trade(at)
+    _sidebar_selectbox(at, "Frequency").set_value("1h").run()
+
+    timing = _sidebar_selectbox(at, "Execution timing")
+    assert timing.options == ["same_bar_close"]
+    assert timing.value == "same_bar_close"
+
+
+def test_execution_timing_falls_back_when_frequency_change_removes_the_selection() -> (
+    None
+):
+    """Regression test: switching Frequency to '1h' after next_bar_open
+    was selected must not leave a stale selection or crash -- the
+    picker's own options list narrows and Streamlit's selectbox falls
+    back to its first option rather than a value no longer offered."""
+    at = AppTest.from_file(APP_PATH, default_timeout=60)
+    at.run()
+    _configure_offline_pairs_trade(at)
+    _sidebar_selectbox(at, "Execution timing").set_value("next_bar_open").run()
+
+    _sidebar_selectbox(at, "Frequency").set_value("1h").run()
+
+    assert not at.exception
+    timing = _sidebar_selectbox(at, "Execution timing")
+    assert timing.options == ["same_bar_close"]
+    assert timing.value == "same_bar_close"
+
+
 def test_advanced_portfolio_constraints_hidden_for_pairs_trading() -> None:
     """A minimum weight, position cap, or exposure cap could drop one leg
     and break the pair hedge, so these constraints must not even be offered."""

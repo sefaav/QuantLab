@@ -11,6 +11,7 @@ from __future__ import annotations
 import pandas as pd
 
 from quantlab.backtesting.engine import BacktestEngine
+from quantlab.backtesting.execution_prices import ExecutionPriceSource
 from quantlab.backtesting.result import BacktestResult
 from quantlab.config import ExperimentConfig
 from quantlab.constants import (
@@ -136,6 +137,7 @@ def run_backtest_from_config(
     config: ExperimentConfig,
     *,
     execution_delay: int = 0,
+    execution_price_source: ExecutionPriceSource | None = None,
     data_quality_report: DataQualityReport | None = None,
 ) -> BacktestResult:
     """Assemble components from ``config`` and run the backtest.
@@ -149,6 +151,10 @@ def run_backtest_from_config(
         execution_delay: Extra periods of execution delay, forwarded to
             :meth:`~quantlab.backtesting.engine.BacktestEngine.run` (the
             "acting on stale signals" stress scenario).
+        execution_price_source: Forwarded to
+            :meth:`~quantlab.backtesting.engine.BacktestEngine.run`.
+            Defaults to
+            :class:`~quantlab.backtesting.execution_prices.RatioApproximatedExecutionPrices`.
         data_quality_report: The report ``DataLoader.load()`` produced for
             ``data``. When provided, it is stored in result metadata.
     """
@@ -162,6 +168,7 @@ def run_backtest_from_config(
         execution_model,
         config,
         execution_delay=execution_delay,
+        execution_price_source=execution_price_source,
     )
     if data_quality_report is not None:
         result.metadata["data_quality"] = data_quality_report.to_dict()

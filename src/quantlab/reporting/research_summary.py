@@ -309,7 +309,17 @@ def _execution_methodology(result: BacktestResult) -> str:
         )
     else:
         slippage = f"constant slippage {slippage_bps:.1f} bps"
-    return f"{base}, and {slippage}"
+    timing = str(execution.execution_timing)
+    timing_text = {
+        "same_bar_close": "decisions filled at the same bar's own close "
+        "(a backtest-only idealization, not causally realizable live)",
+        "next_bar_open": "decisions filled at the next bar's open, with "
+        "overnight and intraday returns compounded separately",
+        "immediate_after_close": "decisions filled at an idealized instant "
+        "after each bar closes (permitted only on continuous 24/7 markets; "
+        "execution latency is not modelled)",
+    }.get(timing, timing)
+    return f"{base}, and {slippage}. Execution timing: {timing_text}."
 
 
 def methodology(result: BacktestResult) -> str:

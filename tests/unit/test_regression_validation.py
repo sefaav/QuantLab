@@ -1337,7 +1337,10 @@ def test_walk_forward_fold_metrics_reflect_only_the_deployed_period() -> None:
 
 
 def test_walk_forward_validation_scoring_charges_entry_cost_too() -> None:
-    from quantlab.validation.walk_forward import _evaluate_fresh_from_window_start
+    from quantlab.validation.walk_forward import (
+        _evaluate_fresh_from_window_start,
+        _overnight_returns_for_fold,
+    )
 
     data, cfg = _rf_test_setup()
     cfg = cfg.revalidated_copy(
@@ -1352,7 +1355,14 @@ def test_walk_forward_validation_scoring_charges_entry_cost_too() -> None:
     val_start = idx[100]
     val_end = idx[149]
     returns = _evaluate_fresh_from_window_start(
-        data, cfg, train_start, val_start, val_end
+        data,
+        cfg,
+        train_start,
+        val_start,
+        val_end,
+        overnight_returns=_overnight_returns_for_fold(
+            data, cfg, train_start, val_end, execution_price_source=None
+        ),
     )
     # The entry trade (row 1, since row 0 is always forced flat) must show
     # the ~1% commission cost, not a silently-free continuation of a
@@ -1705,7 +1715,15 @@ def test_evaluate_window_never_double_applies_execution_delay_to_rebalance_date(
     wf_mod.run_accounting = spy_run_accounting
     try:
         window_weights, _ = wf_mod._weights_and_returns_for_validation(
-            data, cfg, lookback_start, window_start, window_end, execution_delay=2
+            data,
+            cfg,
+            lookback_start,
+            window_start,
+            window_end,
+            execution_delay=2,
+            overnight_returns=wf_mod._overnight_returns_for_fold(
+                data, cfg, lookback_start, window_end, execution_price_source=None
+            ),
         )
     finally:
         wf_mod.run_accounting = orig_run_accounting

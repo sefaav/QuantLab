@@ -850,7 +850,7 @@ def test_trade_log_volume_slippage_matches_accounting() -> None:
     prices = pd.DataFrame({"A": [100.0] * 4}, index=idx)
     trades = build_trade_log(
         accounting.executed_weights,
-        accounting.weight_changes,
+        accounting.weight_changes_for_costs,
         accounting.equity,
         prices,
         commission_bps=0.0,

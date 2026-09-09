@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import itertools
+
 import pandas as pd
 import pytest
 
 from quantlab.exceptions import InvalidConfigurationError
 from quantlab.validation.splits import (
     chronological_split,
+    formation_test_windows,
     walk_forward_windows,
 )
 
@@ -105,3 +108,87 @@ def test_walk_forward_windows_rejects_a_non_integer_window() -> None:
     idx = _index(50)
     with pytest.raises(InvalidConfigurationError, match="integer"):
         walk_forward_windows(idx, "10", 5, 5)  # type: ignore[arg-type]
+
+
+def test_formation_test_windows_never_overlap_formation_and_test() -> None:
+    dates = pd.bdate_range("2010-01-01", periods=1000)
+    windows = formation_test_windows(dates, formation_window=252, test_window=126)
+    assert len(windows) == (1000 - 252) // 126
+    for window in windows:
+        assert window.formation.stop == window.test.start
+        assert window.formation_end < window.test_start
+        assert window.test.stop - window.test.start == 126
+    # Test windows are contiguous and non-overlapping.
+    for previous, current in itertools.pairwise(windows):
+        assert previous.test.stop == current.test.start
+
+
+def test_formation_test_windows_fold_ids_are_sequential() -> None:
+    dates = pd.bdate_range("2010-01-01", periods=600)
+    windows = formation_test_windows(dates, formation_window=126, test_window=63)
+    assert [w.fold for w in windows] == list(range(len(windows)))
+
+
+def test_formation_test_windows_custom_step_overlaps_test_windows() -> None:
+    dates = pd.bdate_range("2010-01-01", periods=600)
+    windows = formation_test_windows(
+        dates, formation_window=126, test_window=63, step=21
+    )
+    assert len(windows) > (600 - 126) // 63
+    for previous, current in itertools.pairwise(windows):
+        assert current.test.start - previous.test.start == 21
+
+
+def test_formation_test_windows_step_exceeding_test_window_leaves_a_gap() -> None:
+    """Unlike walk_forward_windows (whose folds stitch into one continuous
+    OOS curve, so a step > test_window would leave a CAGR-breaking gap),
+    formation_test_windows evaluates each fold independently -- a step
+    larger than test_window is a legitimate sparser design (e.g.
+    re-forming quarterly with a short test window), not an error."""
+    dates = pd.bdate_range("2010-01-01", periods=600)
+    windows = formation_test_windows(
+        dates, formation_window=126, test_window=63, step=100
+    )
+    assert len(windows) >= 2
+    for previous, current in itertools.pairwise(windows):
+        assert current.test.start - previous.test.start == 100
+        # A genuine gap between consecutive TEST windows: dates in between
+        # are evaluated by neither fold (though they still feed the next
+        # fold's own formation window as historical data).
+        assert current.test.start > previous.test.stop
+
+
+def test_formation_test_windows_rejects_insufficient_history() -> None:
+    dates = pd.bdate_range("2010-01-01", periods=100)
+    with pytest.raises(InvalidConfigurationError, match="Not enough history"):
+        formation_test_windows(dates, formation_window=252, test_window=126)
+
+
+def test_formation_test_windows_exact_boundary_count() -> None:
+    """The exact-minimum history (formation_window + test_window
+    observations) must produce exactly one fold, never zero and never
+    raise; one observation short must raise instead of silently
+    producing zero folds."""
+    formation_window, test_window = 60, 20
+    exact = pd.bdate_range("2010-01-01", periods=formation_window + test_window)
+    windows = formation_test_windows(
+        exact, formation_window=formation_window, test_window=test_window
+    )
+    assert len(windows) == 1
+    assert windows[0].test_end == exact[-1]
+
+    one_short = exact[:-1]
+    with pytest.raises(InvalidConfigurationError, match="Not enough history"):
+        formation_test_windows(
+            one_short, formation_window=formation_window, test_window=test_window
+        )
+
+
+def test_formation_test_windows_start_end_timestamps_match_index() -> None:
+    dates = pd.bdate_range("2010-01-01", periods=400)
+    windows = formation_test_windows(dates, formation_window=100, test_window=50)
+    first = windows[0]
+    assert first.formation_start == dates[0]
+    assert first.formation_end == dates[99]
+    assert first.test_start == dates[100]
+    assert first.test_end == dates[149]

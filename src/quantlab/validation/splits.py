@@ -139,6 +139,107 @@ def walk_forward_windows(
     return folds
 
 
+@dataclass(frozen=True)
+class FormationTestWindow:
+    """One formation-then-test fold: positional slices plus start/end timestamps.
+
+    Unlike :class:`WalkForwardWindow` (train/validation/test), this has no
+    validation block -- for a Gatev, Goetzmann & Rouwenhorst (2006, "Pairs
+    Trading: Performance of a Relative-Value Arbitrage Rule")-style design
+    where quantities are estimated once on the formation window and a
+    fixed rule is then applied out of sample, a middle validation block
+    has no role and would only eat into the test window for no purpose.
+
+    Deliberately carries both ``formation``/``test`` (integer-position
+    ``slice`` objects, for ``.iloc[]``-style indexing directly against a
+    prices matrix -- the natural operation for a study evaluating many
+    entities over the same window) and the four ``*_start``/``*_end``
+    timestamps (for display/logging without re-deriving them from
+    ``index[slice]`` at every call site). Unlike :class:`WalkForwardWindow`,
+    which stores each block as its own :class:`pandas.DatetimeIndex` and
+    has no positional-slice form at all, unifying these into one
+    representation here would drop one capability call sites need -- the
+    four timestamps are computed once, in this function alone, from the
+    same ``index`` the slices came from, so there is no risk of the two
+    forms drifting apart independently.
+    """
+
+    fold: int
+    formation: slice
+    test: slice
+    formation_start: pd.Timestamp
+    formation_end: pd.Timestamp
+    test_start: pd.Timestamp
+    test_end: pd.Timestamp
+
+
+def formation_test_windows(
+    index: pd.DatetimeIndex,
+    formation_window: int,
+    test_window: int,
+    *,
+    step: int | None = None,
+) -> list[FormationTestWindow]:
+    """Generate contiguous formation-then-test folds with no validation block.
+
+    Fold ``i``'s formation window is ``index[start-formation_window:start]``
+    immediately followed by its test window ``index[start:start+test_window]``
+    -- formation always strictly precedes test, with no gap and no overlap.
+    ``step`` (default ``test_window``, giving contiguous, non-overlapping
+    test windows; smaller overlaps them for denser evaluation) may exceed
+    ``test_window`` here, UNLIKE :func:`walk_forward_windows`'s own
+    identically-named parameter: each fold here is evaluated on its own
+    (see :class:`FormationTestWindow`'s own docstring on the Gatev/
+    Goetzmann/Rouwenhorst design), never stitched into one continuous
+    curve, so a gap between consecutive test windows -- e.g. re-forming
+    quarterly with a one-month test window -- is a legitimate sparser
+    design, not a CAGR/annualisation hazard the way it is for a stitched
+    OOS curve.
+
+    Args:
+        index: Sorted, unique datetime index covering both formation and
+            test data.
+        formation_window: Number of leading periods used to estimate
+            whatever a caller freezes before trading (e.g. a hedge ratio,
+            a spread's mean/std, an entry threshold).
+        test_window: Number of periods immediately following formation
+            that are then evaluated/traded with those frozen estimates.
+        step: Periods between consecutive folds' formation starts.
+            Defaults to ``test_window``.
+
+    Returns:
+        At least one fold. Raises :class:`InvalidConfigurationError` if
+        ``index`` has too few observations for even one.
+    """
+    _validate_datetime_index(index)
+    formation_window = _validate_window(formation_window, name="formation_window")
+    test_window = _validate_window(test_window, name="test_window")
+    step = test_window if step is None else _validate_window(step, name="step")
+
+    n = len(index)
+    windows: list[FormationTestWindow] = []
+    start = formation_window
+    while start + test_window <= n:
+        windows.append(
+            FormationTestWindow(
+                fold=len(windows),
+                formation=slice(start - formation_window, start),
+                test=slice(start, start + test_window),
+                formation_start=index[start - formation_window],
+                formation_end=index[start - 1],
+                test_start=index[start],
+                test_end=index[start + test_window - 1],
+            )
+        )
+        start += step
+    if not windows:
+        raise InvalidConfigurationError(
+            "Not enough history for a single formation/test fold: need at "
+            f"least {formation_window + test_window} observations, got {n}."
+        )
+    return windows
+
+
 def _validate_datetime_index(index: object) -> None:
     """Validate the chronology required by every split helper."""
     if not isinstance(index, pd.DatetimeIndex):

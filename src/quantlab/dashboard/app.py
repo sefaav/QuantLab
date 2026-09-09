@@ -21,7 +21,13 @@ import pandas as pd
 import streamlit as st
 
 import quantlab.dashboard.explorer.profiles  # noqa: F401  (registration side effect)
-from quantlab.config import DataSourceName, compatible_frequencies_for_sources
+from quantlab.config import (
+    DataFrequency,
+    DataSourceName,
+    ExecutionTiming,
+    compatible_execution_timings,
+    compatible_frequencies_for_sources,
+)
 from quantlab.dashboard.components import (
     binance_universe_labels,
     entry_threshold_bounds,
@@ -86,7 +92,21 @@ if TYPE_CHECKING:
 configure_logging()
 logger = get_logger(__name__)
 
-st.set_page_config(page_title="QuantLab", page_icon="📈", layout="wide")
+st.set_page_config(
+    page_title="QuantLab",
+    page_icon="📈",
+    layout="wide",
+    menu_items={
+        "Get help": "https://sefaav.github.io/QuantLab/",
+        "Report a bug": "https://github.com/sefaav/QuantLab/issues",
+        "About": (
+            "**QuantLab** — reproducible quantitative research and backtesting.\n\n"
+            "[Documentation](https://sefaav.github.io/QuantLab/) · "
+            "[Source](https://github.com/sefaav/QuantLab) · "
+            "[Author](https://sefaav.github.io/website/index.html)"
+        ),
+    },
+)
 
 
 _PAIRS_TRADING_SYMBOLS_HELP = (
@@ -848,7 +868,8 @@ with st.expander("About this platform"):
         to prevent common look-ahead leakage; a custom strategy remains
         responsible for its own causal construction.
 
-        Source: [github.com/sefaav/QuantLab](https://github.com/sefaav/QuantLab)
+        📚 [Documentation](https://sefaav.github.io/QuantLab/)
+        · Source: [github.com/sefaav/QuantLab](https://github.com/sefaav/QuantLab)
         · [Report an issue](https://github.com/sefaav/QuantLab/issues)
         · [Author portfolio](https://sefaav.github.io/website/index.html)
         """
@@ -1640,6 +1661,64 @@ if mode != "Strategies":
                 )
             else:
                 impact_coefficient = 0.1
+
+            # Offer only timings ExperimentConfig would actually accept for
+            # the currently selected frequency/calendar -- compatible_
+            # execution_timings is the single source of truth both this
+            # picker and _check_next_bar_open_requires_a_daily_frequency/
+            # _check_immediate_after_close_needs_a_247_market call, so the
+            # two can never diverge (same precedent as the frequency
+            # picker's own compatible_frequencies_for_sources usage above).
+            # `frequency` is None when frequency_options is empty (an
+            # already-blocked, already-`st.error`-flagged submission
+            # state above) -- fall back to offering neither restricted
+            # timing rather than passing None to DataFrequency.
+            allowed_timings = (
+                compatible_execution_timings(
+                    DataFrequency(frequency),
+                    (row["Calendar"] for row in instrument_rows),
+                )
+                if frequency is not None
+                else set()
+            )
+            excluded_timings: dict[str, str] = {}
+            if ExecutionTiming.NEXT_BAR_OPEN not in allowed_timings:
+                excluded_timings[ExecutionTiming.NEXT_BAR_OPEN.value] = (
+                    "requires daily frequency"
+                )
+            if ExecutionTiming.IMMEDIATE_AFTER_CLOSE not in allowed_timings:
+                excluded_timings[ExecutionTiming.IMMEDIATE_AFTER_CLOSE.value] = (
+                    "requires every instrument on a 24/7 calendar"
+                )
+            execution_timing_options = [
+                t.value for t in ExecutionTiming if t.value not in excluded_timings
+            ]
+            execution_timing = st.selectbox(
+                "Execution timing",
+                execution_timing_options,
+                index=0,
+                help=(
+                    "same_bar_close (the default) fills a changed position at "
+                    "the same bar's own close the decision was computed from -- "
+                    "a standard backtest idealization that cannot be causally "
+                    "realized live. next_bar_open decides on this bar's close "
+                    "and fills at the next bar's open -- requires daily "
+                    "frequency. "
+                    "immediate_after_close fills the instant the bar closes, "
+                    "for continuous 24/7 markets only -- rejected at "
+                    "config-validation time for any instrument whose calendar "
+                    "isn't 24/7."
+                ),
+            )
+            if excluded_timings:
+                st.caption(
+                    "Unavailable for the current frequency/calendar: "
+                    + "; ".join(
+                        f"{name} ({reason})"
+                        for name, reason in excluded_timings.items()
+                    )
+                    + "."
+                )
 
         submission_blocked = bool(conflicts) or not symbols or not frequency_options
         # Same stable key for both -- exactly one of the two ever renders in
@@ -2471,6 +2550,7 @@ def _collect_inputs() -> dict:
         "slippage_bps": slippage_bps,
         "slippage_model": slippage_model,
         "impact_coefficient": impact_coefficient,
+        "execution_timing": execution_timing,
     }
     if mode == "Walk-forward":
         inputs["validation_method"] = "walk_forward"

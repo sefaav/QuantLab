@@ -361,11 +361,11 @@ def test_stop_loss_forces_flat_the_bar_after_the_cumulative_breach() -> None:
 
 
 def test_stop_loss_gates_the_real_drifted_position_not_a_step_function() -> None:
-    """Regression test: `model_weight_drift=True` is now the DEFAULT, so
-    stop-loss/take-profit combined with organic weight drift is close to
-    the ordinary path, not an exotic combination -- yet `_detect_stop_
-    loss_take_profit`'s `before_state = executed - weight_changes` gated-
-    turnover patch was previously never exercised with drift active.
+    """`model_weight_drift=True` is the DEFAULT, so stop-loss/take-profit
+    combined with organic weight drift is the ordinary path, not an
+    exotic combination -- `_detect_stop_loss_take_profit`'s own
+    ``before_state = executed - weight_changes`` gated-turnover patch
+    must be correct with drift active too.
 
     A and B start 50/50; A loses value every day (cumulative loss exceeds
     the 10% stop by the bar entering 2024-01-05); with weight drift on,
@@ -468,6 +468,61 @@ def test_stop_loss_never_triggers_when_no_position_is_actually_executed() -> Non
 
     assert not acc.stop_loss_triggered.to_numpy().any()
     assert (acc.executed_weights["AAA"] == 0.0).all()
+
+
+def test_take_profit_ignores_an_overnight_gap_that_happened_before_entry() -> None:
+    """Under ``execution_timing="next_bar_open"``, a position entered AT
+    the open must not have the overnight gap that happened BEFORE its own
+    entry credited toward its cumulative take-profit return -- it was not
+    yet held then.
+
+    AAA enters on day 2 with a +10% overnight gap immediately preceding
+    entry, then earns exactly 0% every day after entry. A 5% take-profit
+    must NEVER trigger, since the position has genuinely earned nothing
+    since it was actually entered.
+    """
+    idx = pd.date_range("2020-01-01", periods=4, freq="D")
+    held = pd.DataFrame({"AAA": [1.0, 1.0, 1.0, 1.0]}, index=idx)
+    # executed = [0, 1, 1, 1] -> entry lands at index 1.
+    asset_returns = pd.DataFrame({"AAA": [0.0, 0.10, 0.0, 0.0]}, index=idx)
+    overnight_returns = pd.DataFrame({"AAA": [0.0, 0.10, 0.0, 0.0]}, index=idx)
+
+    acc = run_accounting(
+        held,
+        asset_returns,
+        _zero_cost_model(),
+        100_000.0,
+        take_profit_pct=0.05,
+        overnight_returns=overnight_returns,
+    )
+
+    assert not acc.take_profit_triggered.to_numpy().any()
+    assert acc.executed_weights["AAA"].tolist() == [0.0, 1.0, 1.0, 1.0]
+
+
+def test_take_profit_still_triggers_on_a_genuine_post_entry_gain() -> None:
+    """Companion to the regression test above, on the other side: a
+    position entered at the open that GENUINELY gains past the threshold
+    AFTER entry must still trigger -- the fix must not simply suppress
+    every next_bar_open barrier check."""
+    idx = pd.date_range("2020-01-01", periods=4, freq="D")
+    held = pd.DataFrame({"AAA": [1.0, 1.0, 1.0, 1.0]}, index=idx)
+    # executed = [0, 1, 1, 1] -> entry at index 1, no overnight gap this time,
+    # but a genuine +6% intraday move right after entry.
+    asset_returns = pd.DataFrame({"AAA": [0.0, 0.06, 0.0, 0.0]}, index=idx)
+    overnight_returns = pd.DataFrame({"AAA": [0.0, 0.0, 0.0, 0.0]}, index=idx)
+
+    acc = run_accounting(
+        held,
+        asset_returns,
+        _zero_cost_model(),
+        100_000.0,
+        take_profit_pct=0.05,
+        overnight_returns=overnight_returns,
+    )
+
+    assert acc.take_profit_triggered["AAA"].tolist() == [False, False, True, False]
+    assert acc.executed_weights["AAA"].tolist() == [0.0, 1.0, 0.0, 0.0]
 
 
 def test_stop_loss_does_not_immediately_reenter_at_a_rebased_price() -> None:
@@ -578,6 +633,73 @@ def test_direct_long_to_short_reversal_starts_a_fresh_episode() -> None:
 
     assert gated["AAA"].tolist() == [1.0, 1.0, 0.0, -1.0, -1.0]
     assert stop_loss["AAA"].tolist() == [False, False, True, False, False]
+
+
+def test_reversal_ending_a_forced_flatten_gets_a_fresh_trade_size() -> None:
+    """With weight drift active, a same-bar reversal that ends a forced
+    flatten (`reversed_without_flat`, never touched by ``force_flat_series``/
+    ``transition``) must measure its own trade against the REAL pre-trade
+    state the gating already forced to zero, not the ungated, organically-
+    drifted ``before_state`` -- index 3's trade size must be ``-1.0`` (a
+    fresh entry from zero), never ``-2.0`` (a full reversal from the
+    ungated 1.0).
+    """
+    idx = pd.date_range("2020-01-01", periods=5, freq="D")
+    executed = pd.DataFrame({"AAA": [1.0, 1.0, 1.0, -1.0, -1.0]}, index=idx)
+    asset_returns = pd.DataFrame({"AAA": [0.0, -0.20, 0.0, 0.05, 0.05]}, index=idx)
+    # A pure-drift weight_changes: zero on every row except the index-3
+    # reversal, which (pre-gating) is a real decision change of the full
+    # (wrong, ungated) reversal size -1.0 - 1.0 = -2.0.
+    weight_changes = pd.DataFrame({"AAA": [1.0, 0.0, 0.0, -2.0, 0.0]}, index=idx)
+
+    gated, stop_loss, _, gated_weight_changes = _detect_stop_loss_take_profit(
+        executed, asset_returns, None, 0.10, None, weight_changes=weight_changes
+    )
+
+    assert gated["AAA"].tolist() == [1.0, 1.0, 0.0, -1.0, -1.0]
+    assert stop_loss["AAA"].tolist() == [False, False, True, False, False]
+    assert gated_weight_changes is not None
+    # Index 2: the forced exit itself, from before_state=1.0 to 0 (the
+    # `transition` mask).
+    assert gated_weight_changes["AAA"].iloc[2] == pytest.approx(-1.0)
+    # Index 3: a fresh -1.0 trade from the REAL (gated-to-zero) prior
+    # state, never the ungated -2.0.
+    assert gated_weight_changes["AAA"].iloc[3] == pytest.approx(-1.0)
+
+
+def test_exit_via_a_genuine_flat_row_also_gets_a_fresh_trade_size() -> None:
+    """Companion to the reversal case above: ``exit_transition`` must also
+    correctly patch the row a forced flatten ends on when the underlying
+    (pre-gating) exposure genuinely passes through flat first, rather
+    than via a same-bar reversal -- the decision goes flat at index 4
+    (independent of the stop), so the real trade there is "already flat
+    to flat", size 0.0, never the ungated ``0.0 - 1.0 == -1.0`` a phantom
+    closing trade would give. Index 5's fresh entry needs no patching:
+    the position was genuinely flat immediately before it either way.
+    """
+    idx = pd.date_range("2020-01-01", periods=6, freq="D")
+    executed = pd.DataFrame({"AAA": [0.0, 1.0, 1.0, 1.0, 0.0, 1.0]}, index=idx)
+    asset_returns = pd.DataFrame({"AAA": [0.0, 0.0, -0.20, 0.0, 0.0, 0.05]}, index=idx)
+    # Pre-gating (undrifted knowledge of the coming forced exit): entry at
+    # index 1 (+1.0), no trade at 2/3 (target unchanged), a real decision
+    # exit at index 4 (1.0 -> 0.0, trade -1.0), a fresh entry at index 5.
+    weight_changes = pd.DataFrame({"AAA": [0.0, 1.0, 0.0, 0.0, -1.0, 1.0]}, index=idx)
+
+    gated, stop_loss, _, gated_weight_changes = _detect_stop_loss_take_profit(
+        executed, asset_returns, None, 0.10, None, weight_changes=weight_changes
+    )
+
+    assert gated["AAA"].tolist() == [0.0, 1.0, 1.0, 0.0, 0.0, 1.0]
+    assert stop_loss["AAA"].tolist() == [False, False, False, True, False, False]
+    assert gated_weight_changes is not None
+    # Index 3: the forced exit itself (before_state=1.0 -> 0), same as before.
+    assert gated_weight_changes["AAA"].iloc[3] == pytest.approx(-1.0)
+    # Index 4: the fix under test -- already flat going in, so a genuine
+    # no-trade (0.0), never the ungated -1.0 "phantom close".
+    assert gated_weight_changes["AAA"].iloc[4] == pytest.approx(0.0)
+    # Index 5: unaffected either way -- a fresh entry from a state both
+    # the gated and ungated worlds already agree was flat.
+    assert gated_weight_changes["AAA"].iloc[5] == pytest.approx(1.0)
 
 
 def test_position_groups_reject_malformed_declarations() -> None:

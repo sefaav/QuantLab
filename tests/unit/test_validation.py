@@ -372,6 +372,7 @@ def test_walk_forward_run_refuses_a_checkpoint_whose_window_does_not_match(
         expanding=True,
         execution_delay=0,
         parameter_grid={"lookback_period": [60, 120]},
+        execution_price_source_fingerprint="default (RatioApproximatedExecutionPrices)",
     )
     loaded = load_checkpoint(checkpoint_path, provenance)
     assert loaded is not None
@@ -460,6 +461,7 @@ def test_walk_forward_run_refuses_a_checkpoint_with_a_garbage_target_frame(
         expanding=True,
         execution_delay=0,
         parameter_grid={"lookback_period": [60, 120]},
+        execution_price_source_fingerprint="default (RatioApproximatedExecutionPrices)",
     )
     loaded = load_checkpoint(checkpoint_path, provenance)
     assert loaded is not None
@@ -545,6 +547,7 @@ def test_walk_forward_run_refuses_a_checkpoint_with_an_incomplete_target_frame(
         expanding=True,
         execution_delay=0,
         parameter_grid={"lookback_period": [60, 120]},
+        execution_price_source_fingerprint="default (RatioApproximatedExecutionPrices)",
     )
     loaded = load_checkpoint(checkpoint_path, provenance)
     assert loaded is not None
@@ -628,6 +631,7 @@ def test_walk_forward_run_refuses_a_checkpoint_with_a_non_grid_parameter(
         expanding=True,
         execution_delay=0,
         parameter_grid={"lookback_period": [60, 120]},
+        execution_price_source_fingerprint="default (RatioApproximatedExecutionPrices)",
     )
     loaded = load_checkpoint(checkpoint_path, provenance)
     assert loaded is not None
@@ -1050,6 +1054,7 @@ def test_run_with_weight_cache_refuses_a_checkpoint_with_a_mismatched_candidate_
         expanding=True,
         execution_delay=0,
         parameter_grid={"entry_threshold": [0.5, 3.0]},
+        execution_price_source_fingerprint="default (RatioApproximatedExecutionPrices)",
     )
     loaded = load_checkpoint(checkpoint_path, provenance)
     assert loaded is not None
@@ -1132,6 +1137,7 @@ def test_run_with_weight_cache_refuses_a_checkpoint_with_a_corrupted_candidate_f
         expanding=True,
         execution_delay=0,
         parameter_grid={"entry_threshold": [0.5, 3.0]},
+        execution_price_source_fingerprint="default (RatioApproximatedExecutionPrices)",
     )
     loaded = load_checkpoint(checkpoint_path, provenance)
     assert loaded is not None

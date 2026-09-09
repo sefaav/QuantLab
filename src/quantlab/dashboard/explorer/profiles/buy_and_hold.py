@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 from quantlab.dashboard.explorer.profile import (
+    PRICE_TYPE_EXECUTION_NOTE,
     ParameterDoc,
     StrategyProfile,
     register_profile,
@@ -120,8 +121,8 @@ _PARAMETERS = [
         name="price_type",
         what="Which price series ('adjusted_close' or 'close') "
         "generate_signals() reads to decide whether a symbol is eligible "
-        "to be 'held' on a given date. Execution/costs always use the "
-        "raw close regardless.",
+        "to be 'held' on a given date -- "
+        f"{PRICE_TYPE_EXECUTION_NOTE}",
         where="The sole input to the strategy's one-line signal.",
         why="Determines only WHETHER a price exists on a date (affecting "
         "the earliest date a delayed listing becomes eligible), not the "

@@ -29,6 +29,14 @@ from quantlab.backtesting.engine import (
     _git_is_dirty,
     _source_hash,
 )
+from quantlab.backtesting.execution_prices import (
+    ExecutionPriceSource,
+    adjusted_open_for_config,
+    execution_price_source_fingerprint,
+    execution_price_source_is_consulted,
+    overnight_returns_for_config,
+    reference_prices_for_config,
+)
 from quantlab.backtesting.result import BacktestResult
 from quantlab.backtesting.runner import (
     build_execution_from_config,
@@ -36,7 +44,11 @@ from quantlab.backtesting.runner import (
     run_backtest_from_config,
 )
 from quantlab.backtesting.trade_log import build_trade_log
-from quantlab.config import BenchmarkKind, ExperimentConfig, RebalanceFrequency
+from quantlab.config import (
+    BenchmarkKind,
+    ExperimentConfig,
+    RebalanceFrequency,
+)
 from quantlab.constants import SYMBOL
 from quantlab.data.base import price_matrix
 from quantlab.data.calendar import uniform_calendar
@@ -268,6 +280,13 @@ class WalkForwardWeightCache:
     #: is rejected instead of producing quietly wrong results from stale
     #: cached weights.
     base_config: ExperimentConfig
+    #: Fingerprint (see execution_price_source_fingerprint) of the
+    #: execution_price_source this cache's target weights were actually
+    #: computed under -- rescore_with_costs() checks the rescoring
+    #: validator's own source against this, so a caller that rescores the
+    #: same cache from a differently-configured validator instance gets a
+    #: clear error instead of a silent, provenance-inconsistent result.
+    execution_price_source_fingerprint: str
 
 
 def resolve_walk_forward_windows(
@@ -319,10 +338,31 @@ class _PreparedWalkForward:
 class WalkForwardValidator:
     """Select parameters on validation blocks and evaluate them OOS."""
 
-    def __init__(self, base_config: ExperimentConfig) -> None:
+    def __init__(
+        self,
+        base_config: ExperimentConfig,
+        *,
+        execution_price_source: ExecutionPriceSource | None = None,
+    ) -> None:
+        """Store the base config, and optionally an execution-price source.
+
+        Args:
+            base_config: Experiment configuration.
+            execution_price_source: Forwarded to every internal
+                ``overnight_returns_for_config`` call this validator makes
+                (fold selection, OOS stitching, and
+                :meth:`rescore_with_costs`) -- the same parameter
+                :meth:`BacktestEngine.run` accepts, so a custom source
+                given to a single backtest is honoured identically by a
+                validator constructed with the same source over the same
+                config. ``None`` (default) uses
+                ``RatioApproximatedExecutionPrices``, matching a plain
+                ``BacktestEngine.run()`` call given no override.
+        """
         if not isinstance(base_config, ExperimentConfig):
             raise TypeError("base_config must be an ExperimentConfig.")
         self.base_config = base_config
+        self.execution_price_source = execution_price_source
 
     def run(
         self,
@@ -471,6 +511,19 @@ class WalkForwardValidator:
                 expanding=expanding,
                 execution_delay=execution_delay,
                 parameter_grid={k: list(v) for k, v in parameter_grid.items()},
+                # Not captured by `self.base_config` itself -- a custom,
+                # non-default source given to this validator's constructor
+                # changes what a resumed run computes exactly like
+                # `execution_price_source_fingerprint` in the final
+                # result's own metadata already tracks, so resuming under
+                # a DIFFERENT source (or the SAME class with different
+                # parameters -- see `execution_price_source_fingerprint`'s
+                # own docstring) than the one that produced the checkpoint
+                # must be detected as stale rather than silently mixing
+                # the two.
+                execution_price_source_fingerprint=execution_price_source_fingerprint(
+                    self.execution_price_source
+                ),
             )
             checkpoint_result = load_checkpoint(
                 checkpoint_path, provenance, validate=_validate_fold_state
@@ -677,6 +730,19 @@ class WalkForwardValidator:
                 expanding=expanding,
                 execution_delay=execution_delay,
                 parameter_grid={k: list(v) for k, v in parameter_grid.items()},
+                # Not captured by `self.base_config` itself -- a custom,
+                # non-default source given to this validator's constructor
+                # changes what a resumed run computes exactly like
+                # `execution_price_source_fingerprint` in the final
+                # result's own metadata already tracks, so resuming under
+                # a DIFFERENT source (or the SAME class with different
+                # parameters -- see `execution_price_source_fingerprint`'s
+                # own docstring) than the one that produced the checkpoint
+                # must be detected as stale rather than silently mixing
+                # the two.
+                execution_price_source_fingerprint=execution_price_source_fingerprint(
+                    self.execution_price_source
+                ),
             )
             checkpoint_result = load_checkpoint(
                 checkpoint_path, provenance, validate=_validate_cache_fold_state
@@ -781,6 +847,9 @@ class WalkForwardValidator:
             expanding=expanding,
             execution_delay=prepared.delay,
             base_config=self.base_config,
+            execution_price_source_fingerprint=execution_price_source_fingerprint(
+                self.execution_price_source
+            ),
         )
         if checkpoint_path is not None:
             clear_checkpoint(checkpoint_path)
@@ -791,28 +860,38 @@ class WalkForwardValidator:
         cache: WalkForwardWeightCache,
         scenario_config: ExperimentConfig,
     ) -> WalkForwardResult:
-        """Cheaply re-score a cost-only scenario against a cached baseline.
+        """Cheaply re-score an execution-only scenario against a cached baseline.
 
         For every cached candidate on every fold, this re-runs only the
         accounting step under ``scenario_config``'s execution model — never
         the signal/allocation computation that produced the cached weights
         — to re-select each fold's winner, which can differ from the
-        original selection since a stressed cost can change which candidate
-        scores best. It then stitches the out-of-sample series exactly as
-        :meth:`run` would from a fresh full re-run.
+        original selection since a stressed cost (or a different
+        ``execution_timing``) can change which candidate scores best. It
+        then stitches the out-of-sample series exactly as :meth:`run`
+        would from a fresh full re-run.
 
         Only valid when ``scenario_config`` differs from the config that
-        built ``cache`` in execution-cost fields (commission/spread/
-        slippage). Anything that would change signals, weights, the
-        tradable universe or execution delay needs a fresh :meth:`run` or
-        :meth:`run_with_weight_cache` instead -- enforced below, not just
-        documented: a mismatch on any other field raises rather than
-        silently rescoring against stale cached weights that don't actually
-        reflect what the scenario claims to be.
+        built ``cache`` within the ``execution`` section as a whole
+        (commission/spread/slippage/slippage_model/impact_coefficient/
+        execution_timing) -- every one of those is genuinely safe to vary
+        here: none of them can change the cached weights themselves (only
+        how they're accounted for), and ``execution_timing`` specifically
+        is re-derived fresh from ``scenario_config`` on every fold (see
+        ``overnight_returns_for_config`` below), never inherited from
+        whatever timing built the cache. Anything OUTSIDE that section
+        that would change signals, weights, the tradable universe or
+        selection needs a fresh :meth:`run` or :meth:`run_with_weight_
+        cache` instead -- enforced below, not just documented: a mismatch
+        on any other field raises rather than silently rescoring against
+        stale cached weights that don't actually reflect what the
+        scenario claims to be.
 
         Raises:
             InvalidConfigurationError: If ``scenario_config`` differs from
-                ``cache.base_config`` outside the ``execution`` section.
+                ``cache.base_config`` outside the ``execution`` section, or
+                if this validator's own ``execution_price_source`` differs
+                from the one that built ``cache``.
         """
         base_dump = cache.base_config.model_dump(mode="json")
         scenario_dump = scenario_config.model_dump(mode="json")
@@ -821,11 +900,25 @@ class WalkForwardValidator:
         if base_dump != scenario_dump:
             raise InvalidConfigurationError(
                 "rescore_with_costs() requires scenario_config to match the "
-                "config that built cache in every respect except execution "
-                "costs (commission/spread/slippage/slippage_model/"
-                "impact_coefficient) -- this scenario also changes something "
-                "that could change signals, weights, the tradable universe "
-                "or selection. Use run() or run_with_weight_cache() instead."
+                "config that built cache in every respect except the "
+                "execution section (commission/spread/slippage/"
+                "slippage_model/impact_coefficient/execution_timing) -- "
+                "this scenario also changes something that could change "
+                "signals, weights, the tradable universe or selection. Use "
+                "run() or run_with_weight_cache() instead."
+            )
+        if (
+            execution_price_source_fingerprint(self.execution_price_source)
+            != cache.execution_price_source_fingerprint
+        ):
+            raise InvalidConfigurationError(
+                "rescore_with_costs() requires this validator's own "
+                "execution_price_source to match the one that built cache "
+                "-- rescoring from a differently-sourced validator would "
+                "silently mix target weights computed under one source "
+                "with accounting computed under another. Call "
+                "run_with_weight_cache() on a validator constructed with "
+                "the same execution_price_source instead."
             )
 
         started = time.perf_counter()
@@ -862,6 +955,15 @@ class WalkForwardValidator:
             tradable_mask = _tradable_mask_if_mixed_calendar(
                 scenario_config, pd.DatetimeIndex(asset_returns.index)
             )
+            # Loop-invariant across every candidate below (same as
+            # asset_returns/execution_model/tradable_mask above it) --
+            # computed once per fold, not once per candidate.
+            overnight_returns = overnight_returns_for_config(
+                scenario_config,
+                fold_tradable,
+                prices,
+                execution_price_source=self.execution_price_source,
+            )
 
             best_score = -np.inf
             best_index: int | None = None
@@ -889,6 +991,7 @@ class WalkForwardValidator:
                         aligned_tradable,
                         0,
                     ),
+                    overnight_returns=overnight_returns,
                     **accounting_kwargs,
                 )
                 equity = M.equity_from_returns(accounting.net_returns)
@@ -1184,6 +1287,15 @@ class WalkForwardValidator:
                     ).fillna(0.0)
                 else:
                     executed_weights = executed_weights.shift(delay).fillna(0.0)
+            # Computed once (needed by both overnight_returns_for_config
+            # below and reference_prices_for_config inside
+            # _build_oos_result further down) and threaded into each,
+            # mirroring engine.py's own BacktestEngine.run() pattern.
+            adjusted_open = adjusted_open_for_config(
+                active_config,
+                tradable,
+                execution_price_source=self.execution_price_source,
+            )
             accounting = run_accounting(
                 executed_weights,
                 asset_returns,
@@ -1196,6 +1308,13 @@ class WalkForwardValidator:
                     shared_calendar,
                     aligned_tradable_mask,
                     delay,
+                ),
+                overnight_returns=overnight_returns_for_config(
+                    active_config,
+                    tradable,
+                    prices,
+                    execution_price_source=self.execution_price_source,
+                    adjusted_open=adjusted_open,
                 ),
                 **_accounting_kwargs_for_config(active_config),
             )
@@ -1219,6 +1338,7 @@ class WalkForwardValidator:
                 test_window,
                 step,
                 expanding,
+                adjusted_open=adjusted_open,
             )
         else:
             oos_returns = pd.Series(dtype=float)
@@ -1282,6 +1402,8 @@ class WalkForwardValidator:
         test_window: int,
         step: int,
         expanding: bool,
+        *,
+        adjusted_open: pd.DataFrame | None,
     ) -> BacktestResult:
         """Build a genuine BacktestResult from the stitched OOS series.
 
@@ -1293,6 +1415,12 @@ class WalkForwardValidator:
         (``self.base_config`` from :meth:`run`/:meth:`run_with_weight_cache`,
         or a cost-scenario config from :meth:`rescore_with_costs`), so its
         cost fields and metadata describe what was actually run.
+
+        ``adjusted_open`` -- the caller's own already-derived
+        ``adjusted_open_for_config(...)`` result (``_finalize`` needs the
+        same matrix for its own ``overnight_returns_for_config`` call),
+        reused here for :func:`reference_prices_for_config` instead of
+        deriving it a second time.
         """
         # No trigger_*/adjustment_*/position_strategy_origin_* provenance is
         # passed here: attribution is unavailable in this aggregated
@@ -1304,15 +1432,24 @@ class WalkForwardValidator:
         # columns `None`/`NaT` whenever these kwargs are omitted (its
         # documented legacy/no-attribution path), which is correct here, not
         # a bug to fix.
+        reference_prices, reference_price_needs_shift = reference_prices_for_config(
+            active_config,
+            tradable,
+            price_matrix(tradable, adjusted=False),
+            execution_price_source=self.execution_price_source,
+            adjusted_open=adjusted_open,
+        )
         trades = build_trade_log(
             accounting.executed_weights,
-            accounting.weight_changes,
+            accounting.weight_changes_for_costs,
             accounting.equity,
-            price_matrix(tradable, adjusted=False),
+            reference_prices,
+            reference_price_needs_shift=reference_price_needs_shift,
             commission_bps=active_config.commission_bps,
             spread_bps=active_config.spread_bps,
             slippage_model=execution_model.slippage,
             slippage_equity=accounting.equity_for_costs,
+            execution_equity=accounting.execution_equity,
         )
         benchmark_data = (
             data if active_config.benchmark_kind is BenchmarkKind.SYMBOL else tradable
@@ -1365,18 +1502,29 @@ class WalkForwardValidator:
             # Unlike BacktestEngine.run() (docs/api.md documents passing it
             # a custom strategy/allocator/execution-model instance directly,
             # see its own config_yaml_reflects_*), WalkForwardValidator never
-            # accepts one: every component is always built via
+            # accepts a custom strategy/allocator/execution-model instance:
+            # every one of those is always built via
             # build_strategy_from_config/build_allocator_from_config/
             # build_execution_from_config(active_config, ...), so there is
-            # no possible mismatch to verify here -- these are unconditional
-            # facts about this code path, not a best-effort check. Without
-            # them, the HTML report's footer (which requires all three
-            # config_yaml_reflects_* keys) would treat every walk-forward
-            # result as unverified and never claim reproducibility, even
-            # though it always is.
+            # no possible mismatch to verify for THOSE three. It DOES accept
+            # a custom `execution_price_source` (see this class's own
+            # constructor docstring) -- a config-only rebuild has no field
+            # for it at all, so a non-default source given here means the
+            # execution result is NOT reproducible from config.yaml alone,
+            # UNLESS the source was never even consulted: it's only ever
+            # read under next_bar_open (overnight_returns_for_config/
+            # reference_prices_for_config both early-return without
+            # touching it otherwise), exactly like BacktestEngine.run()'s
+            # own config_yaml_reflects_execution treats it.
             "config_yaml_reflects_strategy": True,
             "config_yaml_reflects_allocator": True,
-            "config_yaml_reflects_execution": True,
+            "config_yaml_reflects_execution": (
+                self.execution_price_source is None
+                or not execution_price_source_is_consulted(active_config)
+            ),
+            "execution_price_source_fingerprint": execution_price_source_fingerprint(
+                self.execution_price_source
+            ),
             # `metrics` (below) *are* the out-of-sample metrics — this result
             # is the stitched OOS series, not a full-sample fit. Mirrored
             # into metadata under this exact key because
@@ -1467,6 +1615,16 @@ class WalkForwardValidator:
         best_score = -np.inf
         best_parameters: dict[str, Any] | None = None
         insufficient_warmup = 0
+        # Loop-invariant across every candidate below (a candidate's own
+        # `_with_params` override only ever touches `config.strategy.
+        # parameters`, never `config.execution`/`config.symbols`) --
+        # computed once per fold, not once per candidate, but LAZILY (on
+        # first actually-evaluated candidate, not unconditionally up
+        # front): a fold where every combination is structurally
+        # unwarmed must still never touch `data` at all, matching
+        # run()'s own "no evaluation happens" contract for that case.
+        overnight_returns: pd.DataFrame | None = None
+        overnight_returns_ready = False
         for combination in combinations:
             config = _with_params(self.base_config, combination)
             required = _minimum_observations_for_executable_weight(config)
@@ -1485,6 +1643,15 @@ class WalkForwardValidator:
                 if on_candidate is not None:
                     on_candidate()
                 continue
+            if not overnight_returns_ready:
+                overnight_returns = _overnight_returns_for_fold(
+                    data,
+                    self.base_config,
+                    window.train[0],
+                    window.validation[-1],
+                    execution_price_source=self.execution_price_source,
+                )
+                overnight_returns_ready = True
             returns = _evaluate_fresh_from_window_start(
                 data,
                 config,
@@ -1492,6 +1659,8 @@ class WalkForwardValidator:
                 window.validation[0],
                 window.validation[-1],
                 execution_delay=execution_delay,
+                execution_price_source=self.execution_price_source,
+                overnight_returns=overnight_returns,
             )
             equity = M.equity_from_returns(returns)
             score = scorer(returns, equity, periods_per_year, risk_free_rate)
@@ -1542,6 +1711,10 @@ class WalkForwardValidator:
         best_index: int | None = None
         insufficient_warmup = 0
         captured: list[_FoldCandidateWeights] = []
+        # Loop-invariant across every candidate below, computed lazily --
+        # see _select_on_validation's identical comment.
+        overnight_returns: pd.DataFrame | None = None
+        overnight_returns_ready = False
         for index, combination in enumerate(combinations):
             config = _with_params(self.base_config, combination)
             required = _minimum_observations_for_executable_weight(config)
@@ -1561,6 +1734,15 @@ class WalkForwardValidator:
                 if on_candidate is not None:
                     on_candidate()
                 continue
+            if not overnight_returns_ready:
+                overnight_returns = _overnight_returns_for_fold(
+                    data,
+                    self.base_config,
+                    window.train[0],
+                    window.validation[-1],
+                    execution_price_source=self.execution_price_source,
+                )
+                overnight_returns_ready = True
             validation_weights, returns = _weights_and_returns_for_validation(
                 data,
                 config,
@@ -1568,11 +1750,18 @@ class WalkForwardValidator:
                 window.validation[0],
                 window.validation[-1],
                 execution_delay=execution_delay,
+                execution_price_source=self.execution_price_source,
+                overnight_returns=overnight_returns,
             )
             equity = M.equity_from_returns(returns)
             score = scorer(returns, equity, periods_per_year, risk_free_rate)
             test_targets = _target_weights_for_window(
-                data, config, window.train[0], window.test[0], window.test[-1]
+                data,
+                config,
+                window.train[0],
+                window.test[0],
+                window.test[-1],
+                execution_price_source=self.execution_price_source,
             )
             captured.append(_FoldCandidateWeights(validation_weights, test_targets))
             if on_candidate is not None:
@@ -1600,7 +1789,12 @@ class WalkForwardValidator:
         """Return constrained test targets before scheduling and turnover."""
         config = _with_params(self.base_config, params)
         return _target_weights_for_window(
-            data, config, window.train[0], window.test[0], window.test[-1]
+            data,
+            config,
+            window.train[0],
+            window.test[0],
+            window.test[-1],
+            execution_price_source=self.execution_price_source,
         )
 
 
@@ -1781,17 +1975,29 @@ def _slice_between(
 
 
 def _weights_for_window(
-    data: pd.DataFrame,
+    sliced: pd.DataFrame,
     config: ExperimentConfig,
-    lookback_start: pd.Timestamp,
     window_start: pd.Timestamp,
     window_end: pd.Timestamp,
     *,
     execution_delay: int = 0,
+    execution_price_source: ExecutionPriceSource | None = None,
 ) -> pd.DataFrame:
-    """Return held weights after supplying the required lookback history."""
-    sliced = _slice_between(data, lookback_start, window_end)
-    result = run_backtest_from_config(sliced, config, execution_delay=execution_delay)
+    """Return held weights after supplying the required lookback history.
+
+    ``sliced``: the caller's own already-``_slice_between``-d frame
+    (``[lookback_start, window_end]``), passed in rather than re-derived
+    here -- this function's one caller,
+    :func:`_weights_and_returns_for_validation`, already computes the
+    identical slice for its own accounting step, so re-slicing here would
+    redo that same full-panel mask/copy a second time for no reason.
+    """
+    result = run_backtest_from_config(
+        sliced,
+        config,
+        execution_delay=execution_delay,
+        execution_price_source=execution_price_source,
+    )
     return result.weights.loc[window_start:window_end]
 
 
@@ -1801,13 +2007,43 @@ def _target_weights_for_window(
     lookback_start: pd.Timestamp,
     window_start: pd.Timestamp,
     window_end: pd.Timestamp,
+    *,
+    execution_price_source: ExecutionPriceSource | None = None,
 ) -> pd.DataFrame:
     """Return constrained targets before scheduling and turnover capping."""
     sliced = _slice_between(data, lookback_start, window_end)
-    result = run_backtest_from_config(sliced, config)
+    result = run_backtest_from_config(
+        sliced, config, execution_price_source=execution_price_source
+    )
     if result.target_weights is None:
         raise InvalidConfigurationError("Backtest did not expose target weights.")
     return result.target_weights.loc[window_start:window_end]
+
+
+def _overnight_returns_for_fold(
+    data: pd.DataFrame,
+    config: ExperimentConfig,
+    lookback_start: pd.Timestamp,
+    window_end: pd.Timestamp,
+    *,
+    execution_price_source: ExecutionPriceSource | None,
+) -> pd.DataFrame | None:
+    """overnight_returns_for_config, from the tradable/prices slice for one fold.
+
+    A parameter-grid candidate's own ``_with_params`` override only ever
+    touches ``config.strategy.parameters`` -- never ``config.execution``
+    or ``config.symbols`` -- so this result is provably identical across
+    every candidate scored for the same fold. Callers compute it ONCE per
+    fold and pass it into every one of that fold's per-candidate calls,
+    instead of paying for a fresh ``adjusted_open`` derivation (3
+    full-panel pivots plus a division) on every candidate.
+    """
+    sliced = _slice_between(data, lookback_start, window_end)
+    tradable = sliced[sliced[SYMBOL].isin(set(config.symbols))]
+    prices = price_matrix(tradable, adjusted=True)
+    return overnight_returns_for_config(
+        config, tradable, prices, execution_price_source=execution_price_source
+    )
 
 
 def _weights_and_returns_for_validation(
@@ -1818,21 +2054,29 @@ def _weights_and_returns_for_validation(
     window_end: pd.Timestamp,
     *,
     execution_delay: int = 0,
+    execution_price_source: ExecutionPriceSource | None = None,
+    overnight_returns: pd.DataFrame | None,
 ) -> tuple[pd.DataFrame, pd.Series]:
     """Return one candidate's (held weights, net returns) on a block.
 
     Split out of the former ``_evaluate_fresh_from_window_start`` so
     ``WalkForwardValidator._select_and_capture`` can retain the weights
     instead of discarding them, without duplicating this accounting logic.
+
+    ``execution_price_source`` is forwarded to ``_weights_for_window``
+    (the weight-generation path); ``overnight_returns`` -- normally
+    produced by :func:`_overnight_returns_for_fold` once per fold, not
+    once per candidate -- is used directly for this call's own
+    accounting. See ``WalkForwardValidator``'s own constructor docstring.
     """
     sliced = _slice_between(data, lookback_start, window_end)
     window_weights = _weights_for_window(
-        data,
+        sliced,
         config,
-        lookback_start,
         window_start,
         window_end,
         execution_delay=execution_delay,
+        execution_price_source=execution_price_source,
     )
     tradable = sliced[sliced[SYMBOL].isin(set(config.symbols))]
     prices = price_matrix(tradable, adjusted=True)
@@ -1872,6 +2116,7 @@ def _weights_and_returns_for_validation(
             aligned_tradable,
             0,
         ),
+        overnight_returns=overnight_returns,
         **_accounting_kwargs_for_config(config),
     )
     return window_weights, accounting.net_returns
@@ -1885,6 +2130,8 @@ def _evaluate_fresh_from_window_start(
     window_end: pd.Timestamp,
     *,
     execution_delay: int = 0,
+    execution_price_source: ExecutionPriceSource | None = None,
+    overnight_returns: pd.DataFrame | None,
 ) -> pd.Series:
     """Return independently accounted net returns for candidate scoring."""
     _, net_returns = _weights_and_returns_for_validation(
@@ -1894,6 +2141,8 @@ def _evaluate_fresh_from_window_start(
         window_start,
         window_end,
         execution_delay=execution_delay,
+        execution_price_source=execution_price_source,
+        overnight_returns=overnight_returns,
     )
     return net_returns
 

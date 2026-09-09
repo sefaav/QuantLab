@@ -863,9 +863,13 @@ def render_trade_table(st: Any, result: BacktestResult) -> None:
             "Reference price": st.column_config.NumberColumn(
                 "Reference price",
                 format="%.2f",
-                help="The prior-period price used by the backtest to "
-                "value this trade and compute its notional/costs -- not "
-                "a real fill price from an order book.",
+                help="The reference price shown for valuation context "
+                "alongside this trade (prior-period close, or this row's "
+                "own open under next_bar_open execution timing) -- not "
+                "what the backtest actually uses to size notional/costs "
+                "(that is |weight change| x prior equity, independent of "
+                "this price series), and not a real fill price from an "
+                "order book.",
             ),
             "Traded notional": st.column_config.NumberColumn(
                 "Traded notional (currency units)", format="localized"

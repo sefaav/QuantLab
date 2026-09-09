@@ -18,8 +18,8 @@ data:
 strategy:
   name: buy_and_hold
   parameters: {}
-  # Price series the strategy's own generate_signals() reads. Execution/
-  # costs always use the raw close regardless of this setting.
+  # Price series generate_signals() reads -- does not affect execution/
+  # costs (see docs/backtesting.md and config.py's own signal_price_type).
   signal_price_type: adjusted_close
 
 portfolio:
@@ -32,6 +32,12 @@ execution:
   spread_bps: 1.0
   slippage_bps: 1.0
   slippage_model: constant
+  # same_bar_close (default, backtest-only idealization) | next_bar_open
+  # (only daily frequency is validated) | immediate_after_close (24/7
+  # markets only, validated) -- see docs/backtesting.md#execution-timing.
+  # Explicit here so a future default change never silently alters this
+  # published experiment's own numbers.
+  execution_timing: same_bar_close
 
 backtest:
   initial_capital: 100000

@@ -44,8 +44,9 @@ it lets you pick real data, adjust several of the strategy's own parameters
 with widgets, and immediately recomputes and re-plots the relevant
 indicator/signal/spread/threshold — Streamlit's rerun-on-interaction model
 is what makes a parameter's effect observable without a bespoke "impact"
-widget (see `quantlab.dashboard.explorer.shared_components.
-render_price_chart`). Coverage varies by strategy and by parameter -- not
+widget (see
+`quantlab.dashboard.explorer.shared_components.render_price_chart`).
+Coverage varies by strategy and by parameter -- not
 every constructor parameter necessarily has its own interactive control
 yet; the Parameters section's text is the documented reference regardless.
 Every lab loads its price data through one shared, bounded cache
@@ -73,9 +74,9 @@ registered profile still gets a gallery card, with a "documentation coming
 soon" placeholder, instead of silently disappearing. This does NOT mean
 `app.py`/`cli.py` are strategy-name-free everywhere: the regular Backtest/
 Walk-forward sidebar still branches on a strategy's name to render its own
-config widgets (unrelated to the Strategy Explorer); `reporting/
-html_report.py` is the one file that genuinely never names a strategy
-(enforced by a dedicated regression test). Each strategy's own file under
+config widgets (unrelated to the Strategy Explorer); `reporting/html_report.py`
+is the one file that genuinely never names a strategy (enforced by a
+dedicated regression test). Each strategy's own file under
 `dashboard/explorer/profiles/` registers a `StrategyProfile` (markdown
 fields, a `ParameterDoc` per parameter, and a `lab` callback) at import
 time, the same pattern `register_strategy` already uses for trading logic

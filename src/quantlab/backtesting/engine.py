@@ -43,6 +43,14 @@ from quantlab.backtesting.accounting import (
     run_accounting,
 )
 from quantlab.backtesting.benchmark import build_benchmark
+from quantlab.backtesting.execution_prices import (
+    ExecutionPriceSource,
+    adjusted_open_for_config,
+    execution_price_source_fingerprint,
+    execution_price_source_is_consulted,
+    overnight_returns_for_config,
+    reference_prices_for_config,
+)
 from quantlab.backtesting.result import BacktestResult
 from quantlab.backtesting.trade_log import build_trade_log
 from quantlab.config import BenchmarkKind, ExperimentConfig
@@ -501,6 +509,7 @@ class BacktestEngine:
         config: ExperimentConfig,
         *,
         execution_delay: int = 0,
+        execution_price_source: ExecutionPriceSource | None = None,
     ) -> BacktestResult:
         """Run a backtest and return a :class:`BacktestResult`.
 
@@ -514,6 +523,18 @@ class BacktestEngine:
             execution_delay: Additional bars between target formation and
                 execution. Turnover, costs, trades and returns are recomputed
                 from the delayed weights.
+            execution_price_source: Derives the adjusted-open matrix used
+                when ``config.execution.execution_timing ==
+                "next_bar_open"`` (ignored otherwise). Defaults to
+                :class:`~quantlab.backtesting.execution_prices.
+                RatioApproximatedExecutionPrices` -- the one place this
+                genuinely needs overriding is a future, more accurate
+                point-in-time/corporate-actions-aware implementation (see
+                that module's own docstring), which is exactly what
+                depending on the :class:`~quantlab.backtesting.
+                execution_prices.ExecutionPriceSource` protocol here,
+                rather than the concrete class, exists to make possible
+                without editing this method.
         """
         started = time.perf_counter()
         if not isinstance(data, pd.DataFrame):
@@ -555,6 +576,28 @@ class BacktestEngine:
                 f"Need at least 2 dates to backtest; got {prices.shape[0]}."
             )
         asset_returns = compute_asset_returns(prices)
+
+        # Computed once (needed by both overnight_returns_for_config below
+        # and reference_prices_for_config further down, at the trade-log
+        # step) and threaded into each, rather than each independently
+        # paying for the adjusted-open derivation's full-panel pivots.
+        adjusted_open = adjusted_open_for_config(
+            config, tradable_data, execution_price_source=execution_price_source
+        )
+        # Shared with every walk-forward/robustness accounting call site
+        # (quantlab.validation.walk_forward), so the OVERNIGHT-RETURN
+        # FORMULA itself can never independently drift between the two --
+        # a non-default `execution_price_source` given here is honored
+        # identically by a `WalkForwardValidator` constructed with the
+        # same source over the same config (see its own constructor
+        # docstring).
+        overnight_returns = overnight_returns_for_config(
+            config,
+            tradable_data,
+            prices,
+            execution_price_source=execution_price_source,
+            adjusted_open=adjusted_open,
+        )
 
         # Engine-injected context (never a user-configured constructor
         # hyperparameter, see BaseStrategy.symbol_calendars's own
@@ -1087,6 +1130,7 @@ class BacktestEngine:
             long_only=config.portfolio.long_only,
             rebalance_date=rebalance_date,
             maximum_turnover=config.portfolio.maximum_turnover,
+            overnight_returns=overnight_returns,
         )
 
         # `maximum_turnover` is enforced at the decision level above ONLY
@@ -1156,15 +1200,24 @@ class BacktestEngine:
         # this exact model; the trade log's per-fill breakdown must agree
         # with it too, or the equity curve, trade log and report could each
         # describe a different reality.
+        reference_prices, reference_price_needs_shift = reference_prices_for_config(
+            config,
+            tradable_data,
+            price_matrix(tradable_data, adjusted=False),
+            execution_price_source=execution_price_source,
+            adjusted_open=adjusted_open,
+        )
         trades = build_trade_log(
             accounting.executed_weights,
-            accounting.weight_changes,
+            accounting.weight_changes_for_costs,
             accounting.equity,
-            price_matrix(tradable_data, adjusted=False),
+            reference_prices,
+            reference_price_needs_shift=reference_price_needs_shift,
             commission_bps=execution_model.commission.commission_bps,
             spread_bps=execution_model.spread.spread_bps,
             slippage_model=execution_model.slippage,
             slippage_equity=accounting.equity_for_costs,
+            execution_equity=accounting.execution_equity,
             executed_desired=executed_desired,
             executed_constrained=executed_constrained,
             executed_signal_diag=executed_signal_diag,
@@ -1244,6 +1297,7 @@ class BacktestEngine:
                 strategy,
                 allocator,
                 execution_model,
+                execution_price_source,
             ),
             gross_returns=accounting.gross_returns,
             gross_equity=accounting.gross_equity,
@@ -1259,6 +1313,7 @@ class BacktestEngine:
         strategy: BaseStrategy,
         allocator: PortfolioAllocator,
         execution_model: ExecutionModel,
+        execution_price_source: ExecutionPriceSource | None = None,
     ) -> dict[str, object]:
         """Build metadata used to compare and audit runs.
 
@@ -1341,9 +1396,27 @@ class BacktestEngine:
             )
         execution_effective = _effective_execution_summary(execution_model)
         reference_execution = _reference_execution_model(config, full_data)
+        # A config-only rebuild (`quantlab backtest --config ...`, or this
+        # same engine's own reference reconstruction above) has no config
+        # field for `execution_price_source` at all -- it always gets the
+        # default `RatioApproximatedExecutionPrices`. A non-default source
+        # given to THIS run can change next_bar_open's overnight/intraday
+        # numbers without that difference ever appearing in config.yaml, so
+        # the run cannot be called reproducible from config.yaml alone
+        # whenever one was supplied AND actually consulted -- which is only
+        # ever true under next_bar_open (overnight_returns_for_config/
+        # reference_prices_for_config both early-return without calling it
+        # otherwise, see execution_prices.py), so a custom source paired
+        # with same_bar_close/immediate_after_close has provably zero
+        # effect on this run's numbers and must not be flagged unreproducible.
+        source_fingerprint = execution_price_source_fingerprint(execution_price_source)
         config_yaml_reflects_execution = (
             reference_execution is not None
             and execution_effective == _effective_execution_summary(reference_execution)
+            and (
+                execution_price_source is None
+                or not execution_price_source_is_consulted(config)
+            )
         )
         return {
             "run_timestamp": datetime.now(UTC).isoformat(),
@@ -1355,6 +1428,7 @@ class BacktestEngine:
             "allocator_parameters": allocator_parameters,
             "config_yaml_reflects_allocator": config_yaml_reflects_allocator,
             "config_yaml_reflects_execution": config_yaml_reflects_execution,
+            "execution_price_source_fingerprint": source_fingerprint,
             **execution_effective,
             "symbols": config.symbols,
             "start_date": str(config.start_date),

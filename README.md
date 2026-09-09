@@ -1,60 +1,180 @@
 # QuantLab — Reproducible Quantitative Research and Backtesting
 
-QuantLab is a modular Python platform for **quantitative research**: it turns a
-financial hypothesis into a reproducible, bias-aware experiment. You download
-and validate market data, build features and signals, run vectorised backtests
-with realistic costs, measure performance and risk, validate out-of-sample with
-walk-forward analysis, and generate an honest research report. A YAML config
-drives the core experiment, including an optional walk-forward parameter grid;
-separate Python and notebook APIs expose additional robustness analyses such as
-sensitivity and bootstrap.
+[![CI](https://github.com/sefaav/QuantLab/actions/workflows/ci.yml/badge.svg)](https://github.com/sefaav/QuantLab/actions/workflows/ci.yml)
+[![Python 3.12 | 3.13](https://img.shields.io/badge/python-3.12%20%7C%203.13-blue)](pyproject.toml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
-> ⚠️ **This project is for educational and research purposes only.** It is not
-> investment advice, and historical performance does not guarantee future
-> results.
+QuantLab is a modular Python platform for designing, backtesting, and
+validating systematic strategies under configurable, explicitly modelled
+execution and transaction-cost assumptions. It turns a financial hypothesis
+into a reproducible, bias-aware experiment: you download and validate market
+data, build features and signals, run vectorised backtests with explicitly
+modelled costs, measure performance and risk, validate out-of-sample with
+walk-forward analysis, and generate an honest research report — all driven
+by one YAML config, with a Python/notebook API for deeper robustness
+analysis (sensitivity, bootstrap, permutation).
 
-The goal is **not** to claim a profitable strategy. It is to demonstrate a
-rigorous, reproducible research process, designed to prevent common
-look-ahead leakage through delayed execution. Custom strategies remain
-responsible for causal feature and signal construction.
+The project focuses on rigorous and reproducible empirical research rather
+than maximizing historical performance.
+
+📚 [Documentation](https://sefaav.github.io/QuantLab/)
 
 ---
 
-## Features
+![QuantLab dashboard results](reports/figures/dashboard_results.png)
 
-- **Multiple data sources** — Yahoo Finance (equities/ETFs/indices) and Binance
-  (crypto OHLCV), normalised to one canonical schema and cached as Parquet.
-- **Reusable strategies** — buy & hold, time-series & cross-sectional momentum,
-  mean reversion, trend following, pairs trading — behind one `BaseStrategy`
-  interface.
-- **Realistic costs** — explicit commission, spread and (constant or
-  volume-based) slippage; every result reports **gross vs net**.
+---
+
+## Research methodology
+
 - **Delayed-execution barrier** — signals are strictly shifted before returns;
   the separation between *signal at t*, *position at t+1* and *realised
-  return* is enforced and unit-tested. This prevents the common look-ahead
-  leak of acting on a signal the same period it was formed — a custom
-  strategy that reads future rows directly remains responsible for its own
-  causal construction.
-- **Risk analytics** — Sharpe, Sortino, Calmar, max drawdown, VaR/CVaR,
-  exposures, benchmark alpha/beta, and more, implemented from first principles.
+  return* is enforced and unit-tested. This mechanically prevents a
+  position from earning the return that ends on the same bar its own
+  signal was formed on — the common look-ahead leak — but does not, by
+  itself, guarantee that a custom strategy's own feature/signal
+  construction is causal (e.g. a strategy that reads future rows directly
+  out of its input data); that remains the strategy author's own
+  responsibility.
+- **Configurable modelled costs** — explicit commission, spread and (constant
+  or volume-based) slippage; every result reports **gross vs net**.
 - **Walk-forward validation** — expanding/rolling windows, parameter selection
   on validation only and out-of-sample stitching; separate robustness tools
   provide sensitivity heatmaps, bootstrap, permutation and stress tests.
+- **Risk analytics** — Sharpe, Sortino, Calmar, max drawdown, VaR/CVaR,
+  exposures, benchmark alpha/beta, and more, implemented from first
+  principles.
 - **Automated reports** — self-contained HTML research report with an honest
-  limitations section.
-- **Interfaces** — Python API, a Typer CLI, and a Streamlit dashboard.
-- **Tested architecture** — unit + integration tests, >80% core-library
-  coverage target, Ruff + mypy clean. CLI and dashboard behaviour are exercised
-  separately by integration and Streamlit AppTest tests.
+  limitations section, written to the experiment directory automatically by
+  every `quantlab backtest`/`walk-forward` CLI run; the dashboard generates
+  the same report in memory for on-screen preview and download instead of
+  writing it to disk. Calling `BacktestEngine` directly through the Python
+  API requires the explicit `result.to_html(...)` call shown below.
+
+## Strategies
+
+One `BaseStrategy` interface behind six reusable, tested strategies: buy &
+hold, time-series momentum, cross-sectional momentum, mean reversion
+(z-score, RSI, percentile, Bollinger and distance-to-MA), trend following,
+and pairs trading (hedge ratio + ADF-gated spread). See
+[`docs/strategies.md`](docs/strategies.md) for each strategy's own
+assumptions and parameters.
+
+## Example research
+
+**Robust Cross-Sectional Momentum Across Liquid Multi-Asset ETFs** —
+Can cross-sectional momentum generate stable out-of-sample risk-adjusted
+returns across liquid ETFs after transaction costs and volatility targeting?
+One example of the kind of study the platform is built for; walk through it in
+[`notebooks/02_momentum_research.ipynb`](notebooks/02_momentum_research.ipynb)
+and [`notebooks/05_robustness_analysis.ipynb`](notebooks/05_robustness_analysis.ipynb).
+
+`reports/generated/` is a build artefact, deliberately excluded from version
+control — the full HTML report at
+`reports/generated/cross_sectional_momentum_etfs/report.html` is **not**
+checked into this repository and will not exist until you generate it
+yourself:
+
+```bash
+quantlab walk-forward --config configs/momentum_sp500.yaml
+```
+
+Use `walk-forward`, not `quantlab backtest` — the latter deliberately clears
+the walk-forward CSVs and out-of-sample metrics this report includes. This
+produces the full 26-fold report the "walk-forward out-of-sample" row below
+is drawn from; the other rows in the table come from their own respective
+experiments/configs.
+
+### Results
+
+Representative outputs from the shipped configurations, including negative
+results, computed from real Yahoo Finance / Binance data (2008–2025 for
+ETFs, 2018–2025 for BTC), net of modelled transaction costs:
+
+| Experiment | Universe | Period | CAGR | Sharpe | Max DD | Fills |
+| --- | --- | --- | --- | --- | --- | --- |
+| Cross-sectional momentum (example above) | 8 multi-asset ETFs | 2008–2025 | 5.5% | 0.43 | −15.8% | 1,514 |
+| ↳ walk-forward out-of-sample | same | 26 folds | 4.6% | 0.31 | −18.5% | — |
+| Mean reversion (z-score) | 5 equity ETFs | 2010–2025 | 4.4% | 0.25 | −34.6% | 3,351 |
+| Pairs trading (EWA/EWC, vs SPY) | 2 country ETFs | 2010–2025 | 0.9% | −0.35 | −8.0% | 1,314 |
+| Trend following (BTC) | BTCUSDT | 2018–2025 | 30.3% | 0.93 | −43.9% | 1,563 |
+
+Every number above — including the negative Sharpe on the pairs trade — is
+reported as computed. **These are historical and conditional**: they depend
+on the period, the assumptions, the cost model, the parameters, and data
+quality. They are not predictions. See each report's *Limitations* section
+and [`docs/limitations.md`](docs/limitations.md).
+
+---
+
+## Notebooks
+
+Five executed research notebooks under [`notebooks/`](notebooks/), run for
+real against cached Yahoo/Binance data :
+
+1. [`01_data_quality.ipynb`](notebooks/01_data_quality.ipynb) — coverage, gaps, return sanity checks.
+2. [`02_momentum_research.ipynb`](notebooks/02_momentum_research.ipynb) — a full study end-to-end, including walk-forward.
+3. [`03_mean_reversion_research.ipynb`](notebooks/03_mean_reversion_research.ipynb) — RSI vs Bollinger vs z-score.
+4. [`04_pairs_trading_research.ipynb`](notebooks/04_pairs_trading_research.ipynb) — hedge ratio, ADF test, spread trading.
+5. [`05_robustness_analysis.ipynb`](notebooks/05_robustness_analysis.ipynb) — sensitivity heatmap, bootstrap, stress tests, permutation test.
+
+Regenerate them (after `quantlab download` for each config) with
+`python scripts/build_notebooks.py`.
+
+---
+
+## Strategy Explorer
+
+Interactive explanations, assumptions, parameter behavior, diagnostics, and
+testing tools for each of the six implemented strategies. Each
+strategy opens its own detail page with a live, editable parameter
+laboratory (against real downloaded data, a local CSV, or a bundled offline
+synthetic dataset for zero-setup exploration). See
+[`docs/strategy_explorer.md`](docs/strategy_explorer.md).
+
+![QuantLab Strategy Explorer](reports/figures/strategy_explorer.png)
+
+## Dashboard
+
+```bash
+streamlit run src/quantlab/dashboard/app.py
+```
+
+A **Backtest** / **Walk-forward** / **Strategies** mode switch sits above the
+sidebar. Walk-forward mode runs the same train/validation/test parameter
+selection as `quantlab walk-forward`, with its own sidebar (windows,
+expanding mode, optimization metric, parameter-grid picker) and
+Results/Trades/Robustness/Report tabs built from the stitched out-of-sample
+result, driven by a live progress bar with an ETA while a run is in flight.
+Both modes' Robustness tab includes stress tests, block bootstrap, a Monte
+Carlo permutation test and a 2-parameter sensitivity heatmap, individually or
+via "Run all robustness tests" — in Walk-forward mode, sensitivity and most
+stress-test scenarios re-run the whole selection process per cell/scenario;
+commission/slippage stress scenarios instead re-score cached candidate
+weights under the new costs, re-selecting each fold's winner (see
+[`docs/validation.md`](docs/validation.md#stress-tests) for exactly what's
+cached vs. recomputed).
+
+<details>
+<summary>Home / configuration screen</summary>
+
+![QuantLab dashboard home](reports/figures/dashboard_home.png)
+
+</details>
 
 ---
 
 ## Architecture
 
+Multiple data sources (Yahoo Finance for equities/ETFs/indices, Binance for
+crypto OHLCV) are normalised to one canonical schema and cached as Parquet
+before reaching any strategy.
+
 ```mermaid
 flowchart LR
-    A[Market Data Sources] --> B[Data Cleaning]
-    B --> C[Data Validation]
+    A[Market Data Sources] --> A2[Raw Data Inspection]
+    A2 --> B[Data Cleaning]
+    B --> C[Final Validation]
     C --> E[Strategy using Feature Functions]
     E --> F[Portfolio Allocation]
     F --> G[Constraints]
@@ -71,10 +191,13 @@ flowchart LR
 ```
 
 ```
-Data → Cleaning & Validation → Feature Functions → Strategy Signals
-     → Portfolio Allocation → Execution Costs → Backtest Accounting
-     → Risk & Performance → Validation & Reporting
+Data → Inspection → Cleaning & Validation → Feature Functions → Strategy
+     Signals → Portfolio Allocation → Execution Costs → Backtest
+     Accounting → Risk & Performance → Validation & Reporting
 ```
+
+Three interfaces sit on top of this pipeline: a Python API, a Typer CLI, and
+the Streamlit dashboard above.
 
 ---
 
@@ -137,9 +260,9 @@ result.to_html("reports/generated/demo/report.html")
 
 To run the same experiment on real Yahoo Finance / Binance data instead, swap
 in `configs/momentum_sp500.yaml` (or another shipped config) after making its
-remote data available with `quantlab download --config
-configs/momentum_sp500.yaml`; that command reuses a valid local cache when one
-already covers the requested period.
+remote data available with
+`quantlab download --config configs/momentum_sp500.yaml`; that command
+reuses a valid local cache when one already covers the requested period.
 
 ---
 
@@ -166,15 +289,14 @@ a config's `robustness:` block in one pass. All five branch on
 `validation.method`: with `walk_forward`, each starts from the same
 walk-forward-stitched out-of-sample result rather than a single backtest, so
 the evidence never silently comes from a different validation method than
-the one configured. `sensitivity` re-runs the whole walk-forward selection process per candidate
-parameter pair. `stress-test`'s commission/slippage scenarios reuse the
-baseline's own cached per-fold candidate weights and only re-score them
-under the new costs (cheaper, since selection never depends on execution
-costs); its execution-delay and reduced-universe scenarios genuinely change
-the weights themselves, so each still re-runs selection end to end.
-`bootstrap` and `permutation-test` do neither: they resample or permute the
-walk-forward's already-realised out-of-sample return series statistically,
-without touching the selection process at all.
+the one configured. In that mode, `sensitivity` and most `stress-test`
+scenarios re-run the whole selection process; commission/slippage stress
+scenarios instead re-score cached candidate weights under the new costs,
+re-selecting each fold's winner (see
+[`docs/validation.md`](docs/validation.md#stress-tests) for exactly what's
+cached vs. recomputed). `bootstrap` and `permutation-test` do neither: they
+resample or permute the walk-forward's already-realised out-of-sample
+return series statistically, without touching the selection process at all.
 
 `walk-forward`, `stress-test`, `sensitivity` and `robustness` show a live
 progress bar with an ETA in the terminal, and checkpoint their progress to
@@ -194,56 +316,13 @@ the complete operating-system environment (see `docs/limitations.md`).
 
 ---
 
-## Notebooks
-
-Five executed research notebooks under [`notebooks/`](notebooks/), run for
-real against cached Yahoo/Binance data (not hand-written pseudocode):
-
-1. [`01_data_quality.ipynb`](notebooks/01_data_quality.ipynb) — coverage, gaps, return sanity checks.
-2. [`02_momentum_research.ipynb`](notebooks/02_momentum_research.ipynb) — a full study end-to-end, including walk-forward.
-3. [`03_mean_reversion_research.ipynb`](notebooks/03_mean_reversion_research.ipynb) — RSI vs Bollinger vs z-score.
-4. [`04_pairs_trading_research.ipynb`](notebooks/04_pairs_trading_research.ipynb) — hedge ratio, ADF test, spread trading.
-5. [`05_robustness_analysis.ipynb`](notebooks/05_robustness_analysis.ipynb) — sensitivity heatmap, bootstrap, stress tests, permutation test.
-
-Regenerate them (after `quantlab download` for each config) with
-`python scripts/build_notebooks.py`.
-
----
-
-## Dashboard
-
-```bash
-streamlit run src/quantlab/dashboard/app.py
-```
-
-A **Backtest** / **Walk-forward** mode switch sits above the sidebar.
-Walk-forward mode runs the same train/validation/test parameter selection as
-`quantlab walk-forward`, with its own sidebar (windows, expanding mode,
-optimization metric, parameter-grid picker) and Results/Trades/Robustness/
-Report tabs built from the stitched out-of-sample result, driven by a live
-progress bar with an ETA while a run is in flight. Both modes' Robustness
-tab includes stress tests, block bootstrap, a Monte Carlo permutation test
-and a 2-parameter sensitivity heatmap,
-individually or via "Run all robustness tests" — in Walk-forward mode,
-sensitivity re-runs the whole selection process per cell; stress tests do
-too for execution-delay/reduced-universe scenarios, but reuse the
-baseline's cached candidate weights (just re-scored under new costs) for
-commission/slippage scenarios.
-
-![QuantLab dashboard results](reports/figures/dashboard_results.png)
-
-<details>
-<summary>Home / configuration screen</summary>
-
-![QuantLab dashboard home](reports/figures/dashboard_home.png)
-
-</details>
-
----
-
 ## Tests & quality
 
-The direct commands work in PowerShell, Linux and macOS:
+Unit + integration tests, >82% core-library coverage target (CI-enforced,
+`--cov-fail-under=82`), Ruff + mypy
+clean. CLI and dashboard behaviour are exercised separately by integration
+and Streamlit AppTest tests. The direct commands work in PowerShell, Linux
+and macOS:
 
 ```bash
 python -m pytest -m "not network"
@@ -257,48 +336,6 @@ GNU Make is optional. When it is installed, `make test`, `make coverage`,
 `make lint` and `make type-check` call the same tools.
 
 ---
-
-## Example research
-
-**Robust Cross-Sectional Momentum Across Liquid Multi-Asset ETFs** —
-Can cross-sectional momentum generate stable out-of-sample risk-adjusted
-returns across liquid ETFs after transaction costs and volatility targeting?
-One example of the kind of study the platform is built for; walk through it in
-[`notebooks/02_momentum_research.ipynb`](notebooks/02_momentum_research.ipynb)
-and [`notebooks/05_robustness_analysis.ipynb`](notebooks/05_robustness_analysis.ipynb).
-
-`reports/generated/` is a build artefact, deliberately excluded from version
-control (see `.gitignore`) — the full HTML report at
-`reports/generated/cross_sectional_momentum_etfs/report.html` is **not**
-checked into this repository and will not exist until you generate it
-yourself:
-
-```bash
-quantlab walk-forward --config configs/momentum_sp500.yaml
-```
-
-Use `walk-forward`, not `quantlab backtest` — the latter deliberately clears
-the walk-forward CSVs and out-of-sample metrics this report includes. This
-produces the full 26-fold report the numbers below are drawn from.
-
-## Results
-
-Real, non-cherry-picked results from real Yahoo Finance / Binance data (2008–2025
-for ETFs, 2018–2025 for BTC), net of modelled transaction costs:
-
-| Experiment | Universe | Period | CAGR | Sharpe | Max DD | Fills |
-| --- | --- | --- | --- | --- | --- | --- |
-| Cross-sectional momentum (example above) | 8 multi-asset ETFs | 2008–2025 | 5.5% | 0.43 | −15.8% | 1,514 |
-| ↳ walk-forward out-of-sample | same | 26 folds | 4.7% | 0.32 | −18.5% | — |
-| Mean reversion (z-score) | 5 equity ETFs | 2010–2025 | 4.4% | 0.25 | −34.6% | 3,351 |
-| Pairs trading (EWA/EWC, vs SPY) | 2 country ETFs | 2010–2025 | 0.9% | −0.35 | −8.0% | 1,314 |
-| Trend following (BTC) | BTCUSDT | 2018–2025 | 30.3% | 0.93 | −43.9% | 1,563 |
-
-Every number above — including the negative Sharpe on the pairs trade — is
-reported as computed; nothing here is filtered for looking good. **These are
-historical and conditional**: they depend on the period, the assumptions, the
-cost model, the parameters, and data quality. They are not predictions. See
-each report's *Limitations* section and [`docs/limitations.md`](docs/limitations.md).
 
 ## Limitations
 
@@ -316,9 +353,10 @@ feedback and bug reports are always welcome.
 
 ## Disclaimer
 
-This project is intended for educational and research purposes only. It does not
-constitute investment advice, and historical performance does not guarantee
-future results.
+This project is intended for educational and research purposes only. It does
+not constitute investment advice, and historical performance does not
+guarantee future results. The goal is **not** to claim a profitable
+strategy — it is to demonstrate a rigorous, reproducible research process.
 
 ## Author
 

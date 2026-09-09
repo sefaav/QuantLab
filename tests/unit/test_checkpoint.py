@@ -69,6 +69,30 @@ def test_load_returns_none_when_run_params_change(
     assert load_checkpoint(path, different_provenance) is None
 
 
+def test_load_returns_none_when_execution_price_source_changes(
+    tmp_path: Path, sample_config: ExperimentConfig, synthetic_panel: pd.DataFrame
+) -> None:
+    """A custom ``execution_price_source`` is a constructor-level override
+    with no field in ``config`` at all -- a checkpoint written under one
+    source and resumed under a different one would otherwise pass every
+    other provenance check and silently stitch folds computed under two
+    incompatible sources into one OOS curve."""
+    path = tmp_path / "checkpoint.pkl"
+    provenance = compute_provenance(
+        sample_config,
+        synthetic_panel,
+        execution_price_source_fingerprint="default (RatioApproximatedExecutionPrices)",
+    )
+    save_checkpoint(path, provenance, {"folds": [1]}, progress=1)
+
+    different_provenance = compute_provenance(
+        sample_config,
+        synthetic_panel,
+        execution_price_source_fingerprint="my_module.CustomExecutionPriceSource",
+    )
+    assert load_checkpoint(path, different_provenance) is None
+
+
 def test_load_returns_none_when_file_is_corrupted(
     tmp_path: Path, sample_config: ExperimentConfig, synthetic_panel: pd.DataFrame
 ) -> None:

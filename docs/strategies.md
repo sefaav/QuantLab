@@ -2,8 +2,8 @@
 
 ## The contract
 
-Every strategy implements `BaseStrategy.generate_signals(data, features) ->
-pd.DataFrame`:
+Every strategy implements
+`BaseStrategy.generate_signals(data, features) -> pd.DataFrame`:
 
 - **Index**: dates.
 - **Columns**: symbols.

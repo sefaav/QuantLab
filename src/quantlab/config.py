@@ -278,6 +278,18 @@ class BenchmarkKind(StrEnum):
     CASH = "cash"
 
 
+class ExecutionTiming(StrEnum):
+    """How a decision's return contribution is attributed to its own bar.
+
+    See :class:`ExecutionConfig.execution_timing`'s own field comment for
+    the full rationale.
+    """
+
+    SAME_BAR_CLOSE = "same_bar_close"
+    NEXT_BAR_OPEN = "next_bar_open"
+    IMMEDIATE_AFTER_CLOSE = "immediate_after_close"
+
+
 class _StrictModel(BaseModel):
     """Validated config model with forbidden extra keys and frozen attributes.
 
@@ -365,6 +377,29 @@ def compatible_frequencies_for_sources(
         return set(DataFrequency)
     tables = [_SOURCE_SUPPORTED_FREQUENCIES[source] for source in remote]
     return set.intersection(*(set(table) for table in tables))
+
+
+def compatible_execution_timings(
+    frequency: DataFrequency, calendars: Iterable[str]
+) -> set[ExecutionTiming]:
+    """Return the ``execution_timing`` values compatible with frequency/calendars.
+
+    ``next_bar_open`` requires a native daily frequency; ``immediate_after_
+    close`` requires every instrument to trade on a continuous ('24/7')
+    market -- see ``ExperimentConfig``'s own
+    ``_check_next_bar_open_requires_a_daily_frequency``/
+    ``_check_immediate_after_close_needs_a_247_market`` validators for the
+    full rationale. This is the single source of truth for execution-timing
+    eligibility, mirroring :func:`compatible_frequencies_for_sources` -- both
+    those validators and the dashboard's execution-timing picker call it
+    directly, so the two can never diverge.
+    """
+    compatible = set(ExecutionTiming)
+    if frequency not in (DataFrequency.D1,):
+        compatible.discard(ExecutionTiming.NEXT_BAR_OPEN)
+    if any(calendar != "24/7" for calendar in calendars):
+        compatible.discard(ExecutionTiming.IMMEDIATE_AFTER_CLOSE)
+    return compatible
 
 
 class InstrumentConfig(_StrictModel):
@@ -609,9 +644,15 @@ class StrategyConfig(_StrictModel):
 
     name: str
     parameters: dict[str, Any] = Field(default_factory=dict)
-    #: Price series used to generate signals -- execution/costs always use
-    #: the raw close regardless of this setting (see docs/data_pipeline.md);
-    #: this only controls what a strategy's own generate_signals() sees.
+    #: Price series used to generate signals -- unaffected by execution/
+    #: costs, which never depend on this setting: returns always use the
+    #: adjusted close (and, under execution_timing="next_bar_open", the
+    #: adjusted open too); commission/spread costs are computed from
+    #: weight/notional changes alone, no price series at all; volume-based
+    #: slippage's average-daily-volume basis uses the RAW (unadjusted)
+    #: close instead (see docs/data_pipeline.md and docs/backtesting.md's
+    #: "Execution timing" section). This only controls what a strategy's
+    #: own generate_signals() sees.
     signal_price_type: Literal["adjusted_close", "close"] = "adjusted_close"
 
     @model_validator(mode="after")
@@ -738,6 +779,22 @@ class ExecutionConfig(_StrictModel):
     slippage_model: SlippageModelName = SlippageModelName.CONSTANT
     # Optional volume-based slippage coefficient.
     impact_coefficient: float = Field(default=0.1, ge=0.0)
+    # How a decision's return contribution is attributed relative to the
+    # bar it was decided on. "same_bar_close" (the default) treats a
+    # decision made from bar T's close as if it were also *filled* at
+    # that same close --
+    # standard backtesting idealization, but not causally realizable live
+    # (a real order cannot be conditioned on a bar's final close and also
+    # fill at that same close; a Market-On-Close order must be submitted
+    # *before* the close it targets). "next_bar_open" and
+    # "immediate_after_close" are causally ordered under the stated timing
+    # assumptions instead -- not a claim that either is fully realistic
+    # (e.g. "immediate_after_close" still models no execution latency).
+    # Changing this field for ordinary backtesting is optional either way;
+    # QuantLab does not force a default change -- see accounting.py's
+    # _gross_returns_and_cost_basis for the exact overnight/intraday decomposition
+    # each mode implies.
+    execution_timing: ExecutionTiming = ExecutionTiming.SAME_BAR_CLOSE
 
 
 class BacktestConfig(_StrictModel):
@@ -1262,6 +1319,84 @@ class ExperimentConfig(_StrictModel):
                 "backtest.periods_per_year — QuantLab cannot infer one "
                 "annualisation factor when instruments trade on different "
                 f"calendars ({sorted(calendars)})."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _check_immediate_after_close_needs_a_247_market(self) -> ExperimentConfig:
+        """Reject ``immediate_after_close`` on a session-based instrument.
+
+        This timing is only causally realizable on a continuous (24/7)
+        market -- a real order can be submitted the instant a daily bar
+        closes only when there is no session gap to cross before the next
+        one opens (see ``ExecutionConfig.execution_timing``'s own field
+        comment). Nothing currently derives a different overnight/intraday
+        matrix for it the way ``next_bar_open`` does
+        (:func:`~quantlab.backtesting.execution_prices.
+        overnight_returns_for_config` leaves it as a plain no-op, exactly
+        like ``same_bar_close``), so silently accepting it on a
+        session-based instrument would produce byte-identical results to
+        ``same_bar_close`` while claiming a materially different,
+        causally-realizable execution assumption.
+        """
+        if self.execution.execution_timing != ExecutionTiming.IMMEDIATE_AFTER_CLOSE:
+            return self
+        calendars = [instrument.calendar for instrument in self.data.instruments]
+        if ExecutionTiming.IMMEDIATE_AFTER_CLOSE not in compatible_execution_timings(
+            self.data.frequency, calendars
+        ):
+            non_247 = sorted({calendar for calendar in calendars if calendar != "24/7"})
+            raise ValueError(
+                "execution.execution_timing='immediate_after_close' requires "
+                "every instrument to trade on a continuous ('24/7') market -- "
+                f"found session-based calendar(s) {non_247}. Use 'next_bar_open' "
+                "for a session-based market instead."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _check_next_bar_open_requires_a_daily_frequency(self) -> ExperimentConfig:
+        """Reject ``next_bar_open`` on any non-daily frequency.
+
+        Two independent, unrelated reasons rule out every other
+        :class:`DataFrequency`, not just weekly/monthly:
+
+        - Weekly/monthly (super-daily): ``RatioApproximatedExecutionPrices``
+          derives the adjusted open as ``open * (adjusted_close / close)``
+          from the SAME bar's own OHLC. For a daily bar this is a same-day
+          ratio, at worst approximate for a cash dividend within that
+          single day. For a resampled weekly/monthly bar, ``open`` is the
+          FIRST native day's open of the period while ``close``/
+          ``adjusted_close`` are the LAST native day's values -- a split or
+          dividend occurring partway through that period makes the ratio
+          temporally incoherent (an END-of-period adjustment factor applied
+          to a START-of-period price).
+        - Hourly (sub-daily): ``overnight_returns_for_config`` derives the
+          overnight leg as ``adjusted_open / prices.shift(1) - 1``, i.e. it
+          treats the PREVIOUS ROW as the previous session's close. For an
+          hourly bar, the previous row is usually the previous hour WITHIN
+          the same session, not yesterday's close -- there is no per-row
+          session-boundary detection to identify which hourly transitions
+          are genuine overnight gaps.
+
+        Both are rejected outright rather than silently producing a
+        systematically wrong overnight/adjusted-open split.
+        """
+        if self.execution.execution_timing != ExecutionTiming.NEXT_BAR_OPEN:
+            return self
+        calendars = [instrument.calendar for instrument in self.data.instruments]
+        if ExecutionTiming.NEXT_BAR_OPEN not in compatible_execution_timings(
+            self.data.frequency, calendars
+        ):
+            raise ValueError(
+                "execution.execution_timing='next_bar_open' currently "
+                f"requires a daily ('1d') frequency, got {self.data.frequency!r} "
+                "-- the overnight/adjusted-open derivation this timing "
+                "needs is only coherent for a native daily bar (a "
+                "resampled weekly/monthly bar's open/close span multiple "
+                "native days; an hourly bar's previous row is usually the "
+                "previous hour, not the previous session's close). "
+                "Use 'same_bar_close' at this frequency instead."
             )
         return self
 

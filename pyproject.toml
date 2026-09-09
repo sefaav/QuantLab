@@ -79,7 +79,7 @@ quantlab = "quantlab.cli:app"
 
 [project.urls]
 Homepage = "https://github.com/sefaav/QuantLab"
-Documentation = "https://github.com/sefaav/QuantLab"
+Documentation = "https://sefaav.github.io/QuantLab/"
 Repository = "https://github.com/sefaav/QuantLab.git"
 Issues = "https://github.com/sefaav/QuantLab/issues"
 

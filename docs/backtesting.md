@@ -48,6 +48,110 @@ This is directly unit-tested (`tests/unit/test_accounting.py`): a signal that
 turns long on date *i* must show zero gain on date *i* and only starts
 capturing returns from date *i + 1*.
 
+## Execution timing
+
+`ExecutionConfig.execution_timing` (`same_bar_close` / `next_bar_open` /
+`immediate_after_close`) controls how a period's return contribution is
+attributed relative to the bar the decision was made on:
+
+- **`same_bar_close`** (the default): the decision made from bar `T`'s
+  close is treated as if it were also *filled* at that same close.
+  Standard backtesting
+  idealization, not causally realizable live — a real order cannot be
+  conditioned on a bar's own final close and also fill at that exact
+  close.
+- **`next_bar_open`**: decide at close(`T`), fill at open(`T+1`) —
+  realizable on a session-based market (a regular order queued
+  overnight). Every date's return is decomposed into an overnight leg
+  (`close[T-1] -> open[T]`, earned on the pre-trade holding) and an
+  intraday leg (`open[T] -> close[T]`, earned on the post-trade holding),
+  and the two legs are **compounded**,
+  `(1+overnight_leg)*(1+intraday_leg) - 1`, never simply added — a
+  portfolio 100% in A that gains 10% overnight, then rotates entirely
+  into B, which itself gains 10% intraday, has genuinely earned
+  `1.10*1.10-1 = 21%` that day (the overnight gain funds a *larger*
+  position in B), not `10%+10% = 20%`.
+  Both legs are computed portfolio-wide (every column, not only the ones
+  that traded that day, since the whole book — including untraded
+  positions — earns the overnight leg together before any of that day's
+  trades execute); this provably collapses back to the plain
+  close-to-close formula whenever nothing traded anywhere in the book
+  (see `quantlab.backtesting.accounting._gross_returns_and_cost_basis`'s
+  own docstring for the derivation). Turnover and every cost derived from
+  it (commission, spread, volume-dependent slippage) are sized against
+  the equity that exists *at the open* — `equity[T-1] * (1+overnight_leg)`
+  — since that is what a real order at the open actually has to move
+  against; each cost component is then rescaled by that same
+  `(1+overnight_leg)` factor before it is ever subtracted from a return
+  or reported, so `AccountingResult.costs` and the net-return curve stay
+  on the SAME close(`T-1`)-equity basis throughout, never a mix of the
+  two. Stop-loss/take-profit barriers use
+  the same two-leg compounding at the group level (see
+  [Stop-loss / take-profit](#stop-loss-take-profit) below) so a gap that
+  happened *before* a position's own entry is never credited toward (or
+  blamed on) its cumulative barrier return. The adjusted open price this
+  needs is derived by
+  `quantlab.backtesting.execution_prices.RatioApproximatedExecutionPrices`
+  — exact for a pure split, only approximate for a cash-dividend
+  adjustment (see that class's own docstring).
+
+  Combined with `portfolio.model_weight_drift=True` (the platform
+  default), `apply_weight_drift`'s own per-row loop applies the SAME
+  overnight-then-intraday split to its internal `dollar`/`equity` state:
+  the overnight leg is applied FIRST, before any decision that row makes
+  (anchor detection, the `maximum_turnover` cap, hard-risk-limit
+  compliance), so every decision is evaluated against the real open(T)
+  weight, never a stale close(T-1) one; only the remaining intraday leg
+  advances state at the row's end, ready for the next row's own overnight
+  leg. A hard-risk-limit or turnover-cap correction therefore lands on
+  the SAME row the gap that triggered it happened on, exactly like the
+  ordinary step-function path above.
+- **`immediate_after_close`**: decide and fill an idealized instant after
+  a bar closes — realizable only on a continuous (24/7) market, where
+  there is no session gap to separate an overnight leg from an intraday
+  one, so this mode keeps the plain close-to-close formula (numerically
+  identical to `same_bar_close`, but for a causally different reason: no
+  look-ahead is needed to compute a decision from the finalized close and
+  then submit an order an instant later, unlike a session-based close).
+  This is still a modeling approximation, not a guarantee of a literal
+  zero-latency fill at the exact printed close — real network/exchange
+  latency and any price movement during it are not modeled, the same
+  disclosed idealization every other execution-timing mode makes about
+  its own reference price. Rejected at config-validation time for any
+  instrument whose calendar isn't `"24/7"`
+  (`ExperimentConfig._check_immediate_after_close_needs_a_247_market`) —
+  nothing would otherwise stop it from silently producing
+  `same_bar_close`-identical numbers on a session-based market while
+  claiming a materially different execution assumption.
+
+Changing this field is optional for ordinary backtesting — QuantLab does
+not force a default change. `quantlab.validation.walk_forward` shares the
+exact same `overnight_returns` derivation
+(`quantlab.backtesting.execution_prices.overnight_returns_for_config`) so
+walk-forward validation stays numerically consistent with a single
+backtest using the same config. `BacktestEngine.run` accepts a custom
+`execution_price_source` override, and `WalkForwardValidator`'s own
+constructor accepts the identical parameter and forwards it to every
+internal accounting call site (fold selection, OOS stitching, and
+`rescore_with_costs`) — a non-default source given to a single backtest
+is honoured identically by a `WalkForwardValidator` built with the same
+source over the same config.
+
+### Price basis: signals vs. returns vs. costs
+
+`StrategyConfig.signal_price_type` (`adjusted_close`/`close`) controls
+only what a strategy's own `generate_signals()` sees — it does not affect
+execution or costs, which never depend on it:
+
+- **Returns** always use the adjusted close (and, under
+  `execution_timing="next_bar_open"`, the adjusted open too — see above).
+- **Commission/spread costs** are computed from weight/notional changes
+  alone; no price series is consulted at all.
+- **Volume-based slippage**'s average-daily-volume basis uses the RAW
+  (unadjusted) close instead, since dollar ADV should reflect real
+  historical trading volume against the price actually traded at, not a
+  split/dividend-adjusted one.
+
 ## Equity accounting
 
 ```
@@ -90,6 +194,17 @@ trigger is not presently computable — a deliberate, disclosed design
 convention. Once triggered, no immediate re-entry at a rebased price: the
 position stays flat until its next real flat-to-non-flat transition. See
 `quantlab.backtesting.accounting._detect_stop_loss_take_profit`.
+
+Under `execution_timing="next_bar_open"`, `group_return` is instead the
+group's own compounded overnight/intraday two-leg return (rescaled to
+the group's own gross exposure, mirroring [Execution
+timing](#execution-timing)'s portfolio-level derivation exactly, but at
+the group scale) — never the plain close-to-close formula above. This
+matters specifically for a position entered at the open: a gap that
+happened *before* that entry must not be credited toward (or blamed on)
+the position's cumulative barrier return, since the position was not yet
+held during that gap. See
+`quantlab.backtesting.accounting._group_return_with_execution_timing`.
 
 ## Missing data
 
@@ -171,13 +286,14 @@ its dollar exposure, and therefore its weight, continuously. When
 `portfolio.model_weight_drift` is `True` (the default),
 `quantlab.backtesting.accounting.apply_weight_drift` evolves the already
 shifted, executed weights forward between genuine trades, via a per-column
-dollar exposure and a single shared relative equity `E` (`weight[i] =
-dollar[i] / E`).
+dollar exposure and a single shared relative equity `E`
+(`weight[i] = dollar[i] / E`).
 
 Conceptually, two independent kinds of debt drive every row's output, in
-priority order: a hard-risk-limit breach (`maximum_weight`/`maximum_gross_
-exposure`/`maximum_net_exposure`/`long_only`) is corrected first, via a
-genuine linear program — never a "clip and scale toward zero" heuristic,
+priority order: a hard-risk-limit breach
+(`maximum_weight`/`maximum_gross_exposure`/`maximum_net_exposure`/`long_only`)
+is corrected first, via a genuine linear program — never a "clip and scale
+toward zero" heuristic,
 which can move exposure in the wrong direction — that finds the minimal-
 turnover point restoring compliance; an ordinary fresh rebalance decision
 is applied second, turnover-capped like a decision-level rebalance. See
@@ -207,9 +323,9 @@ states the invariants and limitations a caller needs to know:
   impossible until it reopens; the LP applies the best achievable fix
   meanwhile, carrying the residual as a pending breach rather than
   raising or silently dropping it.
-- Never produces `inf`/`NaN`: a bankrupt anchor-episode (relative `E <=
-  EPSILON`) is force-flattened and logged instead of dividing by
-  (near-)zero.
+- Never produces `inf`/`NaN`: a bankrupt anchor-episode
+  (relative `E <= EPSILON`) is force-flattened and logged instead of
+  dividing by (near-)zero.
 - `model_weight_drift=False` remains available as an optional constant-
   weight compatibility mode (byte-identical to the step function described
   above), not the recommended path.

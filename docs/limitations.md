@@ -2,9 +2,10 @@
 
 QuantLab is a research and education platform. It is designed to make its own
 limitations visible rather than hide them — every generated report includes
-an automatically generated limitations section (see `research_summary.
-STANDARD_LIMITATIONS`); this page provides the more complete, project-level
-discussion. Read this before drawing conclusions from any result.
+an automatically generated limitations section (see
+`research_summary.STANDARD_LIMITATIONS`); this page provides the more
+complete, project-level discussion. Read this before drawing conclusions
+from any result.
 
 ## Data
 

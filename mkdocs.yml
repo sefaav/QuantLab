@@ -1,5 +1,6 @@
 site_name: QuantLab
 site_description: Reproducible quantitative research and backtesting platform
+site_url: https://sefaav.github.io/QuantLab/
 repo_url: https://github.com/sefaav/QuantLab
 docs_dir: docs
 

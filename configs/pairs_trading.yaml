@@ -38,8 +38,8 @@ strategy:
     stop_threshold: 4.0
     dynamic_hedge_ratio: true
     adf_pvalue_threshold: 0.10
-  # Price series the strategy's own generate_signals() reads. Execution/
-  # costs always use the raw close regardless of this setting.
+  # Price series generate_signals() reads -- does not affect execution/
+  # costs (see docs/backtesting.md and config.py's own signal_price_type).
   signal_price_type: adjusted_close
 
 portfolio:
@@ -53,6 +53,10 @@ execution:
   spread_bps: 3.0
   slippage_bps: 2.0
   slippage_model: constant
+  # Explicit so a future default change never silently alters this
+  # published experiment's own numbers (see
+  # docs/backtesting.md#execution-timing for the three possible values).
+  execution_timing: same_bar_close
 
 backtest:
   initial_capital: 100000

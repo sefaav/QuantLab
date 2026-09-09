@@ -63,16 +63,18 @@ src/quantlab/
 - **Signals, weights, costs and returns are combined in one fixed order**,
   with the weight-shift step as a hard, tested barrier against look-ahead
   bias. `BacktestEngine.run()` is that assembly for a single backtest.
-  **Known architectural duplication**: `WalkForwardValidator.
-  _build_oos_result()` independently re-assembles the same stitched-OOS-
-  series case from the same underlying functions rather than calling
-  `BacktestEngine.run()` itself — a fix to that assembly step currently
-  needs applying at both call sites, not one shared entry point.
+  **Known architectural duplication**:
+  `WalkForwardValidator._build_oos_result()` independently re-assembles
+  the same stitched-OOS-series case from the same underlying functions
+  rather than calling `BacktestEngine.run()` itself — a fix to that
+  assembly step currently needs applying at both call sites, not one
+  shared entry point.
 
 ## Data flow shapes
 
-- **Long format** (`timestamp, symbol, open, high, low, close,
-  adjusted_close, volume`) is the canonical on-disk/interchange format.
+- **Long format**
+  (`timestamp, symbol, open, high, low, close, adjusted_close, volume`)
+  is the canonical on-disk/interchange format.
 - **Wide format** (`index=dates, columns=symbols`) is what features,
   strategies and the engine operate on internally, built via
   `quantlab.data.base.pivot_field`.

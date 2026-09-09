@@ -24,6 +24,23 @@ if TYPE_CHECKING:
     from quantlab.reporting.sections import DiagnosticsSection
 
 
+#: Shared tail of every profile's ``price_type`` parameter explanation --
+#: every profile's signal reads ``price_type`` for its own strategy-specific
+#: reason (the lead-in each profile writes on its own), but what happens
+#: downstream of that choice is identical across every strategy, so it's
+#: stated once here rather than re-typed verbatim in six profile files
+#: (see ``docs/backtesting.md``'s execution-timing section for the same
+#: claim in prose form).
+PRICE_TYPE_EXECUTION_NOTE = (
+    "unaffected by execution/costs, which never depend on this: returns "
+    "always use the adjusted close (and, under "
+    "execution_timing='next_bar_open', the adjusted open too); "
+    "commission/spread costs use weight/notional changes alone, no price "
+    "series at all; volume-based slippage's average-daily-volume basis "
+    "uses the raw (unadjusted) close."
+)
+
+
 @dataclass(frozen=True)
 class ParameterDoc:
     """Full explanation of one strategy constructor parameter.

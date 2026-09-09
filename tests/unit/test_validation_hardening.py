@@ -324,6 +324,8 @@ def test_walk_forward_skips_only_structurally_unwarmed_pair_combinations(
         candidate: ExperimentConfig,
         *_bounds: pd.Timestamp,
         execution_delay: int = 0,
+        execution_price_source: object | None = None,
+        overnight_returns: object | None = None,
     ) -> pd.Series:
         evaluated.append(
             {
@@ -336,6 +338,11 @@ def test_walk_forward_skips_only_structurally_unwarmed_pair_combinations(
 
     monkeypatch.setattr(
         walk_forward_module, "_evaluate_fresh_from_window_start", fake_evaluate
+    )
+    monkeypatch.setattr(
+        walk_forward_module,
+        "_overnight_returns_for_fold",
+        lambda *args, **kwargs: None,
     )
 
     selected = WalkForwardValidator(config)._select_on_validation(
@@ -456,6 +463,9 @@ def test_walk_forward_rejects_all_nonfinite_validation_scores(
         walk_forward,
         "_evaluate_fresh_from_window_start",
         lambda *args, **kwargs: pd.Series([0.0, 0.0]),
+    )
+    monkeypatch.setattr(
+        walk_forward, "_overnight_returns_for_fold", lambda *args, **kwargs: None
     )
     validator = WalkForwardValidator(_config())
     with pytest.raises(InvalidConfigurationError, match="non-finite"):
@@ -948,7 +958,7 @@ def test_target_weights_for_window_requires_exposed_target_weights(
     monkeypatch.setattr(
         walk_forward,
         "run_backtest_from_config",
-        lambda data, config: SimpleNamespace(target_weights=None),
+        lambda data, config, **_kwargs: SimpleNamespace(target_weights=None),
     )
     data = pd.DataFrame(
         {

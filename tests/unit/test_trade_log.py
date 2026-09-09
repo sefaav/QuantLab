@@ -192,8 +192,9 @@ def test_previous_weight_correct_for_a_drift_compliance_forced_trade() -> None:
     already proves the underlying drift/correction mechanics for, this
     time feeding `apply_weight_drift`'s own output straight into
     `build_trade_log`, exactly like the real pipeline (`engine.py` passes
-    `accounting.executed_weights`/`accounting.weight_changes`, which ARE
-    `apply_weight_drift`'s two frames when drift is active)."""
+    `accounting.executed_weights`/`accounting.weight_changes_for_costs`;
+    outside `next_bar_open` -- this test's own scenario -- that field is
+    identical to `apply_weight_drift`'s second, `weight_changes`, frame)."""
     from quantlab.backtesting.accounting import apply_weight_drift
 
     dates = pd.date_range("2024-01-01", periods=5, freq="D")
@@ -658,6 +659,16 @@ class _NegativeSlippage(SlippageModel):
 def test_trade_log_rejects_invalid_per_symbol_slippage() -> None:
     with pytest.raises(BacktestError, match=r"slippage costs.*non-negative"):
         _build(*_inputs(), slippage_model=_NegativeSlippage())
+
+
+def test_trade_log_rejects_a_non_boolean_reference_price_needs_shift() -> None:
+    """Regression test: a truthy-but-wrong value (e.g. the string
+    "False", which Python itself treats as truthy) must be rejected
+    outright, not silently take the "needs shift" branch regardless of
+    what the caller actually meant -- mispricing every fill against the
+    wrong reference-price basis with no error at all."""
+    with pytest.raises(BacktestError, match="reference_price_needs_shift must be"):
+        _build(*_inputs(), reference_price_needs_shift="False")
 
 
 class _ReasonKwargs(TypedDict, total=False):

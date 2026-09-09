@@ -9,6 +9,22 @@ from quantlab.validation.holdout import (
     run_holdout_report,
     run_holdout_validation,
 )
+from quantlab.validation.panel_inference import (
+    ClusterDifferenceResult,
+    ClusterSpearmanResult,
+    FamaMacBethResult,
+    PairedSharpeDifferenceResult,
+    PermutationTestResult,
+    Statistic,
+    cliffs_delta,
+    cluster_bootstrap_difference,
+    clustered_regression,
+    fama_macbeth_difference,
+    holm_adjust,
+    paired_cluster_bootstrap_sharpe_difference,
+    per_cluster_spearman,
+    within_cluster_permutation_test,
+)
 from quantlab.validation.parameter_grid import (
     default_parameter_grid,
     parameter_grid_for_config,
@@ -26,8 +42,10 @@ from quantlab.validation.robustness import (
 )
 from quantlab.validation.splits import (
     ChronologicalSplit,
+    FormationTestWindow,
     WalkForwardWindow,
     chronological_split,
+    formation_test_windows,
     walk_forward_windows,
 )
 from quantlab.validation.walk_forward import (
@@ -39,17 +57,32 @@ from quantlab.validation.walk_forward import (
 __all__ = [
     "BootstrapResult",
     "ChronologicalSplit",
+    "ClusterDifferenceResult",
+    "ClusterSpearmanResult",
+    "FamaMacBethResult",
     "FoldResult",
+    "FormationTestWindow",
     "HoldoutReport",
+    "PairedSharpeDifferenceResult",
+    "PermutationTestResult",
+    "Statistic",
     "WalkForwardResult",
     "WalkForwardValidator",
     "WalkForwardWindow",
     "bootstrap_returns",
     "chronological_split",
+    "cliffs_delta",
+    "cluster_bootstrap_difference",
+    "clustered_regression",
     "compute_holdout_split",
     "default_parameter_grid",
+    "fama_macbeth_difference",
+    "formation_test_windows",
+    "holm_adjust",
     "monte_carlo_permutation",
+    "paired_cluster_bootstrap_sharpe_difference",
     "parameter_grid_for_config",
+    "per_cluster_spearman",
     "run_holdout_report",
     "run_holdout_validation",
     "run_parameter_sensitivity",
@@ -59,4 +92,5 @@ __all__ = [
     "sensitivity_heatmap_data",
     "stress_test_checkpoint_paths",
     "walk_forward_windows",
+    "within_cluster_permutation_test",
 ]

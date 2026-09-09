@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any
 import pandas as pd
 
 from quantlab.dashboard.explorer.profile import (
+    PRICE_TYPE_EXECUTION_NOTE,
     ParameterDoc,
     ResultsDiagnostics,
     StrategyProfile,
@@ -389,7 +390,7 @@ _PARAMETERS = [
         name="price_type",
         what="Which price series ('adjusted_close' or 'close') "
         "generate_signals() reads to compute the hedge ratio, spread and "
-        "z-score. Execution/costs always use the raw close regardless.",
+        f"z-score -- {PRICE_TYPE_EXECUTION_NOTE}",
         where="Every step above operates on whichever price series this selects.",
         why="A split or large dividend on either leg shows up as a price "
         "jump in raw close but not in adjusted close -- unadjusted, it "

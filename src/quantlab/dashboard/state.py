@@ -13,7 +13,7 @@ import pandas as pd
 
 from quantlab.backtesting.result import BacktestResult
 from quantlab.backtesting.runner import run_backtest_from_config
-from quantlab.config import ExperimentConfig
+from quantlab.config import ExecutionTiming, ExperimentConfig
 from quantlab.data.base import SymbolSuggestion
 from quantlab.data.binance import BinanceDataSource
 from quantlab.data.loader import DataLoader
@@ -97,6 +97,9 @@ def build_config_from_inputs(inputs: dict[str, Any]) -> ExperimentConfig:
                 "slippage_bps": inputs.get("slippage_bps", 2.0),
                 "slippage_model": inputs.get("slippage_model", "constant"),
                 "impact_coefficient": inputs.get("impact_coefficient", 0.1),
+                "execution_timing": inputs.get(
+                    "execution_timing", ExecutionTiming.SAME_BAR_CLOSE.value
+                ),
             },
             "backtest": {
                 "initial_capital": inputs.get("initial_capital", 100_000.0),

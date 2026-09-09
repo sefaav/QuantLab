@@ -13,12 +13,15 @@ import pytest
 from quantlab.config import (
     BacktestConfig,
     BenchmarkKind,
+    DataFrequency,
     ExecutionConfig,
+    ExecutionTiming,
     ExperimentConfig,
     MissingValuePolicy,
     PortfolioConfig,
     ReproducibilityConfig,
     ValidationConfig,
+    compatible_execution_timings,
 )
 from quantlab.constants import CONFIGS_DIR
 from quantlab.exceptions import InvalidConfigurationError
@@ -899,6 +902,185 @@ def test_mixed_calendars_require_explicit_periods_per_year() -> None:
                 "strategy": {"name": "buy_and_hold"},
             }
         )
+
+
+def test_immediate_after_close_rejects_a_session_based_instrument() -> None:
+    """Regression test: nothing derives a distinct overnight/intraday
+    matrix for `immediate_after_close` the way `next_bar_open` does -- it
+    is a plain no-op, so accepting it on a session-based (non-24/7)
+    market would silently produce results byte-identical to
+    `same_bar_close` while claiming a materially different, causally-
+    realizable execution assumption."""
+    with pytest.raises(InvalidConfigurationError, match="immediate_after_close"):
+        ExperimentConfig.from_dict(
+            {
+                "experiment_name": "x",
+                "data": {
+                    "instruments": [
+                        {"symbol": "AAPL", "source": "yahoo", "calendar": "XNYS"},
+                    ],
+                    "start_date": "2020-01-01",
+                    "end_date": "2021-01-01",
+                },
+                "strategy": {"name": "buy_and_hold"},
+                "execution": {"execution_timing": "immediate_after_close"},
+            }
+        )
+
+
+def test_immediate_after_close_accepts_a_genuine_247_market() -> None:
+    cfg = ExperimentConfig.from_dict(
+        {
+            "experiment_name": "x",
+            "data": {
+                "instruments": [
+                    {"symbol": "BTCUSDT", "source": "binance", "calendar": "24/7"},
+                ],
+                "start_date": "2020-01-01",
+                "end_date": "2021-01-01",
+                "frequency": "1d",
+            },
+            "strategy": {"name": "buy_and_hold"},
+            "execution": {"execution_timing": "immediate_after_close"},
+        }
+    )
+    assert cfg.execution.execution_timing == "immediate_after_close"
+
+
+def test_next_bar_open_rejects_a_weekly_frequency() -> None:
+    """RatioApproximatedExecutionPrices's open/close split is temporally
+    incoherent on a resampled bar (open from the first native day, close
+    from the last) -- next_bar_open must be rejected outright at any
+    frequency coarser than daily, not silently applied anyway."""
+    with pytest.raises(InvalidConfigurationError, match="daily"):
+        ExperimentConfig.from_dict(
+            {
+                "experiment_name": "x",
+                "data": {
+                    "instruments": [
+                        {"symbol": "AAPL", "source": "yahoo", "calendar": "XNYS"},
+                    ],
+                    "start_date": "2020-01-01",
+                    "end_date": "2021-01-01",
+                    "frequency": "1w",
+                },
+                "strategy": {"name": "buy_and_hold"},
+                "execution": {"execution_timing": "next_bar_open"},
+            }
+        )
+
+
+def test_next_bar_open_rejects_a_monthly_frequency() -> None:
+    with pytest.raises(InvalidConfigurationError, match="daily"):
+        ExperimentConfig.from_dict(
+            {
+                "experiment_name": "x",
+                "data": {
+                    "instruments": [
+                        {"symbol": "AAPL", "source": "yahoo", "calendar": "XNYS"},
+                    ],
+                    "start_date": "2020-01-01",
+                    "end_date": "2021-01-01",
+                    "frequency": "1mo",
+                },
+                "strategy": {"name": "buy_and_hold"},
+                "execution": {"execution_timing": "next_bar_open"},
+            }
+        )
+
+
+def test_next_bar_open_rejects_an_hourly_frequency() -> None:
+    """Rejected for an independent reason from weekly/monthly: the
+    overnight-return derivation treats the previous ROW as the previous
+    session's close, which is wrong for an hourly bar (the previous row is
+    usually the previous hour within the same session)."""
+    with pytest.raises(InvalidConfigurationError, match="daily"):
+        ExperimentConfig.from_dict(
+            {
+                "experiment_name": "x",
+                "data": {
+                    "instruments": [
+                        {"symbol": "AAPL", "source": "yahoo", "calendar": "XNYS"},
+                    ],
+                    "start_date": "2020-01-01",
+                    "end_date": "2020-01-02",
+                    "frequency": "1h",
+                },
+                "strategy": {"name": "buy_and_hold"},
+                "execution": {"execution_timing": "next_bar_open"},
+            }
+        )
+
+
+def test_next_bar_open_accepts_a_daily_frequency() -> None:
+    cfg = ExperimentConfig.from_dict(
+        {
+            "experiment_name": "x",
+            "data": {
+                "instruments": [
+                    {"symbol": "AAPL", "source": "yahoo", "calendar": "XNYS"},
+                ],
+                "start_date": "2020-01-01",
+                "end_date": "2021-01-01",
+                "frequency": "1d",
+            },
+            "strategy": {"name": "buy_and_hold"},
+            "execution": {"execution_timing": "next_bar_open"},
+        }
+    )
+    assert cfg.execution.execution_timing == "next_bar_open"
+
+
+@pytest.mark.parametrize(
+    ("frequency", "calendars", "expected"),
+    [
+        (
+            DataFrequency.D1,
+            ["XNYS"],
+            {ExecutionTiming.SAME_BAR_CLOSE, ExecutionTiming.NEXT_BAR_OPEN},
+        ),
+        (DataFrequency.H1, ["XNYS"], {ExecutionTiming.SAME_BAR_CLOSE}),
+        (
+            DataFrequency.D1,
+            ["24/7"],
+            {
+                ExecutionTiming.SAME_BAR_CLOSE,
+                ExecutionTiming.NEXT_BAR_OPEN,
+                ExecutionTiming.IMMEDIATE_AFTER_CLOSE,
+            },
+        ),
+        (
+            DataFrequency.H1,
+            ["24/7"],
+            {ExecutionTiming.SAME_BAR_CLOSE, ExecutionTiming.IMMEDIATE_AFTER_CLOSE},
+        ),
+        # A mixed universe (one session-based, one 24/7 instrument) is
+        # only as permissive as its most restrictive member for
+        # immediate_after_close -- every instrument must be 24/7, not
+        # just one -- but daily frequency alone is still enough for
+        # next_bar_open, which doesn't care about calendars at all.
+        (
+            DataFrequency.D1,
+            ["XNYS", "24/7"],
+            {ExecutionTiming.SAME_BAR_CLOSE, ExecutionTiming.NEXT_BAR_OPEN},
+        ),
+    ],
+    ids=["daily+xnys", "hourly+xnys", "daily+24/7", "hourly+24/7", "daily+mixed"],
+)
+def test_compatible_execution_timings_matrix(
+    frequency: DataFrequency, calendars: list[str], expected: set[ExecutionTiming]
+) -> None:
+    """Direct coverage of the full frequency x calendar eligibility
+    matrix ``compatible_execution_timings`` is the single source of
+    truth for -- both ``ExperimentConfig``'s own validators (see the
+    `test_next_bar_open_*`/`test_immediate_after_close_*` tests above,
+    which exercise the same rules end-to-end through config validation)
+    and the dashboard's execution-timing picker call this directly, so
+    testing it in isolation here covers combinations (daily/hourly x
+    24/7) that dashboard's own AppTest-based tests cannot drive (the
+    per-instrument Calendar column is a ``st.data_editor``, which this
+    Streamlit version's test harness cannot read or set)."""
+    assert compatible_execution_timings(frequency, calendars) == expected
 
 
 def test_yaml_roundtrip(sample_config: ExperimentConfig, tmp_path: Path) -> None:

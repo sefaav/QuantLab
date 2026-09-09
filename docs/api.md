@@ -12,9 +12,9 @@ than from private modules or names beginning with an underscore.
 | `quantlab.strategies` | Built-in strategies, registry helpers and `BaseStrategy` |
 | `quantlab.portfolio` | Allocators, constraints, rebalancing and volatility targeting |
 | `quantlab.execution` | Commission, spread, slippage and aggregate execution models |
-| `quantlab.backtesting` | `BacktestEngine`, `BacktestResult`, accounting, benchmark and trade-log helpers |
+| `quantlab.backtesting` | `BacktestEngine`, `BacktestResult`, accounting, benchmark and trade-log helpers, `ExecutionPriceSource`/`RatioApproximatedExecutionPrices` |
 | `quantlab.risk` | Performance, drawdown, exposure, VaR/CVaR and stress helpers |
-| `quantlab.validation` | Holdout, walk-forward (`FoldResult`, `WalkForwardResult`, `WalkForwardValidator`), sensitivity, bootstrap and stress validation |
+| `quantlab.validation` | Holdout, walk-forward (`FoldResult`, `WalkForwardResult`, `WalkForwardValidator`), sensitivity, bootstrap, stress validation, formation-then-test folds (`formation_test_windows`) and dependence-aware panel inference (`quantlab.validation.panel_inference`) |
 | `quantlab.reporting` | Tables, charts and HTML-report generation |
 
 ## Recommended entry point
@@ -60,6 +60,12 @@ grid and returns a `WalkForwardResult` containing public `FoldResult` records.
 - Implement `SlippageModel` for a custom slippage assumption.
 - Use `FeaturePipeline` only when an explicit reusable feature transformation
   pipeline is useful; built-in strategies call feature functions directly.
+- Implement `ExecutionPriceSource` (one method, `adjusted_open(data)`) for a
+  more accurate adjusted-open price under `execution_timing="next_bar_open"`
+  than the shipped `RatioApproximatedExecutionPrices` approximation, then
+  pass it as `execution_price_source=` to `BacktestEngine.run()` and/or
+  `WalkForwardValidator(...)`. See [Execution
+  timing](backtesting.md#execution-timing).
 
 See [Strategies](strategies.md), [Backtesting](backtesting.md) and
 [Validation](validation.md) for the contracts and methodological assumptions.
