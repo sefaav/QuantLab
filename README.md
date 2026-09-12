@@ -51,6 +51,18 @@ than maximizing historical performance.
   writing it to disk. Calling `BacktestEngine` directly through the Python
   API requires the explicit `result.to_html(...)` call shown below.
 
+## Research built with QuantLab
+
+**Does ADF Filtering Improve Pairs-Trading Performance Out of Sample?**
+
+A reproducible walk-forward study of 92 economically related ETF pairs across
+34 folds (2008–2026), testing whether ADF stationarity filtering applied during
+the formation window improves subsequent out-of-sample pairs-trading performance.
+
+**Main finding:** no statistically detectable out-of-sample benefit from the filter in this experiment.
+
+[Read the study →](https://github.com/sefaav/quant-research-notebooks/tree/main/pairs_trading_stationarity)
+
 ## Strategies
 
 One `BaseStrategy` interface behind six reusable, tested strategies: buy &
