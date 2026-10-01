@@ -51,7 +51,7 @@ dashboard = ["streamlit>=1.61.1"]
 # Data downloads. Isolated so tests can run fully offline.
 yahoo = ["yfinance>=1.6.0"]
 # Optional analytical accelerators for advanced parameter search/ML strategies.
-extra = ["scikit-learn>=1.4", "optuna>=3.5"]
+extra = ["scikit-learn>=1.9.1", "optuna>=3.5"]
 dev = [
     "pytest>=8.0",
     "pytest-cov>=4.1",
