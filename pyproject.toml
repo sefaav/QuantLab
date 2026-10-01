@@ -47,7 +47,7 @@ dependencies = [
 
 [project.optional-dependencies]
 # Streamlit 1.61 provides the iframe and lazy-tab APIs used by the dashboard.
-dashboard = ["streamlit>=1.61.1"]
+dashboard = ["streamlit>=1.64.0"]
 # Data downloads. Isolated so tests can run fully offline.
 yahoo = ["yfinance>=1.6.0"]
 # Optional analytical accelerators for advanced parameter search/ML strategies.
